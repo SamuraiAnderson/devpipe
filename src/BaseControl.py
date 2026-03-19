@@ -22,6 +22,13 @@ class RemoteFileNotFoundError(RemoteError):
         self.path = path
         super().__init__(host, f"path not found: {path}. {reason}")
 
+class WaitTimeoutError(RemoteError):
+    def __init__(self, host, pattern, timeout, output=""):
+        self.pattern = pattern
+        self.timeout = timeout
+        self.output = output
+        super().__init__(host, f"wait for '{pattern}' timed out after {timeout}s")
+
 
 class BaseControl(object):
     '''
@@ -39,6 +46,13 @@ class BaseControl(object):
         raise NotImplementedError()
 
     def shell(self, *args, **kwargs) -> tuple:
+        raise NotImplementedError()
+
+    def wait(self, cmd, pattern, timeout=30):
+        '''执行 cmd，流式监控输出直到匹配 pattern(正则) 或超时。
+        pattern: str 或 re.Pattern，支持捕获组。
+        返回 re.Match，可通过 match.group(1) 等提取变量。
+        '''
         raise NotImplementedError()
 
     def pwd(self):
