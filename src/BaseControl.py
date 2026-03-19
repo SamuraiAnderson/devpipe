@@ -27,6 +27,11 @@ class BaseControl(object):
     '''
         android rv1106 时间会快一点
     '''
+    @property
+    def log(self):
+        import logging
+        return logging.getLogger(f"client.{self.host}")
+
     def push(self, local_path, remote_path):
         raise NotImplementedError()
 

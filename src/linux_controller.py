@@ -1,4 +1,3 @@
-import logging
 from .BaseControl import *
 import paramiko
 from paramiko import SSHClient
@@ -44,7 +43,7 @@ class Linux(BaseControl):
         exit_status = stdout.channel.recv_exit_status()
         if exit_status != 0:
             raise ShellError(self.host, remote_cmd, exit_status, stdout.read().decode(), stderr.read().decode())
-        logging.debug("%s:%s", self.host, remote_cmd)
+        self.log.debug("shell: %s", remote_cmd)
         return exit_status, stdout.read().decode(), stderr.read().decode()
 
     def push(self, local_path, remote_path):
@@ -57,7 +56,7 @@ class Linux(BaseControl):
         finally:
             if sftp is not None:
                 sftp.close()
-        logging.debug("%s:push %s %s", self.host, local_path, remote_path)
+        self.log.debug("push %s → %s", local_path, remote_path)
 
     def pull(self, remote_path, local_path):
         sftp = None
@@ -69,7 +68,7 @@ class Linux(BaseControl):
         finally:
             if sftp is not None:
                 sftp.close()
-        logging.debug("%s:pull %s %s", self.host, remote_path, local_path)
+        self.log.debug("pull %s → %s", remote_path, local_path)
 
     def close(self):
         self.remoter.close()

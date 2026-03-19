@@ -1,4 +1,3 @@
-import logging
 from .BaseControl import *
 
 class AdbCnet(BaseControl):
@@ -46,23 +45,22 @@ class AdbCnet(BaseControl):
         code, out, err = subprocess_run(cmd)
         if code != 0:
             raise ShellError(self.host, remote_cmd, code, out, err)
-        logging.debug("%s:%s", self.host, cmd)
+        self.log.debug("shell: %s", cmd)
         return code, out.decode(), err.decode()
-
 
     def push(self, file_local, file_remote):
         cmd = args_to_cmd(['adb', 'push', file_local, file_remote])
         code, out, err = subprocess_run(cmd)
         if code != 0:
             raise TransferError(self.host, file_local, file_remote, err)
-        logging.debug("%s:push %s %s", self.host, file_local, file_remote)
+        self.log.debug("push %s → %s", file_local, file_remote)
 
     def pull(self, file_remote, file_local):
         cmd = args_to_cmd(['adb', 'pull', file_remote, file_local])
         code, out, err = subprocess_run(cmd)
         if code != 0:
             raise TransferError(self.host, file_remote, file_local, err)
-        logging.debug("%s:pull %s %s", self.host, file_remote, file_local)
+        self.log.debug("pull %s → %s", file_remote, file_local)
 
     def close(self):
         cmd = args_to_cmd(['adb', 'disconnect', self._host])
