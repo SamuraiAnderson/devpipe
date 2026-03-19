@@ -3,3 +3,4 @@ paramiko
 numpy
 scipy
 python-dotenv
+nicegui
