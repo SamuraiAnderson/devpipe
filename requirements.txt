@@ -1,0 +1,5 @@
+pydub
+paramiko
+numpy
+scipy
+python-dotenv

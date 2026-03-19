@@ -1,0 +1,13 @@
+
+1.文件系统
+
+我们要实现兼容多平台, make风格的脚本.
+
+那么, 我们怎么去表示我们的文件? (user, host, PATH)
+
+2.指令系统
+
+对于adb, 我们最少有三种指令, push, pull, shell.
+
+对于shell型指令, 以PREFIX_SHELL_COMMAND "REMOTE COMMAND".
+
