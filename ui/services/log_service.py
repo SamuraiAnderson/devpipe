@@ -1,6 +1,8 @@
 import logging
 import os
 from datetime import datetime
+from io import TextIOWrapper
+from pathlib import Path
 from typing import Callable, Optional
 
 from dotenv import load_dotenv
@@ -39,6 +41,55 @@ class LogRecord:
         return f"{self.timestamp} [{self.level}] {self.message}"
 
 
+SOURCES = [ALL, 'Local', 'Linux', 'Android']
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_LOG_DIR = _PROJECT_ROOT / 'logs'
+
+
+class LogFileWriter:
+    """Manages per-source log files under a central directory."""
+
+    def __init__(self, log_dir: Path = _LOG_DIR):
+        self._log_dir = log_dir
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._files: dict[str, TextIOWrapper] = {}
+        for source in SOURCES:
+            self._open_new(source)
+
+    def _open_new(self, source: str):
+        old = self._files.get(source)
+        if old is not None and not old.closed:
+            old.close()
+        ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        path = self._log_dir / f'{source}_{ts}.log'
+        self._files[source] = open(path, 'a', encoding='utf-8')
+
+    def write(self, source: str, record: 'LogRecord'):
+        f = self._files.get(source)
+        if f is not None and not f.closed:
+            f.write(record.formatted() + '\n')
+            f.flush()
+
+    def rotate(self, source: str):
+        if source in self._files:
+            self._open_new(source)
+
+    def rotate_all(self):
+        for source in list(self._files):
+            self._open_new(source)
+
+
+_file_writer: Optional[LogFileWriter] = None
+
+
+def get_file_writer() -> LogFileWriter:
+    global _file_writer
+    if _file_writer is None:
+        _file_writer = LogFileWriter()
+    return _file_writer
+
+
 class UILogHandler(logging.Handler):
     """Routes Python logging records to per-client UI callbacks."""
 
@@ -68,6 +119,10 @@ class UILogHandler(logging.Handler):
             msg = self.format(record)
             source = self._resolve_source(record)
             lr = LogRecord(ts, record.levelname, msg, source)
+
+            writer = get_file_writer()
+            writer.write(ALL, lr)
+            writer.write(source, lr)
 
             if ALL in self._callbacks:
                 self._callbacks[ALL](lr)

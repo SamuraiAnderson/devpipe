@@ -1,6 +1,7 @@
 **/__pycache__
 .vscode/
 .env
+logs/
 
 # # Byte-compiled / optimized Python files
 # __pycache__/
