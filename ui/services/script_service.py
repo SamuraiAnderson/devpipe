@@ -60,7 +60,7 @@ class ScriptService:
         self._on_state_change = fn
 
     def scan(self) -> list[dict]:
-        """Scan the script directory and return a tree for NiceGUI ui.tree."""
+        """Scan the script directory and return a nested tree of dicts."""
         return self._build_tree(self._script_dir)
 
     def _build_tree(self, directory: Path) -> list[dict]:

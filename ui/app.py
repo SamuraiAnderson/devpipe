@@ -1,102 +1,45 @@
-"""RedPyMake UI — entry point."""
+"""RedPyMake UI — Streamlit entry point."""
 
 import logging
+import sys
+from pathlib import Path
 
-from nicegui import ui
+import streamlit as st
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from ui.services.client_service import ClientService
 from ui.services.script_service import ScriptService
+from ui.services.log_service import install
 
-THEME_CSS = """
-:root {
-    --bg-base:    #fafbfc;
-    --bg-surface: #ffffff;
-    --bg-mantle:  #f0f2f5;
-    --fg:         #2c3e50;
-    --fg-dim:     #7f8c9b;
-    --border:     #e4e8ed;
-    --accent:     #4a90d9;
-}
-body, .q-page, .nicegui-content {
-    background: var(--bg-base) !important;
-    color: var(--fg) !important;
-}
-.q-header {
-    background: var(--bg-surface) !important;
-    box-shadow: none !important;
-    border-bottom: 1px solid var(--border);
-}
-.q-splitter__separator {
-    background: var(--border) !important;
-}
-.q-tree__node-header {
-    color: var(--fg) !important;
-    border-radius: 4px;
-}
-.q-tree__node-header:hover {
-    background: rgba(74, 144, 217, 0.06) !important;
-}
-.q-separator {
-    background: var(--border) !important;
-}
-.q-card {
-    box-shadow: none !important;
-}
-"""
+st.set_page_config(page_title="RedPyMake", layout="wide", page_icon=":wrench:")
 
-client_svc = ClientService()
-script_svc = ScriptService()
+if "client_svc" not in st.session_state:
+    logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s", force=True)
+    install(level=0)
+    st.session_state.client_svc = ClientService()
+    st.session_state.script_svc = ScriptService()
 
+from ui.components.client_panel import render_client_panel
+from ui.components.log_panel import render_log_panel
+from ui.components.script_panel import render_script_panel
 
-@ui.page('/')
-def index():
-    from ui.components.client_panel import ClientPanel
-    from ui.components.log_panel import LogPanel
-    from ui.components.script_panel import ScriptPanel
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebar"] { min-width: 280px; }
+    .log-container pre { font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace; font-size: 12px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    ui.add_head_html(f'<style>{THEME_CSS}</style>')
-    ui.add_head_html(
-        '<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">'
-    )
+with st.sidebar:
+    st.markdown("### RedPyMake")
+    render_script_panel(st.session_state.script_svc)
 
-    with ui.header().classes('items-center px-4 py-2'):
-        ui.label('RedPyMake').classes('text-h6 font-bold').style('color: #2c3e50; letter-spacing: 1px;')
-        ui.space()
-        connected = sum(
-            1 for c in client_svc.clients.values()
-            if c.state.value == 'connected'
-        )
-        total = len(client_svc.clients)
-        ui.label(f'已连接 {connected}/{total} 客户端').classes('text-caption').style('color: #7f8c9b;')
-
-    with ui.splitter(value=25).classes('w-full').style('height: calc(100vh - 52px);') as splitter:
-        with splitter.before:
-            with ui.column().classes('w-full h-full').style(
-                'background: var(--bg-surface); border-right: 1px solid var(--border);'
-            ):
-                ScriptPanel(script_svc)
-
-        with splitter.after:
-            with ui.column().classes('w-full h-full gap-0'):
-                ClientPanel(client_svc)
-                ui.separator()
-                with ui.column().classes('w-full flex-grow gap-0').style('min-height: 0;'):
-                    LogPanel()
-
-
-def main():
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(levelname)s: %(message)s",
-        force=True,
-    )
-    ui.run(
-        title='RedPyMake',
-        port=8080,
-        reload=False,
-        dark=False,
-    )
-
-
-if __name__ in {'__main__', '__mp_main__'}:
-    main()
+render_client_panel(st.session_state.client_svc)
+st.divider()
+render_log_panel()
