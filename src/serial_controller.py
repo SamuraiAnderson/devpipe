@@ -6,24 +6,49 @@ import uuid
 
 
 class SerialControl(BaseControl):
-    """通过串口 (UART) 控制远程 Linux 设备。
+    """通过串口 (UART) 控制远程设备。
 
-    使用 base64 编解码实现文件传输，通过唯一标记符界定命令输出边界。
+    支持两种模式：
+    - 'linux'（默认）：Linux shell，使用 base64 编解码实现文件传输，
+      通过唯一标记符界定命令输出边界。
+    - 'bootloader'：U-Boot 模式，直接发送命令，通过提示符检测响应结束。
     """
 
     CHUNK_SIZE = 512
 
-    def __init__(self, port, baudrate=115200, timeout=10):
+    def __init__(self, port, baudrate=115200, timeout=10, mode='linux'):
         import serial as _serial
         self._port = port
         self._baudrate = baudrate
         self._timeout = timeout
+        self._mode = mode
         self._pwd = '~'
-        self._ser = _serial.Serial(port, baudrate, timeout=timeout)
+        try:
+            self._ser = _serial.Serial(port, baudrate, timeout=timeout)
+        except Exception as e:
+            reason = self._parse_open_error(e)
+            raise RemoteConnectionError(port, reason) from e
+        self.log.info("串口 %s 打开成功 (mode=%s)", port, mode)
         time.sleep(0.2)
         self._ser.reset_input_buffer()
         self._exec_raw("")
-        self._exec_raw("stty -echo 2>/dev/null; export PS1=''")
+        if mode == 'linux':
+            self._exec_raw("stty -echo 2>/dev/null; export PS1=''")
+
+    @staticmethod
+    def _parse_open_error(exc):
+        msg = str(exc).lower()
+        if 'errno 13' in msg or 'access is denied' in msg:
+            return "权限被拒绝：串口可能被其他程序占用，或当前用户无访问权限"
+        if 'errno 2' in msg or 'filenotfounderror' in msg:
+            return "串口不存在：请检查端口名称是否正确，设备是否已连接"
+        if 'errno 32' in msg or 'broken pipe' in msg:
+            return "资源繁忙：串口已被其他进程占用"
+        if 'errno 183' in msg:
+            return "无法创建串口实例：端口名称冲突或已被占用"
+        if 'permission' in msg:
+            return f"权限错误：{exc}"
+        return f"串口打开失败：{exc}"
 
     @property
     def host(self):
@@ -62,6 +87,11 @@ class SerialControl(BaseControl):
         raise WaitTimeoutError(self.host, sentinel, self._timeout, buf)
 
     def _exec_raw(self, cmd):
+        if self._mode == 'bootloader':
+            return self._exec_raw_bootloader(cmd)
+        return self._exec_raw_linux(cmd)
+
+    def _exec_raw_linux(self, cmd):
         """发送命令并通过标记符解析输出和退出码。"""
         marker = uuid.uuid4().hex[:16]
         start_tag = f"_S{marker}_"
@@ -90,9 +120,44 @@ class SerialControl(BaseControl):
 
         return code, stdout, ""
 
+    def _exec_raw_bootloader(self, cmd):
+        """Bootloader 模式：直接发送命令，检测提示符结束。"""
+        self._ser.reset_input_buffer()
+        self._ser.write((cmd + "\n").encode())
+        self._ser.flush()
+
+        buf = ""
+        deadline = time.time() + self._timeout
+        while time.time() < deadline:
+            n = self._ser.in_waiting
+            if n:
+                buf += self._ser.read(n).decode(errors='replace')
+                lines = buf.rstrip().split('\n')
+                if lines:
+                    last = lines[-1].strip()
+                    if last.endswith('#') or last.endswith('>'):
+                        stdout = '\n'.join(lines[1:-1]).strip()
+                        return 0, stdout, ""
+            else:
+                time.sleep(0.02)
+        raise WaitTimeoutError(self.host, "prompt (# or >)", self._timeout, buf)
+
     def shell(self, *args) -> tuple:
+        if self._mode == 'bootloader':
+            return self._shell_bootloader(*args)
+        return self._shell_linux(*args)
+
+    def _shell_linux(self, *args) -> tuple:
         args = self.args_prefix + list(args)
         remote_cmd = args_to_cmd(args)
+        code, stdout, stderr = self._exec_raw(remote_cmd)
+        if code != 0:
+            raise ShellError(self.host, remote_cmd, code, stdout, stderr)
+        self.log.debug("shell: %s", remote_cmd)
+        return code, stdout, stderr
+
+    def _shell_bootloader(self, *args) -> tuple:
+        remote_cmd = args_to_cmd(list(args))
         code, stdout, stderr = self._exec_raw(remote_cmd)
         if code != 0:
             raise ShellError(self.host, remote_cmd, code, stdout, stderr)
@@ -132,10 +197,19 @@ class SerialControl(BaseControl):
         self.log.debug("pull %s → %s", remote_path, local_path)
 
     def wait(self, cmd, pattern, timeout=30):
+        """执行 cmd 并流式监控输出，直到匹配 pattern 或超时。
+
+        linux 模式下会自动添加 cd 前缀；bootloader 模式直接发送命令。
+        pattern: str 或 re.Pattern，支持捕获组。
+        返回 re.Match，可通过 match.group(1) 等提取变量。
+        """
         if isinstance(pattern, str):
             pattern = re.compile(pattern)
-        args = self.args_prefix + [cmd]
-        remote_cmd = args_to_cmd(args)
+        if self._mode == 'linux':
+            args = self.args_prefix + [cmd]
+            remote_cmd = args_to_cmd(args)
+        else:
+            remote_cmd = cmd
         self._ser.write((remote_cmd + "\n").encode())
         self._ser.flush()
 
