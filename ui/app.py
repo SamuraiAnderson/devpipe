@@ -22,15 +22,25 @@ if "client_svc" not in st.session_state:
     st.session_state.client_svc = ClientService()
     st.session_state.script_svc = ScriptService()
 
-from ui.components.client_panel import render_client_panel
 from ui.components.log_panel import render_log_panel
 from ui.components.script_panel import render_script_panel
+from ui.components.visualization_panel import render_visualization_panel
 
 st.markdown(
     """
     <style>
-    [data-testid="stSidebar"] { min-width: 280px; }
-    .log-container pre { font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace; font-size: 12px; }
+    [data-testid="stSidebar"] { min-width: 300px; }
+    .log-container pre {
+        font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+        font-size: 12px;
+    }
+    [data-testid="stSidebar"] button {
+        padding: 0.25rem 0.4rem;
+        min-height: 2rem;
+    }
+    [data-testid="stSidebar"] [data-testid="column"] p {
+        line-height: 2rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -40,6 +50,6 @@ with st.sidebar:
     st.markdown("### RedPyMake")
     render_script_panel(st.session_state.script_svc)
 
-render_client_panel(st.session_state.client_svc)
+render_visualization_panel()
 st.divider()
 render_log_panel()
