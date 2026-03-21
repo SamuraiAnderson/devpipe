@@ -1,4 +1,6 @@
 from .BaseControl import *
+import re
+import time
 import paramiko
 from paramiko import SSHClient
 
@@ -11,6 +13,11 @@ class Linux(BaseControl):
         self.remoter = SSHClient()
         self.remoter.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.remoter.connect(hostname=self._host, username=self.user)
+        self._register()
+
+    @property
+    def platform(self) -> str:
+        return "Linux"
 
     @property
     def args_prefix(self):
@@ -24,6 +31,14 @@ class Linux(BaseControl):
     def host(self):
         return self._host
 
+    def cd(self, target):
+        resolve_cmd = f"cd {self._pwd} && cd {target} && pwd"
+        stdin, stdout, stderr = self.remoter.exec_command(resolve_cmd)
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            raise RemoteFileNotFoundError(self.host, target)
+        self._pwd = stdout.read().decode(errors='replace').strip()
+
     @property
     def pwd(self):
         return self._pwd
@@ -36,15 +51,59 @@ class Linux(BaseControl):
         else:
             raise RemoteFileNotFoundError(self.host, path)
 
+    @staticmethod
+    def _channel_read_fn(channel):
+        """返回一个从 paramiko Channel 流式读取的 read_fn 闭包。"""
+        def read_fn():
+            if channel.recv_ready():
+                return channel.recv(4096).decode(errors='replace')
+            if channel.exit_status_ready() and not channel.recv_ready():
+                return None
+            return ""
+        return read_fn
+
     def shell(self, *args):
         args = self.args_prefix + list(args)
         remote_cmd = args_to_cmd(args)
         stdin, stdout, stderr = self.remoter.exec_command(remote_cmd)
-        exit_status = stdout.channel.recv_exit_status()
+        channel = stdout.channel
+
+        out_text, _ = self._stream_and_tee(self._channel_read_fn(channel))
+        exit_status = channel.recv_exit_status()
+        stderr_text = stderr.read().decode(errors='replace')
         if exit_status != 0:
-            raise ShellError(self.host, remote_cmd, exit_status, stdout.read().decode(), stderr.read().decode())
+            raise ShellError(self.host, remote_cmd, exit_status, out_text, stderr_text)
         self.log.debug("shell: %s", remote_cmd)
-        return exit_status, stdout.read().decode(), stderr.read().decode()
+        return exit_status, out_text, stderr_text
+
+    def wait(self, cmd, pattern, timeout=30):
+        if isinstance(pattern, str):
+            pattern = re.compile(pattern)
+        args = self.args_prefix + [cmd]
+        remote_cmd = args_to_cmd(args)
+        stdin, stdout, stderr = self.remoter.exec_command(remote_cmd)
+        channel = stdout.channel
+
+        deadline = time.time() + timeout
+
+        def read_fn():
+            if time.time() >= deadline:
+                channel.close()
+                return None
+            if channel.recv_ready():
+                return channel.recv(4096).decode(errors='replace')
+            if channel.exit_status_ready() and not channel.recv_ready():
+                return None
+            return ""
+
+        output, match = self._stream_and_tee(
+            read_fn,
+            stop_fn=lambda acc: pattern.search(acc),
+        )
+        if match:
+            channel.close()
+            return match
+        raise WaitTimeoutError(self.host, pattern.pattern, timeout, output)
 
     def push(self, local_path, remote_path):
         sftp = None
@@ -72,6 +131,7 @@ class Linux(BaseControl):
 
     def close(self):
         self.remoter.close()
+        self._unregister()
 
     @property
     def name(self):

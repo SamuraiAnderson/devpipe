@@ -1,4 +1,7 @@
 from .BaseControl import *
+import re
+import subprocess
+import time
 
 class AdbCnet(BaseControl):
     def __init__(self, host, user=None) -> None:
@@ -6,10 +9,23 @@ class AdbCnet(BaseControl):
         self._pwd = '~'
         self._user = 'oem'
         self._connect()
+        self._register()
+
+    @property
+    def platform(self) -> str:
+        return "Android"
 
     @property
     def args_prefix(self):
         return ['cd', self.pwd, "&&"]
+
+    def cd(self, target):
+        resolve_cmd = args_to_cmd(["adb", "shell",
+            f"cd {self._pwd} && cd {target} && pwd"])
+        code, out, _ = subprocess_run(resolve_cmd)
+        if code != 0:
+            raise RemoteFileNotFoundError(self.host, target)
+        self._pwd = out.decode(errors='replace').strip()
 
     @property
     def pwd(self):
@@ -42,11 +58,33 @@ class AdbCnet(BaseControl):
         args = self.args_prefix + list(args)
         remote_cmd = args_to_cmd(args)
         cmd = args_to_cmd(["adb", "shell", remote_cmd])
-        code, out, err = subprocess_run(cmd)
+        code, out, err = subprocess_run_streaming(
+            cmd, on_chunk=self._log_chunk
+        )
         if code != 0:
             raise ShellError(self.host, remote_cmd, code, out, err)
         self.log.debug("shell: %s", cmd)
-        return code, out.decode(), err.decode()
+        return code, out.decode(errors='replace'), err.decode(errors='replace')
+
+    def wait(self, cmd, pattern, timeout=30):
+        if isinstance(pattern, str):
+            pattern = re.compile(pattern)
+        args = self.args_prefix + [cmd]
+        remote_cmd = args_to_cmd(args)
+        full_cmd = args_to_cmd(["adb", "shell", remote_cmd])
+        process = subprocess.Popen(
+            full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
+        )
+
+        deadline = time.time() + timeout
+        output, match = self._stream_and_tee(
+            subprocess_read_fn(process, deadline),
+            stop_fn=lambda acc: pattern.search(acc),
+        )
+        if match:
+            process.kill()
+            return match
+        raise WaitTimeoutError(self.host, pattern.pattern, timeout, output)
 
     def push(self, file_local, file_remote):
         cmd = args_to_cmd(['adb', 'push', file_local, file_remote])
@@ -65,6 +103,7 @@ class AdbCnet(BaseControl):
     def close(self):
         cmd = args_to_cmd(['adb', 'disconnect', self._host])
         subprocess_run(cmd)
+        self._unregister()
 
     @property
     def name(self):

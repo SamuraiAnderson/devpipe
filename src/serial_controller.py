@@ -34,6 +34,7 @@ class SerialControl(BaseControl):
         self._exec_raw("")
         if mode == 'linux':
             self._exec_raw("stty -echo 2>/dev/null; export PS1=''")
+        self._register()
 
     @staticmethod
     def _parse_open_error(exc):
@@ -51,12 +52,23 @@ class SerialControl(BaseControl):
         return f"串口打开失败：{exc}"
 
     @property
+    def platform(self) -> str:
+        return "Serial"
+
+    @property
     def host(self):
         return self._port
 
     @property
     def args_prefix(self):
         return ['cd', self.pwd, '&&']
+
+    def cd(self, target):
+        code, stdout, _ = self._exec_raw(
+            f"cd {self._pwd} && cd {target} && pwd")
+        if code != 0:
+            raise RemoteFileNotFoundError(self.host, target)
+        self._pwd = stdout.strip()
 
     @property
     def pwd(self):
@@ -74,17 +86,25 @@ class SerialControl(BaseControl):
     def name(self):
         return 'posix'
 
-    def _read_until(self, sentinel, deadline):
-        buf = ""
-        while time.time() < deadline:
+    def _serial_read_fn(self, deadline):
+        """返回一个从串口流式读取的 read_fn 闭包。"""
+        def read_fn():
+            if time.time() >= deadline:
+                return None
             n = self._ser.in_waiting
-            if n:
-                buf += self._ser.read(n).decode(errors='replace')
-                if sentinel in buf:
-                    return buf
-            else:
-                time.sleep(0.02)
-        raise WaitTimeoutError(self.host, sentinel, self._timeout, buf)
+            return self._ser.read(n).decode(errors='replace') if n else ""
+        return read_fn
+
+    def _read_until(self, sentinel, deadline):
+        output, found = self._stream_and_tee(
+            self._serial_read_fn(deadline),
+            on_chunk=lambda c: None,
+            stop_fn=lambda acc: sentinel if sentinel in acc else None,
+            interval=0.02,
+        )
+        if not found:
+            raise WaitTimeoutError(self.host, sentinel, self._timeout, output)
+        return output
 
     def _exec_raw(self, cmd):
         if self._mode == 'bootloader':
@@ -126,21 +146,27 @@ class SerialControl(BaseControl):
         self._ser.write((cmd + "\n").encode())
         self._ser.flush()
 
-        buf = ""
         deadline = time.time() + self._timeout
-        while time.time() < deadline:
-            n = self._ser.in_waiting
-            if n:
-                buf += self._ser.read(n).decode(errors='replace')
-                lines = buf.rstrip().split('\n')
-                if lines:
-                    last = lines[-1].strip()
-                    if last.endswith('#') or last.endswith('>'):
-                        stdout = '\n'.join(lines[1:-1]).strip()
-                        return 0, stdout, ""
-            else:
-                time.sleep(0.02)
-        raise WaitTimeoutError(self.host, "prompt (# or >)", self._timeout, buf)
+
+        def stop_fn(acc):
+            lines = acc.rstrip().split('\n')
+            if lines:
+                last = lines[-1].strip()
+                if last.endswith('#') or last.endswith('>'):
+                    return True
+            return None
+
+        output, found = self._stream_and_tee(
+            self._serial_read_fn(deadline),
+            on_chunk=lambda c: None,
+            stop_fn=stop_fn,
+            interval=0.02,
+        )
+        if not found:
+            raise WaitTimeoutError(self.host, "prompt (# or >)", self._timeout, output)
+        lines = output.rstrip().split('\n')
+        stdout = '\n'.join(lines[1:-1]).strip()
+        return 0, stdout, ""
 
     def shell(self, *args) -> tuple:
         if self._mode == 'bootloader':
@@ -213,18 +239,13 @@ class SerialControl(BaseControl):
         self._ser.write((remote_cmd + "\n").encode())
         self._ser.flush()
 
-        output = ""
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            n = self._ser.in_waiting
-            if n:
-                chunk = self._ser.read(n).decode(errors='replace')
-                output += chunk
-                m = pattern.search(output)
-                if m:
-                    return m
-            else:
-                time.sleep(0.05)
+        output, match = self._stream_and_tee(
+            self._serial_read_fn(deadline),
+            stop_fn=lambda acc: pattern.search(acc),
+        )
+        if match:
+            return match
         raise WaitTimeoutError(self.host, pattern.pattern, timeout, output)
 
     def get_file_timestamp(self, path):
@@ -240,3 +261,4 @@ class SerialControl(BaseControl):
     def close(self):
         if self._ser and self._ser.is_open:
             self._ser.close()
+        self._unregister()
