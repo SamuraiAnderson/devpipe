@@ -11,28 +11,18 @@ _PLATFORM_ICONS = {
     "Serial":  ":electric_plug:",
 }
 
-_PLATFORM_COLORS = {
-    "Local":   "blue",
-    "Linux":   "green",
-    "Android": "orange",
-    "Serial":  "violet",
-}
-
 
 def _render_controller_card(info: ControllerInfo):
     icon = _PLATFORM_ICONS.get(info.platform, ":gear:")
-    color = _PLATFORM_COLORS.get(info.platform, "gray")
 
-    var_label = f"  `{info.var_name}`" if info.var_name else ""
-    st.markdown(f"### {icon} {info.platform}{var_label}")
-
-    st.caption(f"类: `{info.class_name}`")
+    var_part = f" (`{info.var_name}`)" if info.var_name else ""
+    st.markdown(f"**{icon} {info.platform}** · `{info.class_name}`{var_part}")
 
     if info.params:
-        for key, value in info.params.items():
-            st.markdown(f"- **{key}**: `{value}`")
+        params_str = " &nbsp; ".join(f"`{k}={v}`" for k, v in info.params.items())
+        st.caption(params_str)
     else:
-        st.markdown("_无构造参数_")
+        st.caption("_无构造参数_")
 
 
 def render_visualization_panel():

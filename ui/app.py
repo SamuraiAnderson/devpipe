@@ -29,17 +29,30 @@ from ui.components.visualization_panel import render_visualization_panel
 st.markdown(
     """
     <style>
+    .block-container { padding-top: 1rem !important; padding-bottom: 0.5rem !important; }
+    [data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
     [data-testid="stSidebar"] { min-width: 300px; }
-    .log-container pre {
-        font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
-        font-size: 12px;
-    }
     [data-testid="stSidebar"] button {
         padding: 0.25rem 0.4rem;
         min-height: 2rem;
     }
     [data-testid="stSidebar"] [data-testid="column"] p {
         line-height: 2rem;
+    }
+    .log-terminal {
+        background-color: #012456;
+        color: #cccccc;
+        font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, 'Courier New', monospace;
+        font-size: 13px;
+        line-height: 1.4;
+        height: calc(100vh - 22rem);
+        min-height: 200px;
+        overflow-y: auto;
+        border-radius: 6px;
+        padding: 0.6rem 0.8rem;
+    }
+    .log-terminal {
+        word-wrap: break-word;
     }
     </style>
     """,
@@ -51,5 +64,4 @@ with st.sidebar:
     render_script_panel(st.session_state.script_svc)
 
 render_visualization_panel()
-st.divider()
 render_log_panel()
