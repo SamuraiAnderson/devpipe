@@ -26,7 +26,9 @@ def _active_sources() -> list[str]:
     if not controllers:
         return list(SOURCES)
 
-    platforms = list(dict.fromkeys(c.platform for c in controllers))
+    platforms = list(dict.fromkeys(
+        c.platform for c in controllers if c.kind == "controller"
+    ))
     return [ALL, SCRIPT] + platforms
 
 

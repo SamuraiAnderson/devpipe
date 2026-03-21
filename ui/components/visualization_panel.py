@@ -9,6 +9,7 @@ _PLATFORM_ICONS = {
     "Linux":   ":desktop_computer:",
     "Android": ":iphone:",
     "Serial":  ":electric_plug:",
+    "TFTP":    ":open_file_folder:",
 }
 
 
@@ -37,7 +38,7 @@ def render_visualization_panel():
     controllers = analyze_script(selected)
 
     if not controllers:
-        st.warning("未检测到控制器实例化（AdbCnet / Linux / LocalHost / SerialControl）")
+        st.warning("未检测到控制器或服务实例化（AdbCnet / Linux / LocalHost / SerialControl / TftpdServer）")
         return
 
     cols = st.columns(min(len(controllers), 3))

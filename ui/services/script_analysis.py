@@ -1,8 +1,8 @@
 """AST-based static analysis for task scripts.
 
 Parses Python scripts to extract controller instantiations (AdbCnet, Linux,
-LocalHost, SerialControl) and their constructor parameters without executing
-the script.
+LocalHost, SerialControl) and service instantiations (TftpdServer) along with
+their constructor parameters without executing the script.
 """
 
 from __future__ import annotations
@@ -31,6 +31,17 @@ CONTROLLER_PARAM_NAMES: dict[str, list[str]] = {
     "SerialControl": ["port", "baudrate", "timeout", "mode"],
 }
 
+KNOWN_SERVICES: dict[str, str] = {
+    "TftpdServer": "TFTP",
+}
+
+SERVICE_PARAM_NAMES: dict[str, list[str]] = {
+    "TftpdServer": ["root_dir", "host", "port"],
+}
+
+_ALL_KNOWN: dict[str, str] = {**KNOWN_CONTROLLERS, **KNOWN_SERVICES}
+_ALL_PARAM_NAMES: dict[str, list[str]] = {**CONTROLLER_PARAM_NAMES, **SERVICE_PARAM_NAMES}
+
 
 @dataclass
 class ControllerInfo:
@@ -38,6 +49,7 @@ class ControllerInfo:
     platform: str
     var_name: Optional[str]
     params: dict[str, str] = field(default_factory=dict)
+    kind: str = "controller"
 
 
 def _resolve_arg(node: ast.expr) -> str:
@@ -62,19 +74,19 @@ def _resolve_arg(node: ast.expr) -> str:
 
 def _collect_imports(tree: ast.Module) -> dict[str, str]:
     """Walk the *entire* AST and build a mapping {local_name -> class_name}
-    for every import of a known controller class, including imports nested
-    inside functions."""
+    for every import of a known controller or service class, including imports
+    nested inside functions."""
     mapping: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for alias in node.names:
                 name = alias.asname or alias.name
-                if alias.name in KNOWN_CONTROLLERS:
+                if alias.name in _ALL_KNOWN:
                     mapping[name] = alias.name
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 name = alias.asname or alias.name
-                if name in KNOWN_CONTROLLERS:
+                if name in _ALL_KNOWN:
                     mapping[name] = name
     return mapping
 
@@ -83,7 +95,7 @@ def _find_instantiations(
     tree: ast.Module,
     import_map: dict[str, str],
 ) -> list[ControllerInfo]:
-    """Walk the AST for Call nodes that instantiate known controllers."""
+    """Walk the AST for Call nodes that instantiate known controllers or services."""
     results: list[ControllerInfo] = []
     seen_keys: set[tuple[str, str | None]] = set()
 
@@ -101,8 +113,9 @@ def _find_instantiations(
             continue
 
         class_name = import_map[call_name]
-        platform = KNOWN_CONTROLLERS[class_name]
-        param_names = CONTROLLER_PARAM_NAMES.get(class_name, [])
+        platform = _ALL_KNOWN[class_name]
+        param_names = _ALL_PARAM_NAMES.get(class_name, [])
+        kind = "service" if class_name in KNOWN_SERVICES else "controller"
 
         params: dict[str, str] = {}
         for idx, arg in enumerate(node.args):
@@ -124,6 +137,7 @@ def _find_instantiations(
             platform=platform,
             var_name=var_name,
             params=params,
+            kind=kind,
         ))
 
     return results
@@ -159,9 +173,11 @@ class _VarNameVisitor(ast.NodeVisitor):
 
 
 def analyze_script(script_id: str) -> list[ControllerInfo]:
-    """Analyze a script file and return detected controller instantiations.
+    """Analyze a script file and return detected controller/service instantiations.
 
     *script_id* is relative to PROJECT_ROOT (e.g. ``example/main.py``).
+    Each returned ``ControllerInfo`` carries a ``kind`` field: ``"controller"``
+    for platform controllers, ``"service"`` for infrastructure services.
     """
     script_path = PROJECT_ROOT / script_id
     if not script_path.exists():
