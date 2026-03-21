@@ -1,5 +1,4 @@
 import logging
-import os
 import threading
 from collections import deque
 from datetime import datetime
@@ -7,33 +6,14 @@ from io import TextIOWrapper
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
-_HOST_TO_SOURCE: dict[str, str] = {}
-
-
-def _init_host_map():
-    """Build a mapping from host string to platform label using .env values."""
-    _HOST_TO_SOURCE['localhost'] = 'Local'
-    linux_host = os.getenv('LINUX_HOST', '')
-    android_host = os.getenv('ANDROID_HOST', '')
-    if linux_host:
-        _HOST_TO_SOURCE[linux_host] = 'Linux'
-    if android_host:
-        _HOST_TO_SOURCE[android_host] = 'Android'
-
-
-_init_host_map()
-
 ALL = 'All'
+SCRIPT = 'Script'
 
 
 class LogRecord:
     __slots__ = ('timestamp', 'level', 'message', 'source')
 
-    def __init__(self, timestamp: str, level: str, message: str, source: str = 'General'):
+    def __init__(self, timestamp: str, level: str, message: str, source: str = SCRIPT):
         self.timestamp = timestamp
         self.level = level
         self.message = message
@@ -42,8 +22,11 @@ class LogRecord:
     def formatted(self) -> str:
         return f"{self.timestamp} [{self.level}] {self.message}"
 
+    def formatted_all(self) -> str:
+        return f"{self.timestamp} [{self.source}] [{self.level}] {self.message}"
 
-SOURCES = [ALL, 'Local', 'Linux', 'Android']
+
+SOURCES = [ALL, SCRIPT, 'Local', 'Linux', 'Android']
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _LOG_DIR = _PROJECT_ROOT / 'logs'
@@ -175,9 +158,9 @@ class UILogHandler(logging.Handler):
     @staticmethod
     def _resolve_source(record: logging.LogRecord) -> str:
         if record.name.startswith('client.'):
-            host = record.name.split('.', 1)[1]
-            return _HOST_TO_SOURCE.get(host, host)
-        return 'General'
+            parts = record.name.split('.', 2)
+            return parts[1] if len(parts) >= 2 else SCRIPT
+        return SCRIPT
 
 
 _handler: Optional[UILogHandler] = None

@@ -111,4 +111,5 @@ class ClientService:
         info = self._clients[platform]
         if info.state == ConnState.CONNECTED:
             return info.controller
-        return None
+        from src.BaseControl import BaseControl
+        return BaseControl._registry.get(platform.value)
