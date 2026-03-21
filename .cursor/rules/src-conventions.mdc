@@ -1,0 +1,45 @@
+---
+description: src/ 核心库编码规范 — 控制器接口、异常体系、流式读取
+globs: src/**/*.py
+alwaysApply: false
+---
+
+# 核心库编码规范
+
+## 控制器接口
+
+所有平台控制器继承 `BaseControl`，必须实现以下方法：
+
+- `platform` (property) — 返回平台标识字符串
+- `shell(*args, **kwargs) -> (returncode, stdout, stderr)` — 执行命令，返回三元组
+- `push(local_path, remote_path)` — 上传文件
+- `pull(remote_path, local_path)` — 下载文件
+- `wait(cmd, pattern, timeout)` — 流式监控直到匹配正则或超时，返回 `re.Match`
+- `pwd()` — 当前工作目录
+- `file_exist(path)` — 文件是否存在
+- `get_file_timestamp(file)` — 获取文件时间戳
+
+## 上下文管理器
+
+控制器支持 `with` 语句，`close()` 中调用 `_unregister()`。
+
+## 异常体系
+
+```
+RemoteError(host, message)
+├── ShellError(host, cmd, code, stdout, stderr)
+├── TransferError(host, src, dst, reason)
+├── RemoteConnectionError(host, reason)
+├── RemoteFileNotFoundError(host, path, reason)
+└── WaitTimeoutError(host, pattern, timeout, output)
+```
+
+抛出异常时选择最具体的子类，始终传入 `host` 标识来源。
+
+## 流式读取
+
+使用 `_stream_and_tee(read_fn, on_chunk, stop_fn, interval)` 模板处理流式输出，不要在子类中重复实现流式循环。
+
+## 注册机制
+
+构造时调用 `_register()` 注册到 `BaseControl._registry`，`close()` 时自动注销。

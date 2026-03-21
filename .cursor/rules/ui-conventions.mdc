@@ -1,0 +1,29 @@
+---
+description: Streamlit UI 层规范 — 组件/服务分层、类型定义、脚本分析
+globs: ui/**/*.py
+alwaysApply: false
+---
+
+# Streamlit UI 规范
+
+## 启动方式
+
+从项目根目录执行 `streamlit run ui/app.py`。
+
+## 目录分层
+
+- `ui/components/` — 面板组件（`script_panel`、`log_panel`、`visualization_panel`、`client_panel`）
+- `ui/services/` — 业务逻辑（`ClientService`、`ScriptService`、`LogService`、`script_analysis`）
+
+## 编码要求
+
+- 充分使用 **type hints**
+- 数据结构用 `dataclass`，状态枚举用 `Enum`
+- 服务类管理各自职责：
+  - `ClientService` — 连接与控制器管理
+  - `ScriptService` — 脚本扫描与后台执行
+  - `LogService` — 日志分发与环形缓冲
+
+## 脚本分析
+
+使用 Python `ast` 模块静态解析 `example/` 下的脚本，提取 `AdbCnet`、`Linux`、`LocalHost`、`SerialControl` 实例信息。不要用正则或字符串匹配替代 AST 解析。

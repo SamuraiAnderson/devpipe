@@ -1,0 +1,32 @@
+---
+description: RedPyMake 项目总览 — 架构、目录、导入与命名约定
+alwaysApply: true
+---
+
+# RedPyMake 项目概览
+
+跨平台测试与构建脚本框架，在不同平台（本地、Linux/SSH、Android/ADB、串口）上执行命令、传输文件，并提供 Make 风格增量执行。
+
+## 目录结构
+
+- `src/` — 核心库：`BaseControl` 基类及各平台实现、`UFile`、`make_style`
+- `ui/` — Streamlit Web 界面：`components/`(面板组件)、`services/`(业务服务)
+- `example/` — 示例/测试脚本，通过 `.env` + `argparse` 配置
+- `doc/` — 设计文档
+
+## 导入约定
+
+- `src/` 内部使用**相对导入**：`from .BaseControl import *`
+- `example/`、`ui/` 通过 `sys.path.insert(0, PROJECT_ROOT)` 后 `import src`
+
+## 命名约定
+
+- 类：`PascalCase`（`BaseControl`、`AdbCnet`、`LocalHost`）
+- 函数 / 变量：`snake_case`
+- 私有成员：`_leading_underscore`（`_host`、`_stream_and_tee`）
+- 使用 `dataclass` 和 `Enum` 做结构化类型定义
+
+## 语言
+
+- 代码注释和 docstring 使用**中文**
+- 与用户交流使用**中文**

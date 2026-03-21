@@ -1,0 +1,35 @@
+---
+description: 示例/测试脚本约定 — 配置管理、入口函数、增量执行
+globs: example/**/*.py
+alwaysApply: false
+---
+
+# 示例脚本约定
+
+## 配置管理
+
+- 环境变量放 `.env`（不提交），模板放 `.env.example`
+- 使用 `python-dotenv` 加载环境变量，`argparse` 处理命令行参数
+- 参考 `example/config.py` 中的模式
+
+## 入口函数
+
+脚本入口函数命名为 `make_test` 或 `main`，供 UI 层 `ScriptService` 自动发现和调用。
+
+## 增量执行
+
+使用 `make_style_decorate` 装饰器实现 Make 风格增量执行——比较源/目标文件时间戳，仅在目标更旧时执行。
+
+## 跨平台文件
+
+使用 `UFile(dev, path)` 封装跨平台文件路径，通过 `exist`、`get_timestamp`、`is_file`、`is_dir` 查询文件状态。
+
+## 控制器使用
+
+通过 `with` 语句管理控制器生命周期：
+
+```python
+with Linux(host, user) as linux:
+    linux.shell("uname -a")
+    linux.push(local_file, remote_path)
+```
