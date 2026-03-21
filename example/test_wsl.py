@@ -162,9 +162,9 @@ def make_test():
         log.error("断言失败: %s", e, exc_info=True)
         sys.exit(1)
     finally:
-        if linux is not None:
-            linux.close()
-            log.info("WSL 连接已关闭")
+        # if linux is not None:
+        #     linux.close()
+        #     log.info("WSL 连接已关闭")
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
         log.info("本地临时目录已清理: %s", tmp_dir)
