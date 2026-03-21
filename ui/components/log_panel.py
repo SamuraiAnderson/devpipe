@@ -1,10 +1,12 @@
 import html
+import json
 import re
 from datetime import timedelta
 
 import streamlit as st
 
 from ui.services.client_service import Platform
+from ui.services.history_service import get_history
 from ui.services.log_service import ALL, SCRIPT, SOURCES, get_buffer, get_file_writer
 from ui.services.script_analysis import analyze_script
 
@@ -88,6 +90,58 @@ def _render_log_tab(source: str):
         args=(source,),
     )
 
+    if controller:
+        history_cmds = get_history(controller.host).load()
+        _inject_history_js(source, history_cmds)
+
+
+def _inject_history_js(source: str, history: list[str]):
+    """注入 JavaScript，为当前 Tab 的输入框添加上下键切换命令历史。"""
+    history_json = json.dumps(history, ensure_ascii=False).replace("</", r"<\/")
+    marker_id = f"hist-{source}"
+    script = (
+        f'<div id="{marker_id}" style="display:none"></div>'
+        "<script>"
+        "setTimeout(function(){"
+        f'var m=document.getElementById("{marker_id}");'
+        "if(!m)return;"
+        f"var h={history_json};"
+        'var c=m;while(c&&!c.querySelector(\'input[type="text"]\')){c=c.parentElement;}'
+        "if(!c)return;"
+        'var inp=c.querySelector(\'input[type="text"]\');'
+        "if(!inp)return;"
+        "var ol=inp._cmdHistLen||0;"
+        "inp._cmdHistory=h;inp._cmdHistLen=h.length;"
+        "if(h.length!==ol){inp._histIdx=h.length;}"
+        "if(inp._hBound)return;"
+        "inp._hBound=true;"
+        "var set=Object.getOwnPropertyDescriptor("
+        "window.HTMLInputElement.prototype,'value').set;"
+        "inp.addEventListener('keydown',function(e){"
+        "var hist=inp._cmdHistory;"
+        "if(!hist||!hist.length)return;"
+        "if(e.key==='ArrowUp'){"
+        "e.preventDefault();"
+        "if(inp._histIdx>0)inp._histIdx--;"
+        "set.call(inp,hist[inp._histIdx]||'');"
+        "inp.dispatchEvent(new Event('input',{bubbles:true}));"
+        "}else if(e.key==='ArrowDown'){"
+        "e.preventDefault();"
+        "if(inp._histIdx<hist.length-1){"
+        "inp._histIdx++;"
+        "set.call(inp,hist[inp._histIdx]);"
+        "}else{"
+        "inp._histIdx=hist.length;"
+        "set.call(inp,'');"
+        "}"
+        "inp.dispatchEvent(new Event('input',{bubbles:true}));"
+        "}"
+        "});"
+        "},0);"
+        "</script>"
+    )
+    st.markdown(script, unsafe_allow_html=True)
+
 
 def _dispatch_cmd(controller, cmd: str):
     """拦截用户命令，处理内建命令，转发其余命令到 shell。"""
@@ -119,6 +173,9 @@ def _on_cmd_submit(source: str):
     controller = client_svc.get_controller(platform) if client_svc else None
     if controller is None:
         return
+
+    get_history(controller.host).add(cmd)
+
     try:
         _dispatch_cmd(controller, cmd)
     except Exception as exc:
