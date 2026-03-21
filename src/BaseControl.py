@@ -35,6 +35,7 @@ class BaseControl(object):
         android rv1106 时间会快一点
     '''
     _registry: dict[str, 'BaseControl'] = {}
+    _executor = __import__('concurrent.futures', fromlist=['ThreadPoolExecutor']).ThreadPoolExecutor(max_workers=8)
 
     @property
     def platform(self) -> str:
@@ -125,6 +126,40 @@ class BaseControl(object):
     def file_exist(self, path):
         raise NotImplementedError()
 
+    # ── async 包装：不同连接间可并发，同一连接由调用方保证串行 ──
+
+    async def async_shell(self, *args, **kwargs) -> tuple:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, lambda: self.shell(*args, **kwargs))
+
+    async def async_wait(self, cmd, pattern, timeout=30):
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, lambda: self.wait(cmd, pattern, timeout))
+
+    async def async_push(self, local_path, remote_path):
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, lambda: self.push(local_path, remote_path))
+
+    async def async_pull(self, remote_path, local_path):
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, lambda: self.pull(remote_path, local_path))
+
+    async def async_cd(self, target: str):
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, lambda: self.cd(target))
+
+    # ── 生命周期 ──
+
     def close(self):
         self._unregister()
 
@@ -132,6 +167,13 @@ class BaseControl(object):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
 
