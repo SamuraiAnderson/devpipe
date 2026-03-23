@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import builtins
 import ctypes
 import importlib
 import logging
 import os
+import queue
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -13,6 +15,42 @@ from typing import Callable, Optional
 from ui.services.log_service import begin_script_log_session
 
 log = logging.getLogger(__name__)
+
+_original_input = builtins.input
+
+
+class ScriptInputProxy:
+    """通过 builtins.input 猴子补丁拦截脚本工作线程的 input() 调用。"""
+
+    def __init__(self):
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._waiting = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def install(self, thread: threading.Thread):
+        self._thread = thread
+
+        def patched_input(prompt=''):
+            if threading.current_thread() is not self._thread:
+                return _original_input(prompt)
+            if prompt:
+                log.info(prompt)
+            self._waiting.set()
+            result = self._queue.get()
+            self._waiting.clear()
+            return result
+
+        builtins.input = patched_input
+
+    def uninstall(self):
+        builtins.input = _original_input
+
+    @property
+    def waiting_for_input(self) -> bool:
+        return self._waiting.is_set()
+
+    def provide_input(self, text: str):
+        self._queue.put(text)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -41,6 +79,7 @@ class ScriptService:
         self._running_id: Optional[str] = None
         self._current_thread: Optional[threading.Thread] = None
         self._on_state_change: Optional[Callable[[RunState, Optional[str]], None]] = None
+        self._input_proxy: Optional[ScriptInputProxy] = None
 
     @property
     def state(self) -> RunState:
@@ -104,6 +143,9 @@ class ScriptService:
         begin_script_log_session(script_id)
 
         def _worker():
+            input_proxy = ScriptInputProxy()
+            self._input_proxy = input_proxy
+            input_proxy.install(threading.current_thread())
             try:
                 module_path = script_id.replace(os.sep, '.').replace('/', '.').removesuffix('.py')
                 mod = importlib.import_module(module_path)
@@ -118,6 +160,9 @@ class ScriptService:
             except Exception as exc:
                 log.error("执行失败: %s — %s", script_id, exc)
                 self.state = RunState.ERROR
+            finally:
+                input_proxy.uninstall()
+                self._input_proxy = None
 
         self._current_thread = threading.Thread(target=_worker, daemon=True)
         self._current_thread.start()
@@ -146,3 +191,13 @@ class ScriptService:
 
     def is_running(self) -> bool:
         return self._state == RunState.RUNNING
+
+    @property
+    def waiting_for_input(self) -> bool:
+        proxy = self._input_proxy
+        return proxy is not None and proxy.waiting_for_input
+
+    def provide_input(self, text: str):
+        proxy = self._input_proxy
+        if proxy is not None:
+            proxy.provide_input(text)

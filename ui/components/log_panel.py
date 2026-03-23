@@ -6,6 +6,7 @@ from datetime import timedelta
 from typing import Optional
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from ui.services.history_service import get_history
 from ui.services.log_service import ALL, SCRIPT, close_log_session, get_buffer, get_file_writer
@@ -63,27 +64,40 @@ def render_log_panel():
 
     for tab_obj, tab in zip(tab_objects, tabs):
         with tab_obj:
-            _render_log_tab(tab)
+            if tab.controller_key is not None:
+                _render_controller_tab(tab)
+            elif tab.log_source == SCRIPT:
+                _render_script_tab(tab)
+            else:
+                _render_log_view(tab)
 
 
-@st.fragment(run_every=timedelta(milliseconds=500))
-def _render_log_tab(tab: _TabSource):
-    records = get_buffer().get_records(tab.log_source)
-    fmt = (lambda r: r.formatted_all()) if tab.log_source == ALL else (lambda r: r.formatted())
-    lines = "<br>".join(html.escape(fmt(r)) for r in records) if records else "(空)"
-    uid = f"log-{tab.log_source}"
-    terminal_html = (
-        f'<div class="log-terminal" id="{uid}">'
-        f"{lines}"
-        f"</div>"
-        f'<script>var e=document.getElementById("{uid}");'
-        f"e.scrollTop=e.scrollHeight;</script>"
+# ── 控制器 Tab：模式切换 + 日志/终端 + 输入框 ──
+
+def _render_controller_tab(tab: _TabSource):
+    col_mode, _ = st.columns([1, 5])
+    with col_mode:
+        terminal_mode = st.toggle("终端", key=f"term_mode_{tab.log_source}")
+
+    if terminal_mode:
+        _render_xterm_iframe(tab)
+    else:
+        _render_log_view(tab)
+
+    _render_cmd_input(tab, terminal_mode)
+
+
+def _render_xterm_iframe(tab: _TabSource):
+    session_key = tab.controller_key
+    components.iframe(
+        f"http://localhost:8766/terminal/{session_key}",
+        height=500,
+        scrolling=False,
     )
-    st.markdown(terminal_html, unsafe_allow_html=True)
 
-    if tab.controller_key is None:
-        return
 
+def _render_cmd_input(tab: _TabSource, terminal_mode: bool):
+    """底部命令输入框，两种模式均可用。"""
     client_svc = st.session_state.get("client_svc")
     controller = (
         client_svc.get_controller_by_key(tab.controller_key)
@@ -103,13 +117,52 @@ def _render_log_tab(tab: _TabSource):
         disabled=disabled,
         label_visibility="collapsed",
         on_change=_on_cmd_submit,
-        args=(tab.log_source, tab.controller_key),
+        args=(tab.log_source, tab.controller_key, terminal_mode),
     )
 
     if controller:
         history_cmds = get_history(controller.host).load()
         _inject_history_js(tab.log_source, history_cmds)
 
+
+# ── 脚本 Tab：日志 + stdin 输入框 ──
+
+def _render_script_tab(tab: _TabSource):
+    _render_log_view(tab)
+
+    script_svc = st.session_state.get("script_svc")
+    if script_svc and script_svc.is_running():
+        waiting = script_svc.waiting_for_input
+        placeholder = "脚本等待输入..." if waiting else "脚本运行中（无输入请求）"
+        st.text_input(
+            "脚本输入",
+            key="script_stdin_input",
+            placeholder=placeholder,
+            disabled=not waiting,
+            label_visibility="collapsed",
+            on_change=_on_script_stdin_submit,
+        )
+
+
+# ── 日志视图（fragment，500ms 轮询）──
+
+@st.fragment(run_every=timedelta(milliseconds=500))
+def _render_log_view(tab: _TabSource):
+    records = get_buffer().get_records(tab.log_source)
+    fmt = (lambda r: r.formatted_all()) if tab.log_source == ALL else (lambda r: r.formatted())
+    lines = "<br>".join(html.escape(fmt(r)) for r in records) if records else "(空)"
+    uid = f"log-{tab.log_source}"
+    terminal_html = (
+        f'<div class="log-terminal" id="{uid}">'
+        f"{lines}"
+        f"</div>"
+        f'<script>var e=document.getElementById("{uid}");'
+        f"e.scrollTop=e.scrollHeight;</script>"
+    )
+    st.markdown(terminal_html, unsafe_allow_html=True)
+
+
+# ── 命令历史 JS 注入 ──
 
 def _inject_history_js(source: str, history: list[str]):
     """注入 JavaScript，为当前 Tab 的输入框添加上下键切换命令历史。"""
@@ -159,6 +212,8 @@ def _inject_history_js(source: str, history: list[str]):
     st.markdown(script, unsafe_allow_html=True)
 
 
+# ── 命令提交回调 ──
+
 def _dispatch_cmd(controller, cmd: str):
     """拦截用户命令，处理内建命令，转发其余命令到 shell。"""
     user = getattr(controller, 'user', '')
@@ -177,11 +232,12 @@ def _dispatch_cmd(controller, cmd: str):
     controller.shell(cmd)
 
 
-def _on_cmd_submit(log_source: str, controller_key: str):
+def _on_cmd_submit(log_source: str, controller_key: str, terminal_mode: bool = False):
     widget_key = f"cmd_input_{log_source}"
     cmd = st.session_state.get(widget_key, "").strip()
     if not cmd:
         return
+
     client_svc = st.session_state.get("client_svc")
     controller = (
         client_svc.get_controller_by_key(controller_key)
@@ -192,8 +248,25 @@ def _on_cmd_submit(log_source: str, controller_key: str):
 
     get_history(controller.host).add(cmd)
 
-    try:
-        _dispatch_cmd(controller, cmd)
-    except Exception as exc:
-        controller.log.error("%s", exc)
+    if terminal_mode:
+        from ui.services.terminal_service import get_session
+        session = get_session(controller_key)
+        if session and not session.closed:
+            session.write((cmd + '\n').encode())
+    else:
+        try:
+            _dispatch_cmd(controller, cmd)
+        except Exception as exc:
+            controller.log.error("%s", exc)
+
     st.session_state[widget_key] = ""
+
+
+def _on_script_stdin_submit():
+    cmd = st.session_state.get("script_stdin_input", "").strip()
+    if not cmd:
+        return
+    script_svc = st.session_state.get("script_svc")
+    if script_svc and hasattr(script_svc, 'provide_input'):
+        script_svc.provide_input(cmd)
+    st.session_state["script_stdin_input"] = ""

@@ -17,6 +17,7 @@ class Platform(Enum):
     LOCAL = "Local"
     LINUX = "Linux"
     ANDROID = "Android"
+    SERIAL = "Serial"
 
 
 class ConnState(Enum):
@@ -52,6 +53,10 @@ class ClientService:
                 platform=Platform.ANDROID,
                 host=os.getenv("ANDROID_HOST", ""),
             ),
+            Platform.SERIAL: ClientInfo(
+                platform=Platform.SERIAL,
+                host=os.getenv("SERIAL_PORT", ""),
+            ),
         }
         self._try_connect_local()
 
@@ -81,6 +86,11 @@ class ClientService:
             elif platform == Platform.ANDROID:
                 from src.adb_connector import AdbCnet
                 ctrl = AdbCnet(info.host)
+                info.controller = ctrl
+            elif platform == Platform.SERIAL:
+                from src.serial_controller import SerialControl
+                baudrate = int(os.getenv("SERIAL_BAUDRATE", "115200"))
+                ctrl = SerialControl(info.host, baudrate=baudrate)
                 info.controller = ctrl
             elif platform == Platform.LOCAL:
                 self._try_connect_local()
