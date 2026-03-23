@@ -44,6 +44,13 @@ _ALL_PARAM_NAMES: dict[str, list[str]] = {**CONTROLLER_PARAM_NAMES, **SERVICE_PA
 
 
 @dataclass
+class LogFilterRule:
+    """脚本中 ``LOG_FILTERS`` 声明的单条过滤规则（regex 字符串）。"""
+    include: Optional[str] = None
+    exclude: Optional[str] = None
+
+
+@dataclass
 class ControllerInfo:
     class_name: str
     platform: str
@@ -185,6 +192,20 @@ class _InstantiationVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _parse_script_ast(script_id: str) -> Optional[ast.Module]:
+    """读取并解析脚本 AST，失败返回 None。"""
+    script_path = PROJECT_ROOT / script_id
+    if not script_path.exists():
+        log.warning("脚本不存在: %s", script_id)
+        return None
+    try:
+        source = script_path.read_text(encoding="utf-8")
+        return ast.parse(source, filename=str(script_path))
+    except SyntaxError as exc:
+        log.error("脚本语法错误: %s — %s", script_id, exc)
+        return None
+
+
 def analyze_script(script_id: str) -> list[ControllerInfo]:
     """Analyze a script file and return detected controller/service instantiations.
 
@@ -192,16 +213,8 @@ def analyze_script(script_id: str) -> list[ControllerInfo]:
     Each returned ``ControllerInfo`` carries a ``kind`` field: ``"controller"``
     for platform controllers, ``"service"`` for infrastructure services.
     """
-    script_path = PROJECT_ROOT / script_id
-    if not script_path.exists():
-        log.warning("脚本不存在: %s", script_id)
-        return []
-
-    try:
-        source = script_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(script_path))
-    except SyntaxError as exc:
-        log.error("脚本语法错误: %s — %s", script_id, exc)
+    tree = _parse_script_ast(script_id)
+    if tree is None:
         return []
 
     import_map = _collect_imports(tree)
@@ -211,3 +224,55 @@ def analyze_script(script_id: str) -> list[ControllerInfo]:
     visitor = _InstantiationVisitor(import_map)
     visitor.visit(tree)
     return visitor.results
+
+
+# ── LOG_FILTERS 提取 ──
+
+def _extract_log_filters_from_tree(tree: ast.Module) -> dict[str, LogFilterRule]:
+    """从 AST 顶层语句中提取 ``LOG_FILTERS = {...}`` 字典字面量。"""
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        if node.targets[0].id != 'LOG_FILTERS':
+            continue
+        if not isinstance(node.value, ast.Dict):
+            log.warning("LOG_FILTERS 应为 dict 字面量，已跳过")
+            return {}
+
+        result: dict[str, LogFilterRule] = {}
+        for key_node, val_node in zip(node.value.keys, node.value.values):
+            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+                continue
+            if not isinstance(val_node, ast.Dict):
+                continue
+
+            include: Optional[str] = None
+            exclude: Optional[str] = None
+            for ik, iv in zip(val_node.keys, val_node.values):
+                if not isinstance(ik, ast.Constant) or not isinstance(ik.value, str):
+                    continue
+                if not isinstance(iv, ast.Constant) or not isinstance(iv.value, str):
+                    continue
+                if ik.value == 'include':
+                    include = iv.value
+                elif ik.value == 'exclude':
+                    exclude = iv.value
+
+            if include is not None or exclude is not None:
+                result[key_node.value] = LogFilterRule(include=include, exclude=exclude)
+
+        return result
+    return {}
+
+
+def extract_log_filters(script_id: str) -> dict[str, LogFilterRule]:
+    """从脚本 AST 提取 ``LOG_FILTERS`` 变量，返回 ``{key: LogFilterRule}``。
+
+    key 可以是控制器变量名、固定 Tab 名（``'Script'`` / ``'All'``）或通配符 ``'*'``。
+    """
+    tree = _parse_script_ast(script_id)
+    if tree is None:
+        return {}
+    return _extract_log_filters_from_tree(tree)

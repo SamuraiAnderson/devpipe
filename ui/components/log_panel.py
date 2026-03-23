@@ -1,5 +1,6 @@
 import html
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import timedelta
@@ -10,7 +11,7 @@ import streamlit.components.v1 as components
 
 from ui.services.history_service import get_history
 from ui.services.log_service import ALL, SCRIPT, close_log_session, get_buffer, get_file_writer
-from ui.services.script_analysis import analyze_script
+from ui.services.script_analysis import analyze_script, extract_log_filters
 
 
 @dataclass
@@ -18,6 +19,8 @@ class _TabSource:
     label: str
     log_source: str
     controller_key: Optional[str] = None
+    include_re: Optional[re.Pattern] = None
+    exclude_re: Optional[re.Pattern] = None
 
 
 _FIXED_TABS = [
@@ -26,25 +29,76 @@ _FIXED_TABS = [
 ]
 
 
+_log = logging.getLogger(__name__)
+
+
+def _compile_re(pattern: Optional[str]) -> Optional[re.Pattern]:
+    if pattern is None:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        _log.warning("无效的日志过滤 regex %r: %s", pattern, exc)
+        return None
+
+
+def _merge_patterns(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """将两条 regex 字符串用 ``|`` 合并；任一为 None 则返回另一条。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return f"(?:{a})|(?:{b})"
+
+
 def _active_sources() -> list[_TabSource]:
     selected = st.session_state.get("selected_script")
     if not selected:
         return list(_FIXED_TABS)
 
     controllers = analyze_script(selected)
-    if not controllers:
-        return list(_FIXED_TABS)
+    filters = extract_log_filters(selected)
+    wildcard = filters.pop("*", None)
 
-    tabs: list[_TabSource] = list(_FIXED_TABS)
+    var_to_source: dict[str, str] = {}
+    for c in controllers:
+        if c.var_name:
+            var_to_source[c.var_name] = c.log_source
+
+    resolved: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    for key, rule in filters.items():
+        log_source = var_to_source.get(key, key)
+        resolved[log_source] = (rule.include, rule.exclude)
+
+    def _build_tab(log_source: str, **kwargs) -> _TabSource:
+        inc, exc = resolved.get(log_source, (None, None))
+        if wildcard:
+            inc = _merge_patterns(inc, wildcard.include)
+            exc = _merge_patterns(exc, wildcard.exclude)
+        return _TabSource(
+            log_source=log_source,
+            include_re=_compile_re(inc),
+            exclude_re=_compile_re(exc),
+            **kwargs,
+        )
+
+    tabs: list[_TabSource] = [
+        _build_tab(ALL, label="全部"),
+        _build_tab(SCRIPT, label="脚本"),
+    ]
+
+    if not controllers:
+        return tabs
+
     seen: set[str] = set()
     for c in controllers:
         if c.kind != "controller" or c.log_source in seen:
             continue
         seen.add(c.log_source)
         label = f"{c.platform} ({c.var_name})" if c.var_name else c.platform
-        tabs.append(_TabSource(
+        tabs.append(_build_tab(
+            c.log_source,
             label=label,
-            log_source=c.log_source,
             controller_key=c.log_source,
         ))
     return tabs
@@ -146,9 +200,21 @@ def _render_script_tab(tab: _TabSource):
 
 # ── 日志视图（fragment，500ms 轮询）──
 
+def _apply_filters(records, tab: _TabSource):
+    """根据 include_re / exclude_re 过滤日志记录列表。"""
+    if tab.include_re is None and tab.exclude_re is None:
+        return records
+    out = records
+    if tab.include_re is not None:
+        out = [r for r in out if tab.include_re.search(r.message)]
+    if tab.exclude_re is not None:
+        out = [r for r in out if not tab.exclude_re.search(r.message)]
+    return out
+
+
 @st.fragment(run_every=timedelta(milliseconds=500))
 def _render_log_view(tab: _TabSource):
-    records = get_buffer().get_records(tab.log_source)
+    records = _apply_filters(get_buffer().get_records(tab.log_source), tab)
     fmt = (lambda r: r.formatted_all()) if tab.log_source == ALL else (lambda r: r.formatted())
     lines = "<br>".join(html.escape(fmt(r)) for r in records) if records else "(空)"
     uid = f"log-{tab.log_source}"

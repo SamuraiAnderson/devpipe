@@ -20,6 +20,11 @@ log = logging.getLogger(__name__)
 WSL_HOST = os.getenv("WSL_HOST", "localhost")
 WSL_USER = os.getenv("WSL_USER", "lain")
 
+LOG_FILTERS = {
+    "linux": {"exclude": r"pwd|uname"},
+    "Script": {"exclude": r"清理"},
+}
+
 
 def make_test():
     from src.localhost import LocalHost
