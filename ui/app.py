@@ -22,6 +22,9 @@ if "client_svc" not in st.session_state:
     st.session_state.client_svc = ClientService()
     st.session_state.script_svc = ScriptService()
 
+    from ui.services.terminal_service import ensure_ws_server
+    ensure_ws_server(port=8766)
+
 from ui.components.log_panel import render_log_panel
 from ui.components.script_panel import render_script_panel
 from ui.components.visualization_panel import render_visualization_panel
