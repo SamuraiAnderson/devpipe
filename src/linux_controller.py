@@ -4,6 +4,38 @@ import time
 import paramiko
 from paramiko import SSHClient
 
+class _ParamikoInteractiveSession(InteractiveSession):
+    """基于 Paramiko SSH Channel 的交互式会话。"""
+
+    def __init__(self, channel):
+        self._channel = channel
+
+    def write(self, data: bytes) -> None:
+        if not self._channel.closed:
+            self._channel.send(data)
+
+    def read_nonblocking(self) -> bytes | None:
+        if self._channel.closed:
+            return None
+        if self._channel.recv_ready():
+            return self._channel.recv(4096)
+        if self._channel.exit_status_ready() and not self._channel.recv_ready():
+            return None
+        return None
+
+    def resize(self, cols: int, rows: int) -> None:
+        if not self._channel.closed:
+            self._channel.resize_pty(width=cols, height=rows)
+
+    def close(self) -> None:
+        if not self._channel.closed:
+            self._channel.close()
+
+    @property
+    def closed(self) -> bool:
+        return self._channel.closed
+
+
 class Linux(BaseControl):
     def __init__(self, host, user) -> None:
         self._user = user
@@ -128,6 +160,13 @@ class Linux(BaseControl):
             if sftp is not None:
                 sftp.close()
         self.log.debug("pull %s → %s", remote_path, local_path)
+
+    def open_interactive(self) -> 'InteractiveSession':
+        transport = self.remoter.get_transport()
+        channel = transport.open_session()
+        channel.get_pty(term='xterm-256color', width=120, height=40)
+        channel.invoke_shell()
+        return _ParamikoInteractiveSession(channel)
 
     def close(self):
         self.remoter.close()

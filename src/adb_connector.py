@@ -100,6 +100,14 @@ class AdbCnet(BaseControl):
             raise TransferError(self.host, file_remote, file_local, err)
         self.log.debug("pull %s → %s", file_remote, file_local)
 
+    def open_interactive(self) -> 'InteractiveSession':
+        import subprocess as _sp
+        process = _sp.Popen(
+            ['adb', 'shell'],
+            stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+        )
+        return SubprocessInteractiveSession(process)
+
     def close(self):
         cmd = args_to_cmd(['adb', 'disconnect', self._host])
         subprocess_run(cmd)

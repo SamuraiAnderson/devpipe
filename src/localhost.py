@@ -69,6 +69,15 @@ class LocalHost(BaseControl):
             return match
         raise WaitTimeoutError(self.host, pattern.pattern, timeout, output)
 
+    def open_interactive(self) -> 'InteractiveSession':
+        shell_cmd = ['cmd.exe'] if os.name == 'nt' else ['bash']
+        process = subprocess.Popen(
+            shell_cmd,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=self._pwd,
+        )
+        return SubprocessInteractiveSession(process)
+
     def get_file_timestamp(self, path):
         return int(os.stat(path).st_mtime)
 

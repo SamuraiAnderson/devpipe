@@ -5,6 +5,34 @@ import base64
 import uuid
 
 
+class _SerialInteractiveSession(InteractiveSession):
+    """基于 pyserial 的交互式会话，直接包装已有串口对象。"""
+
+    def __init__(self, controller: 'SerialControl'):
+        self._controller = controller
+        self._ser = controller._ser
+
+    def write(self, data: bytes) -> None:
+        if not self.closed:
+            self._ser.write(data)
+            self._ser.flush()
+
+    def read_nonblocking(self) -> bytes | None:
+        if self.closed:
+            return None
+        n = self._ser.in_waiting
+        if n > 0:
+            return self._ser.read(n)
+        return None
+
+    def close(self) -> None:
+        self._controller._interactive_mode = False
+
+    @property
+    def closed(self) -> bool:
+        return not self._controller._interactive_mode
+
+
 class SerialControl(BaseControl):
     """通过串口 (UART) 控制远程设备。
 
@@ -23,6 +51,7 @@ class SerialControl(BaseControl):
         self._timeout = timeout
         self._mode = mode
         self._pwd = '~'
+        self._interactive_mode = False
         try:
             self._ser = _serial.Serial(port, baudrate, timeout=timeout)
         except Exception as e:
@@ -168,7 +197,13 @@ class SerialControl(BaseControl):
         stdout = '\n'.join(lines[1:-1]).strip()
         return 0, stdout, ""
 
+    def _check_not_interactive(self):
+        if self._interactive_mode:
+            raise RuntimeError(
+                f"[{self.host}] 交互终端已打开，请先关闭终端再执行命令")
+
     def shell(self, *args) -> tuple:
+        self._check_not_interactive()
         if self._mode == 'bootloader':
             return self._shell_bootloader(*args)
         return self._shell_linux(*args)
@@ -222,6 +257,11 @@ class SerialControl(BaseControl):
             raise TransferError(self.host, remote_path, local_path, str(e)) from e
         self.log.debug("pull %s → %s", remote_path, local_path)
 
+    def open_interactive(self) -> 'InteractiveSession':
+        self._check_not_interactive()
+        self._interactive_mode = True
+        return _SerialInteractiveSession(self)
+
     def wait(self, cmd, pattern, timeout=30):
         """执行 cmd 并流式监控输出，直到匹配 pattern 或超时。
 
@@ -229,6 +269,7 @@ class SerialControl(BaseControl):
         pattern: str 或 re.Pattern，支持捕获组。
         返回 re.Match，可通过 match.group(1) 等提取变量。
         """
+        self._check_not_interactive()
         if isinstance(pattern, str):
             pattern = re.compile(pattern)
         if self._mode == 'linux':

@@ -30,6 +30,88 @@ class WaitTimeoutError(RemoteError):
         super().__init__(host, f"wait for '{pattern}' timed out after {timeout}s")
 
 
+class InteractiveSession:
+    """持久交互式 Shell 会话的抽象接口，由各平台控制器子类化实现。"""
+
+    def write(self, data: bytes) -> None:
+        raise NotImplementedError
+
+    def read_nonblocking(self) -> bytes | None:
+        """有数据返回 bytes，无数据返回 None（不阻塞）。"""
+        raise NotImplementedError
+
+    def resize(self, cols: int, rows: int) -> None:
+        pass
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    @property
+    def closed(self) -> bool:
+        raise NotImplementedError
+
+
+class SubprocessInteractiveSession(InteractiveSession):
+    """基于 subprocess stdin/stdout pipe 的交互式会话（LocalHost、AdbCnet 共用）。"""
+
+    def __init__(self, process):
+        import os
+        import queue as _queue
+        import threading
+
+        self._process = process
+        self._queue: _queue.Queue[bytes | None] = _queue.Queue()
+        self._closed = False
+
+        def _reader():
+            fd = process.stdout.fileno()
+            try:
+                while True:
+                    data = os.read(fd, 4096)
+                    if not data:
+                        break
+                    self._queue.put(data)
+            except OSError:
+                pass
+            self._queue.put(None)
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+    def write(self, data: bytes) -> None:
+        if self._closed:
+            return
+        try:
+            self._process.stdin.write(data)
+            self._process.stdin.flush()
+        except OSError:
+            self._closed = True
+
+    def read_nonblocking(self) -> bytes | None:
+        import queue as _queue
+        if self._closed:
+            return None
+        try:
+            data = self._queue.get_nowait()
+            if data is None:
+                self._closed = True
+                return None
+            return data
+        except _queue.Empty:
+            return None
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            try:
+                self._process.terminate()
+            except OSError:
+                pass
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+
 class BaseControl(object):
     '''
         android rv1106 时间会快一点
@@ -126,6 +208,10 @@ class BaseControl(object):
 
     def file_exist(self, path):
         raise NotImplementedError()
+
+    def open_interactive(self) -> InteractiveSession:
+        """创建持久交互式 Shell 会话。子类按平台实现。"""
+        raise NotImplementedError
 
     # ── async 包装：不同连接间可并发，同一连接由调用方保证串行 ──
 
