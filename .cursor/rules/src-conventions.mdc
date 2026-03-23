@@ -43,3 +43,8 @@ RemoteError(host, message)
 ## 注册机制
 
 构造时调用 `_register()` 注册到 `BaseControl._registry`，`close()` 时自动注销。
+registry key 为 `f"{self.platform}.{self.host}"`（如 `"Linux.192.168.1.1"`），支持同平台多实例共存。
+
+## 日志
+
+每个控制器的 logger 名为 `client.{platform}.{host}`，UI 层据此路由日志到对应 tab。
