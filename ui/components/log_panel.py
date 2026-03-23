@@ -8,7 +8,7 @@ from typing import Optional
 import streamlit as st
 
 from ui.services.history_service import get_history
-from ui.services.log_service import ALL, SCRIPT, SOURCES, get_buffer, get_file_writer
+from ui.services.log_service import ALL, SCRIPT, close_log_session, get_buffer, get_file_writer
 from ui.services.script_analysis import analyze_script
 
 
@@ -58,9 +58,8 @@ def render_log_panel():
     with col_clear:
         st.markdown("")
         if st.button(":wastebasket:", key="clear_all", help="清空日志", use_container_width=True):
-            for t in tabs:
-                get_buffer().clear(t.log_source)
-                get_file_writer().rotate(t.log_source)
+            get_buffer().clear_all()
+            close_log_session()
 
     for tab_obj, tab in zip(tab_objects, tabs):
         with tab_obj:

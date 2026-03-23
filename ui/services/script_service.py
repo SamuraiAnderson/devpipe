@@ -10,6 +10,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
+from ui.services.log_service import begin_script_log_session
+
 log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -99,6 +101,7 @@ class ScriptService:
         self._running_id = script_id
         self.state = RunState.RUNNING
         log.info("开始执行: %s", script_id)
+        begin_script_log_session(script_id)
 
         def _worker():
             try:
