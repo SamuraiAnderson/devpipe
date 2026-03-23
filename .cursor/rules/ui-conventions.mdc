@@ -20,10 +20,39 @@ alwaysApply: false
 - 充分使用 **type hints**
 - 数据结构用 `dataclass`，状态枚举用 `Enum`
 - 服务类管理各自职责：
-  - `ClientService` — 连接与控制器管理
+  - `ClientService` — 连接与控制器管理（`get_controller_by_key` 按 `platform.host` 查找）
   - `ScriptService` — 脚本扫描与后台执行
-  - `LogService` — 日志分发与环形缓冲
+  - `LogService` — 日志分发与动态环形缓冲（`LogBuffer` 按需创建 source deque）
 
 ## 脚本分析
 
-使用 Python `ast` 模块静态解析 `example/` 下的脚本，提取 `AdbCnet`、`Linux`、`LocalHost`、`SerialControl` 实例信息。不要用正则或字符串匹配替代 AST 解析。
+使用 `_InstantiationVisitor`（`ast.NodeVisitor`）单次遍历 AST 提取控制器/服务实例化信息，在 `visit_Assign`/`visit_AnnAssign`/`visit_With`/`visit_Expr` 中自然获取 `var_name`。不要用正则或字符串匹配替代 AST 解析。
+
+`ControllerInfo` 关键属性：
+- `key` — 去重与 session_state 标识，格式 `"platform:var_name"` 或 `"platform"`
+- `log_source` — 匹配运行时日志路由，格式 `"platform.host"`
+
+## 日志分流
+
+三类日志（语义）与去向：
+
+| 类型 | Logger 特征 | Web 面板 | 磁盘 `logs/` | CLI |
+|------|-------------|----------|--------------|-----|
+| UI 程序日志 | `ui.*` 且**非** `ui.services.script_service`（含子 logger） | **不进** `LogBuffer` | 不写 | 照常（根 logger 的终端 handler，如 `app.py` 中 `basicConfig`） |
+| 脚本日志 | `ui.services.script_service`；任务脚本内 `logging`（如 `example.*`） | 「脚本」Tab +「全部」 | 仅磁盘会话激活时由 `LogFileWriter.write` 落盘 | 同上 |
+| 会话对端日志 | `client.{platform}.{host}`（`BaseControl.log`） | 各会话 Tab +「全部」 | 同上（动态 source 首次写入时按需 `open`） | 同上 |
+
+路由规则：`UILogHandler.emit` 在 `_IGNORED_LOGGERS` 之后，对「UI 程序日志」**直接 return**，不调用 `get_buffer` / `get_file_writer`；其余记录经 `_resolve_source`：`client.*` → `platform.host`，否则 → `Script`。`LogFileWriter.write` 在**无磁盘会话**时立即返回，不写任何文件。
+
+磁盘会话语义为 **start-in-use**：`ScriptService.run_script` 在启动工作线程前调用 `begin_script_log_session(script_id)`（首次调用创建 `All`、`Script` 及 AST 中各 controller 的 `log_source` 文件；后续调用沿用当前会话，仅为新出现的 source 追加打开）。会话**不随脚本结束关闭**，多脚本轮流执行共享同一批日志文件。用户点击「清空日志」按钮时调用 `close_log_session()`，关闭所有句柄并结束会话；之后直到下次 `begin` 前磁盘不再写入。
+
+**Tab 关系：** 固定「全部」「脚本」+ 由当前脚本 AST 解析出的**动态会话 Tab**；**不设「应用」Tab**。日志 Tab 集合为固定 Tab 与动态会话 Tab 之并，其中仅动态会话 Tab 对应远端会话，故 **log Tab 范围真超集于 session Tab**。
+
+**实现锚点：** `ui/services/log_service.py`（`UILogHandler`、`begin_script_log_session`、`close_log_session`、`LogFileWriter`）、`ui/services/script_service.py`、`ui/components/log_panel.py`（`_FIXED_TABS`、`_active_sources`）。
+
+## 多实例日志（会话侧）
+
+会话对端日志的路由 key 为 `platform.host`（如 `"Linux.192.168.1.1"`），贯穿全链路：
+
+- `BaseControl.log` → `UILogHandler._resolve_source` → `LogBuffer` → `log_panel` 会话 Tab
+- `log_panel` 用 `_TabSource(label, log_source, controller_key)` 为每个控制器实例生成独立 Tab，并在该 Tab 提供会话 CLI 输入框
