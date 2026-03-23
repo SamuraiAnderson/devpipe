@@ -4,4 +4,5 @@ numpy
 scipy
 python-dotenv
 streamlit
+tornado
 tftpy
