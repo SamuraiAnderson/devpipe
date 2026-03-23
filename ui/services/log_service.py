@@ -38,18 +38,20 @@ class LogBuffer:
     def __init__(self, maxlen: int = 1000):
         self._maxlen = maxlen
         self._lock = threading.Lock()
-        self._buffers: dict[str, deque[LogRecord]] = {
-            source: deque(maxlen=maxlen) for source in SOURCES
-        }
+        self._buffers: dict[str, deque[LogRecord]] = {}
+
+    def _ensure(self, source: str) -> deque[LogRecord]:
+        buf = self._buffers.get(source)
+        if buf is None:
+            buf = deque(maxlen=self._maxlen)
+            self._buffers[source] = buf
+        return buf
 
     def push(self, source: str, record: LogRecord):
         with self._lock:
-            buf = self._buffers.get(ALL)
-            if buf is not None:
-                buf.append(record)
-            buf = self._buffers.get(source)
-            if buf is not None:
-                buf.append(record)
+            self._ensure(ALL).append(record)
+            if source != ALL:
+                self._ensure(source).append(record)
 
     def get_records(self, source: str) -> list[LogRecord]:
         with self._lock:
@@ -159,6 +161,8 @@ class UILogHandler(logging.Handler):
     def _resolve_source(record: logging.LogRecord) -> str:
         if record.name.startswith('client.'):
             parts = record.name.split('.', 2)
+            if len(parts) >= 3:
+                return f"{parts[1]}.{parts[2]}"
             return parts[1] if len(parts) >= 2 else SCRIPT
         return SCRIPT
 

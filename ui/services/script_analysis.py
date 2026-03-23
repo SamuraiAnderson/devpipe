@@ -51,6 +51,22 @@ class ControllerInfo:
     params: dict[str, str] = field(default_factory=dict)
     kind: str = "controller"
 
+    @property
+    def key(self) -> str:
+        """用于 session_state 和去重的稳定标识，如 ``'Linux:my_var'`` 或 ``'Linux'``。"""
+        return f"{self.platform}:{self.var_name}" if self.var_name else self.platform
+
+    @property
+    def log_source(self) -> str:
+        """预测运行时日志路由的 source key，格式 ``'{platform}.{host}'``。"""
+        if self.class_name == "LocalHost":
+            return f"{self.platform}.localhost"
+        raw = self.params.get("host") or self.params.get("port", "")
+        host = raw.strip("'\"")
+        if host and host not in ("<f-string>", "<expr>"):
+            return f"{self.platform}.{host}"
+        return self.platform
+
 
 def _resolve_arg(node: ast.expr) -> str:
     """Best-effort extraction of a human-readable value from an AST node."""
@@ -91,84 +107,81 @@ def _collect_imports(tree: ast.Module) -> dict[str, str]:
     return mapping
 
 
-def _find_instantiations(
-    tree: ast.Module,
-    import_map: dict[str, str],
-) -> list[ControllerInfo]:
-    """Walk the AST for Call nodes that instantiate known controllers or services."""
-    results: list[ControllerInfo] = []
-    seen_keys: set[tuple[str, str | None]] = set()
+class _InstantiationVisitor(ast.NodeVisitor):
+    """单次遍历 AST，在赋值 / with 上下文中自然获取 var_name 并提取控制器实例化信息。"""
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
+    def __init__(self, import_map: dict[str, str]) -> None:
+        self.import_map = import_map
+        self.results: list[ControllerInfo] = []
+        self._seen_keys: set[str] = set()
 
+    def _try_extract(self, call: ast.Call, var_name: str | None) -> None:
+        """若 *call* 是已知控制器/服务的实例化，提取参数并记录（按 key 去重）。"""
         call_name: str | None = None
-        if isinstance(node.func, ast.Name):
-            call_name = node.func.id
-        elif isinstance(node.func, ast.Attribute):
-            call_name = node.func.attr
+        if isinstance(call.func, ast.Name):
+            call_name = call.func.id
+        elif isinstance(call.func, ast.Attribute):
+            call_name = call.func.attr
 
-        if call_name is None or call_name not in import_map:
-            continue
+        if not call_name or call_name not in self.import_map:
+            return
 
-        class_name = import_map[call_name]
+        class_name = self.import_map[call_name]
         platform = _ALL_KNOWN[class_name]
-        param_names = _ALL_PARAM_NAMES.get(class_name, [])
         kind = "service" if class_name in KNOWN_SERVICES else "controller"
+        param_names = _ALL_PARAM_NAMES.get(class_name, [])
 
         params: dict[str, str] = {}
-        for idx, arg in enumerate(node.args):
-            key = param_names[idx] if idx < len(param_names) else f"arg{idx}"
-            params[key] = _resolve_arg(arg)
-        for kw in node.keywords:
+        for idx, arg in enumerate(call.args):
+            k = param_names[idx] if idx < len(param_names) else f"arg{idx}"
+            params[k] = _resolve_arg(arg)
+        for kw in call.keywords:
             if kw.arg is not None:
                 params[kw.arg] = _resolve_arg(kw.value)
 
-        var_name = _infer_var_name(node)
-
-        key = (class_name, var_name)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-
-        results.append(ControllerInfo(
+        info = ControllerInfo(
             class_name=class_name,
             platform=platform,
             var_name=var_name,
             params=params,
             kind=kind,
-        ))
+        )
 
-    return results
-
-
-def _infer_var_name(call_node: ast.Call) -> Optional[str]:
-    """Try to figure out the variable name the call result is assigned to.
-
-    Works for simple ``x = Cls(...)`` patterns when the parent is available
-    via line-number heuristics (ast.walk does not provide parent links).
-    This is a best-effort helper; returns None when the pattern doesn't match.
-    """
-    return None
-
-
-class _VarNameVisitor(ast.NodeVisitor):
-    """Two-pass visitor: first pass collects assignment targets by line,
-    second pass is used by analyze_script to annotate var_name."""
-
-    def __init__(self) -> None:
-        self.assign_targets: dict[int, str] = {}
+        if info.key in self._seen_keys:
+            return
+        self._seen_keys.add(info.key)
+        self.results.append(info)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            if isinstance(node.value, ast.Call):
-                self.assign_targets[node.value.lineno] = node.targets[0].id
+        if isinstance(node.value, ast.Call):
+            var_name = (
+                node.targets[0].id
+                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                else None
+            )
+            self._try_extract(node.value, var_name)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if isinstance(node.target, ast.Name) and node.value and isinstance(node.value, ast.Call):
-            self.assign_targets[node.value.lineno] = node.target.id
+        if node.value and isinstance(node.value, ast.Call):
+            var_name = node.target.id if isinstance(node.target, ast.Name) else None
+            self._try_extract(node.value, var_name)
+        self.generic_visit(node)
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            if isinstance(item.context_expr, ast.Call):
+                var_name = (
+                    item.optional_vars.id
+                    if isinstance(item.optional_vars, ast.Name)
+                    else None
+                )
+                self._try_extract(item.context_expr, var_name)
+        self.generic_visit(node)
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        if isinstance(node.value, ast.Call):
+            self._try_extract(node.value, None)
         self.generic_visit(node)
 
 
@@ -195,24 +208,6 @@ def analyze_script(script_id: str) -> list[ControllerInfo]:
     if not import_map:
         return []
 
-    var_visitor = _VarNameVisitor()
-    var_visitor.visit(tree)
-
-    results = _find_instantiations(tree, import_map)
-
-    for info in results:
-        if info.var_name is None:
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                func_name = None
-                if isinstance(node.func, ast.Name):
-                    func_name = node.func.id
-                elif isinstance(node.func, ast.Attribute):
-                    func_name = node.func.attr
-                if func_name and import_map.get(func_name) == info.class_name:
-                    if node.lineno in var_visitor.assign_targets:
-                        info.var_name = var_visitor.assign_targets[node.lineno]
-                        break
-
-    return results
+    visitor = _InstantiationVisitor(import_map)
+    visitor.visit(tree)
+    return visitor.results

@@ -1,63 +1,78 @@
 import html
 import json
 import re
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import Optional
 
 import streamlit as st
 
-from ui.services.client_service import Platform
 from ui.services.history_service import get_history
 from ui.services.log_service import ALL, SCRIPT, SOURCES, get_buffer, get_file_writer
 from ui.services.script_analysis import analyze_script
 
-_SOURCE_LABELS = {ALL: '全部', SCRIPT: '脚本', 'Local': 'Local', 'Linux': 'Linux', 'Android': 'Android', 'Serial': 'Serial'}
 
-_SOURCE_TO_PLATFORM = {
-    'Local': Platform.LOCAL,
-    'Linux': Platform.LINUX,
-    'Android': Platform.ANDROID,
-}
+@dataclass
+class _TabSource:
+    label: str
+    log_source: str
+    controller_key: Optional[str] = None
 
 
-def _active_sources() -> list[str]:
+_FIXED_TABS = [
+    _TabSource(label="全部", log_source=ALL),
+    _TabSource(label="脚本", log_source=SCRIPT),
+]
+
+
+def _active_sources() -> list[_TabSource]:
     selected = st.session_state.get("selected_script")
     if not selected:
-        return list(SOURCES)
+        return list(_FIXED_TABS)
 
     controllers = analyze_script(selected)
     if not controllers:
-        return list(SOURCES)
+        return list(_FIXED_TABS)
 
-    platforms = list(dict.fromkeys(
-        c.platform for c in controllers if c.kind == "controller"
-    ))
-    return [ALL, SCRIPT] + platforms
+    tabs: list[_TabSource] = list(_FIXED_TABS)
+    seen: set[str] = set()
+    for c in controllers:
+        if c.kind != "controller" or c.log_source in seen:
+            continue
+        seen.add(c.log_source)
+        label = f"{c.platform} ({c.var_name})" if c.var_name else c.platform
+        tabs.append(_TabSource(
+            label=label,
+            log_source=c.log_source,
+            controller_key=c.log_source,
+        ))
+    return tabs
 
 
 def render_log_panel():
-    sources = _active_sources()
+    tabs = _active_sources()
 
     col_tabs, col_clear = st.columns([9, 1])
     with col_tabs:
-        tab_objects = st.tabs([_SOURCE_LABELS.get(s, s) for s in sources])
+        tab_objects = st.tabs([t.label for t in tabs])
     with col_clear:
         st.markdown("")
         if st.button(":wastebasket:", key="clear_all", help="清空日志", use_container_width=True):
-            for source in sources:
-                get_buffer().clear(source)
-                get_file_writer().rotate(source)
+            for t in tabs:
+                get_buffer().clear(t.log_source)
+                get_file_writer().rotate(t.log_source)
 
-    for tab, source in zip(tab_objects, sources):
-        with tab:
-            _render_log_tab(source)
+    for tab_obj, tab in zip(tab_objects, tabs):
+        with tab_obj:
+            _render_log_tab(tab)
 
 
 @st.fragment(run_every=timedelta(milliseconds=500))
-def _render_log_tab(source: str):
-    records = get_buffer().get_records(source)
-    fmt = (lambda r: r.formatted_all()) if source == ALL else (lambda r: r.formatted())
+def _render_log_tab(tab: _TabSource):
+    records = get_buffer().get_records(tab.log_source)
+    fmt = (lambda r: r.formatted_all()) if tab.log_source == ALL else (lambda r: r.formatted())
     lines = "<br>".join(html.escape(fmt(r)) for r in records) if records else "(空)"
-    uid = f"log-{source}"
+    uid = f"log-{tab.log_source}"
     terminal_html = (
         f'<div class="log-terminal" id="{uid}">'
         f"{lines}"
@@ -67,12 +82,14 @@ def _render_log_tab(source: str):
     )
     st.markdown(terminal_html, unsafe_allow_html=True)
 
-    platform = _SOURCE_TO_PLATFORM.get(source)
-    if platform is None:
+    if tab.controller_key is None:
         return
 
     client_svc = st.session_state.get("client_svc")
-    controller = client_svc.get_controller(platform) if client_svc else None
+    controller = (
+        client_svc.get_controller_by_key(tab.controller_key)
+        if client_svc else None
+    )
     disabled = controller is None
 
     if controller:
@@ -82,17 +99,17 @@ def _render_log_tab(source: str):
 
     st.text_input(
         "命令",
-        key=f"cmd_input_{source}",
+        key=f"cmd_input_{tab.log_source}",
         placeholder=placeholder,
         disabled=disabled,
         label_visibility="collapsed",
         on_change=_on_cmd_submit,
-        args=(source,),
+        args=(tab.log_source, tab.controller_key),
     )
 
     if controller:
         history_cmds = get_history(controller.host).load()
-        _inject_history_js(source, history_cmds)
+        _inject_history_js(tab.log_source, history_cmds)
 
 
 def _inject_history_js(source: str, history: list[str]):
@@ -161,16 +178,16 @@ def _dispatch_cmd(controller, cmd: str):
     controller.shell(cmd)
 
 
-def _on_cmd_submit(source: str):
-    key = f"cmd_input_{source}"
-    cmd = st.session_state.get(key, "").strip()
+def _on_cmd_submit(log_source: str, controller_key: str):
+    widget_key = f"cmd_input_{log_source}"
+    cmd = st.session_state.get(widget_key, "").strip()
     if not cmd:
         return
-    platform = _SOURCE_TO_PLATFORM.get(source)
-    if platform is None:
-        return
     client_svc = st.session_state.get("client_svc")
-    controller = client_svc.get_controller(platform) if client_svc else None
+    controller = (
+        client_svc.get_controller_by_key(controller_key)
+        if client_svc else None
+    )
     if controller is None:
         return
 
@@ -180,4 +197,4 @@ def _on_cmd_submit(source: str):
         _dispatch_cmd(controller, cmd)
     except Exception as exc:
         controller.log.error("%s", exc)
-    st.session_state[key] = ""
+    st.session_state[widget_key] = ""

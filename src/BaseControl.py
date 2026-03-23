@@ -47,11 +47,12 @@ class BaseControl(object):
         return logging.getLogger(f"client.{self.platform}.{self.host}")
 
     def _register(self):
-        BaseControl._registry[self.platform] = self
+        BaseControl._registry[f"{self.platform}.{self.host}"] = self
 
     def _unregister(self):
-        if BaseControl._registry.get(self.platform) is self:
-            del BaseControl._registry[self.platform]
+        key = f"{self.platform}.{self.host}"
+        if BaseControl._registry.get(key) is self:
+            del BaseControl._registry[key]
 
     def _log_chunk(self, chunk):
         for line in chunk.splitlines():

@@ -44,5 +44,5 @@ def render_visualization_panel():
     cols = st.columns(min(len(controllers), 3))
     for idx, info in enumerate(controllers):
         with cols[idx % len(cols)]:
-            with st.container(border=True):
+            with st.container(border=True, key=f"viz_{info.key}"):
                 _render_controller_card(info)
