@@ -1,5 +1,6 @@
 from .BaseControl import *
 import re
+import threading
 import time
 import base64
 import uuid
@@ -52,6 +53,8 @@ class SerialControl(BaseControl):
         self._mode = mode
         self._pwd = '~'
         self._interactive_mode = False
+        self._cmd_lock = threading.Lock()
+        self._bg_stop = threading.Event()
         try:
             self._ser = _serial.Serial(port, baudrate, timeout=timeout)
         except Exception as e:
@@ -64,6 +67,9 @@ class SerialControl(BaseControl):
         if mode == 'linux':
             self._exec_raw("stty -echo 2>/dev/null; export PS1=''")
         self._register()
+        self._bg_thread = threading.Thread(
+            target=self._background_reader, daemon=True)
+        self._bg_thread.start()
 
     @staticmethod
     def _parse_open_error(exc):
@@ -79,6 +85,26 @@ class SerialControl(BaseControl):
         if 'permission' in msg:
             return f"权限错误：{exc}"
         return f"串口打开失败：{exc}"
+
+    def _background_reader(self):
+        """后台持续读取串口输出并记录到日志。命令执行 / 交互模式期间自动让出。"""
+        while not self._bg_stop.is_set():
+            if self._interactive_mode:
+                time.sleep(0.1)
+                continue
+            acquired = self._cmd_lock.acquire(timeout=0.05)
+            if not acquired:
+                continue
+            try:
+                n = self._ser.in_waiting
+                if n > 0:
+                    data = self._ser.read(n).decode(errors='replace')
+                    self._log_chunk(data)
+            except Exception:
+                break
+            finally:
+                self._cmd_lock.release()
+            time.sleep(0.02)
 
     @property
     def platform(self) -> str:
@@ -136,9 +162,13 @@ class SerialControl(BaseControl):
         return output
 
     def _exec_raw(self, cmd):
-        if self._mode == 'bootloader':
-            return self._exec_raw_bootloader(cmd)
-        return self._exec_raw_linux(cmd)
+        with self._cmd_lock:
+            n = self._ser.in_waiting
+            if n > 0:
+                self._log_chunk(self._ser.read(n).decode(errors='replace'))
+            if self._mode == 'bootloader':
+                return self._exec_raw_bootloader(cmd)
+            return self._exec_raw_linux(cmd)
 
     def _exec_raw_linux(self, cmd):
         """发送命令并通过标记符解析输出和退出码。"""
@@ -215,6 +245,8 @@ class SerialControl(BaseControl):
         if code != 0:
             raise ShellError(self.host, remote_cmd, code, stdout, stderr)
         self.log.debug("shell: %s", remote_cmd)
+        if stdout:
+            self._log_chunk(stdout)
         return code, stdout, stderr
 
     def _shell_bootloader(self, *args) -> tuple:
@@ -223,6 +255,8 @@ class SerialControl(BaseControl):
         if code != 0:
             raise ShellError(self.host, remote_cmd, code, stdout, stderr)
         self.log.debug("shell: %s", remote_cmd)
+        if stdout:
+            self._log_chunk(stdout)
         return code, stdout, stderr
 
     def push(self, local_path, remote_path):
@@ -277,14 +311,15 @@ class SerialControl(BaseControl):
             remote_cmd = args_to_cmd(args)
         else:
             remote_cmd = cmd
-        self._ser.write((remote_cmd + "\n").encode())
-        self._ser.flush()
+        with self._cmd_lock:
+            self._ser.write((remote_cmd + "\n").encode())
+            self._ser.flush()
 
-        deadline = time.time() + timeout
-        output, match = self._stream_and_tee(
-            self._serial_read_fn(deadline),
-            stop_fn=lambda acc: pattern.search(acc),
-        )
+            deadline = time.time() + timeout
+            output, match = self._stream_and_tee(
+                self._serial_read_fn(deadline),
+                stop_fn=lambda acc: pattern.search(acc),
+            )
         if match:
             return match
         raise WaitTimeoutError(self.host, pattern.pattern, timeout, output)
@@ -300,6 +335,8 @@ class SerialControl(BaseControl):
         return stdout.strip() == "true"
 
     def close(self):
+        self._bg_stop.set()
+        self._bg_thread.join(timeout=1)
         if self._ser and self._ser.is_open:
             self._ser.close()
         self._unregister()
