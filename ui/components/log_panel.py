@@ -51,6 +51,28 @@ def _merge_patterns(a: Optional[str], b: Optional[str]) -> Optional[str]:
     return f"(?:{a})|(?:{b})"
 
 
+def _resolve_runtime_source(ast_source: str, used: set[str]) -> str:
+    """将 AST 预测的 log_source 映射到运行时实际 registry key。
+
+    精确匹配优先；无精确匹配时按平台前缀做唯一候选匹配。
+    """
+    from src.BaseControl import BaseControl
+    registry = BaseControl._registry
+
+    if ast_source in registry:
+        used.add(ast_source)
+        return ast_source
+
+    platform = ast_source.split('.')[0]
+    candidates = [k for k in registry if k.startswith(platform + '.') and k not in used]
+
+    if len(candidates) == 1:
+        used.add(candidates[0])
+        return candidates[0]
+
+    return ast_source
+
+
 def _active_sources() -> list[_TabSource]:
     selected = st.session_state.get("selected_script")
     if not selected:
@@ -70,8 +92,10 @@ def _active_sources() -> list[_TabSource]:
         log_source = var_to_source.get(key, key)
         resolved[log_source] = (rule.include, rule.exclude)
 
-    def _build_tab(log_source: str, **kwargs) -> _TabSource:
+    def _build_tab(log_source: str, ast_source: str = None, **kwargs) -> _TabSource:
         inc, exc = resolved.get(log_source, (None, None))
+        if (inc, exc) == (None, None) and ast_source:
+            inc, exc = resolved.get(ast_source, (None, None))
         if wildcard:
             inc = _merge_patterns(inc, wildcard.include)
             exc = _merge_patterns(exc, wildcard.exclude)
@@ -91,15 +115,18 @@ def _active_sources() -> list[_TabSource]:
         return tabs
 
     seen: set[str] = set()
+    used: set[str] = set()
     for c in controllers:
         if c.kind != "controller" or c.log_source in seen:
             continue
         seen.add(c.log_source)
+        runtime_source = _resolve_runtime_source(c.log_source, used)
         label = f"{c.platform} ({c.var_name})" if c.var_name else c.platform
         tabs.append(_build_tab(
-            c.log_source,
+            runtime_source,
+            ast_source=c.log_source,
             label=label,
-            controller_key=c.log_source,
+            controller_key=runtime_source,
         ))
     return tabs
 

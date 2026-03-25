@@ -106,23 +106,14 @@ class LogFileWriter:
     def begin_script_log_session(self, script_id: str):
         """打开或沿用磁盘日志会话。
 
-        首次调用建 All、Script 及 AST 中各控制器的 source 文件；
-        后续调用沿用已有句柄，仅为新出现的 source 追加打开。
+        首次调用建 All、Script 文件；控制器日志文件由 ``write()``
+        在首次写入时按需创建，避免 AST 预测 source 与运行时不一致。
         """
-        from ui.services.script_analysis import analyze_script
-
         with self._lock:
             if not self._session_active:
                 self._session_active = True
                 self._open_new(ALL)
                 self._open_new(SCRIPT)
-            sources_needed = [
-                info.log_source for info in analyze_script(script_id)
-                if info.kind == 'controller'
-            ]
-            for src in sources_needed:
-                if src not in self._files or self._files[src].closed:
-                    self._open_new(src)
 
     def close_session(self):
         """关闭会话并释放所有文件句柄（由清空日志按钮触发）。"""

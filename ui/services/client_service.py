@@ -125,10 +125,10 @@ class ClientService:
         return BaseControl._registry.get(platform.value)
 
     def get_controller_by_key(self, key: str) -> Optional[object]:
-        """通过 ``'platform.host'`` 格式的 key 查找控制器。"""
+        """通过 ``registry_key`` (``'platform.host'``) 查找控制器。"""
         for info in self._clients.values():
             ctrl = info.controller
-            if ctrl and f"{info.platform.value}.{getattr(ctrl, 'host', '')}" == key:
+            if ctrl and getattr(ctrl, 'registry_key', None) == key:
                 return ctrl
         from src.BaseControl import BaseControl
         return BaseControl._registry.get(key)

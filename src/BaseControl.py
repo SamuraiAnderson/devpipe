@@ -124,15 +124,20 @@ class BaseControl(object):
         raise NotImplementedError
 
     @property
+    def registry_key(self) -> str:
+        """控制器在 registry / LogBuffer / 日志路由中的唯一标识。"""
+        return f"{self.platform}.{self.host}"
+
+    @property
     def log(self):
         import logging
-        return logging.getLogger(f"client.{self.platform}.{self.host}")
+        return logging.getLogger(f"client.{self.registry_key}")
 
     def _register(self):
-        BaseControl._registry[f"{self.platform}.{self.host}"] = self
+        BaseControl._registry[self.registry_key] = self
 
     def _unregister(self):
-        key = f"{self.platform}.{self.host}"
+        key = self.registry_key
         if BaseControl._registry.get(key) is self:
             del BaseControl._registry[key]
 

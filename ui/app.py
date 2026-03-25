@@ -16,8 +16,22 @@ from ui.services.log_service import install
 
 st.set_page_config(page_title="RedPyMake", layout="wide", page_icon=":wrench:")
 
+
+class _ClientLogFilter(logging.Filter):
+    """排除 client.* 日志，避免会话对端输出在 CLI 终端重复打印。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.name.startswith('client.')
+
+
 if "client_svc" not in st.session_state:
-    logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s", force=True)
+    _cli = logging.StreamHandler()
+    _cli.setLevel(logging.DEBUG)
+    _cli.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    _cli.addFilter(_ClientLogFilter())
+    logging.root.handlers.clear()
+    logging.root.addHandler(_cli)
+    logging.root.setLevel(logging.DEBUG)
     install(level=0)
     st.session_state.client_svc = ClientService()
     st.session_state.script_svc = ScriptService()
