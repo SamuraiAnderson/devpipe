@@ -2,6 +2,7 @@
 .vscode/
 .env
 logs/
+history
 
 # # Byte-compiled / optimized Python files
 # __pycache__/

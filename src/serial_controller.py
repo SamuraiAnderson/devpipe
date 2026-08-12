@@ -318,6 +318,7 @@ class SerialControl(BaseControl):
             deadline = time.time() + timeout
             output, match = self._stream_and_tee(
                 self._serial_read_fn(deadline),
+                on_chunk=self._log_chunk,
                 stop_fn=lambda acc: pattern.search(acc),
             )
         if match:
