@@ -14,6 +14,7 @@
     §CORE-01/ssh/connect-immediately  → test_ssh_connect_failure_wraps_in_session_connection_error
     §CORE-01/adb/no-adb-binary        → test_adb_without_binary_raises_session_connection_error
     §CORE-01/serial/no-fs             → test_serial_resource_ops_raise_unsupported
+    §CORE-01/wsl/no-wsl-binary        → test_wsl_without_binary_raises_session_connection_error
 
 """
 
@@ -46,11 +47,12 @@ def test_local_factory_returns_local_session():
 
 
 def test_factory_type_names():
-    """§CORE-01：四类会话的类型名可通过顶层属性获取（惰性也算）。"""
+    """§CORE-01：五类会话的类型名可通过顶层属性获取（惰性也算）。"""
     assert isinstance(rpm.LocalSession, type)
     assert isinstance(rpm.SshSession, type)
     assert isinstance(rpm.AdbSession, type)
     assert isinstance(rpm.SerialSession, type)
+    assert isinstance(rpm.WslSession, type)
 
 
 # ------------------------------------------------------------------- 生命周期
@@ -147,7 +149,7 @@ def test_no_implicit_global_registry():
         b.close()
 
 
-# --------------------------------------------------------- SSH / ADB / Serial
+# --------------------------------------------------------- SSH / ADB / Serial / WSL
 
 
 def test_ssh_connect_failure_wraps_in_session_connection_error(monkeypatch):
@@ -207,3 +209,15 @@ def test_serial_resource_ops_raise_unsupported(monkeypatch):
             p.exists()
     finally:
         sess.close()
+
+
+def test_wsl_without_binary_raises_session_connection_error(monkeypatch):
+    """§CORE-01：``rpm.wsl()`` 找不到 ``wsl.exe`` 时立即抛 ``SessionConnectionError``。
+
+    WSL 会话被视作"本地已运行的 Linux 用户态"，构造时只校验 ``wsl.exe`` 存在；
+    不做 distro 级探测。这里通过 monkeypatch 让 ``shutil.which`` 返回 ``None``，
+    应立即抛出 ``SessionConnectionError``，与 ADB 语义一致。
+    """
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    with pytest.raises(SessionConnectionError):
+        rpm.wsl()

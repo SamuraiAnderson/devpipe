@@ -146,6 +146,7 @@ rpm.local()
 rpm.ssh(host, user=..., port=22, password=..., key_filename=...)
 rpm.adb(serial=...)
 rpm.serial(port, baudrate=115200)
+rpm.wsl(distribution=None, user=None)
 ```
 
 ### 类型命名
@@ -156,6 +157,7 @@ rpm.serial(port, baudrate=115200)
 | `rpm.ssh(...)` | `SshSession` |
 | `rpm.adb(...)` | `AdbSession` |
 | `rpm.serial(...)` | `SerialSession` |
+| `rpm.wsl(...)` | `WslSession` |
 
 ### 要求
 
@@ -166,6 +168,15 @@ rpm.serial(port, baudrate=115200)
 - 不得在构造时隐式注册到全局 UI 注册表。
 - 平台不支持的能力抛出 `UnsupportedOperationError`，不得直接暴露 `NotImplementedError`。
 - `at()` 创建的视图共享同一连接、同一日志缓冲。
+
+### WSL 说明（"构造时立即连接"的显式例外）
+
+`rpm.wsl(...)` 面向 Windows 上的 Linux 用户态子系统。与 SSH/ADB 不同，它**只在构造时校验 `wsl.exe` 是否可执行**，不做 distro 级探测；`wsl.exe` 缺失时抛 `SessionConnectionError`，其余"发行版未安装 / 冷启动失败"等情形延迟到首次 `run()` 时以 `CommandError` 呈现。这样构造几乎零延迟，语义更贴近 `LocalSession`。
+
+- 路径风格：`posix`。
+- 传输：`push` / `pull` 通过 `/mnt/<drive>/…` 中转到 `wsl -e cp`；`copy` 同理。
+- 参数：`distribution` → `wsl -d`；`user` → `wsl -u`；`wsl_path` 可覆盖 `wsl.exe` 路径（主要用于测试注入）。
+- 由于不探测 `$HOME`，`~` 前缀不做展开，需要时请给绝对路径或用 `default_cwd="/home/xxx"`。
 
 ---
 

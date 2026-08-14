@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from ._command import CommandResult
-from ._factory import adb, local, serial, ssh
+from ._factory import adb, local, serial, ssh, wsl
 from ._local import LocalSession
 from ._logs import (
     LogBuffer,
@@ -61,6 +61,10 @@ def __getattr__(name: str):
         from ._serial import SerialSession as _SerialSession
 
         return _SerialSession
+    if name == "WslSession":
+        from ._wsl import WslSession as _WslSession
+
+        return _WslSession
     raise AttributeError(f"module 'redpymake' has no attribute {name!r}")
 
 
@@ -71,12 +75,14 @@ __all__ = [
     "ssh",
     "adb",
     "serial",
+    "wsl",
     # 一级类型
     "Session",
     "LocalSession",
     "SshSession",
     "AdbSession",
     "SerialSession",
+    "WslSession",
     # 数据对象
     "CommandResult",
     "TransferResult",

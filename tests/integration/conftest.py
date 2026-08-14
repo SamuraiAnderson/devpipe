@@ -53,3 +53,21 @@ def serial_port() -> str:
             "to enable serial integration tests"
         )
     return port
+
+
+@pytest.fixture
+def wsl_target() -> dict:
+    """WSL 集成目标。
+
+    需要环境变量 ``RPM_TEST_WSL=1``；可选 ``RPM_TEST_WSL_DISTRO``、
+    ``RPM_TEST_WSL_USER``。未设置直接 skip。
+    """
+    if not os.environ.get("RPM_TEST_WSL"):
+        pytest.skip(
+            "set RPM_TEST_WSL=1 (+ optional _DISTRO/_USER) "
+            "to enable WSL integration tests"
+        )
+    return {
+        "distribution": os.environ.get("RPM_TEST_WSL_DISTRO"),
+        "user": os.environ.get("RPM_TEST_WSL_USER"),
+    }

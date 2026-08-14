@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "RedPyMake contributors" }]
-keywords = ["automation", "ssh", "adb", "serial", "make", "session"]
+keywords = ["automation", "ssh", "adb", "serial", "wsl", "make", "session"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -63,13 +63,14 @@ addopts = "-m 'not integration' --timeout=30"
 
 [tool.coverage.run]
 source = ["redpymake"]
-# _ssh / _adb / _serial 需要真实设备才能充分覆盖，走 tests/integration/。
-# 默认覆盖率报告聚焦"核心包"（对应验收标准 §5/9 的 80%）；
+# _ssh / _adb / _serial / _wsl 需要真实设备或子系统才能充分覆盖，走
+# tests/integration/。默认覆盖率报告聚焦"核心包"（对应验收标准 §5/9 的 80%）；
 # 跑集成测试时可通过 `pytest -m integration --cov=redpymake` 得到完整覆盖。
 omit = [
     "src/redpymake/_ssh.py",
     "src/redpymake/_adb.py",
     "src/redpymake/_serial.py",
+    "src/redpymake/_wsl.py",
 ]
 
 [tool.coverage.report]

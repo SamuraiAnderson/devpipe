@@ -16,6 +16,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from ._adb import AdbSession
     from ._serial import SerialSession
     from ._ssh import SshSession
+    from ._wsl import WslSession
 
 
 _default_local_lock = threading.Lock()
@@ -99,4 +100,28 @@ def serial(
     )
 
 
-__all__ = ["local", "ssh", "adb", "serial"]
+def wsl(
+    distribution: str | None = None,
+    *,
+    user: str | None = None,
+    wsl_path: str | None = None,
+    default_cwd: str | None = None,
+) -> "WslSession":
+    """构造 WSL 会话。
+
+    与 SSH/ADB 不同，此工厂**只校验 ``wsl.exe`` 是否可执行**（不做 distro 级
+    探测），是 CORE-01 "构造时立即连接"要求的显式例外；distro 未安装 / 冷启动
+    失败等情形延迟到首次 ``run()`` 时以 ``CommandError`` 呈现。``wsl.exe``
+    不存在则抛 ``SessionConnectionError``。
+    """
+    from ._wsl import WslSession
+
+    return WslSession(
+        distribution=distribution,
+        user=user,
+        wsl_path=wsl_path,
+        default_cwd=default_cwd,
+    )
+
+
+__all__ = ["local", "ssh", "adb", "serial", "wsl"]
