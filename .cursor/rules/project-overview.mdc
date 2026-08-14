@@ -1,38 +1,39 @@
 ---
-description: RedPyMake 项目总览 — 架构、目录、导入与命名约定
+description: RedPyMake 项目概览与顶层约定
 alwaysApply: true
 ---
 
 # RedPyMake 项目概览
 
-**功能定位：** RedPyMake 是一套以 Python 为任务脚本的跨平台自动化框架，并在同一套模型上提供 Web 可视化：用统一抽象管理「会话连接、文件与远端资源、脚本化任务」，在界面中浏览脚本、静态展示脚本中的终端/服务拓扑，并运行脚本、分源查看日志。
+**定位：** 跨运行环境（本地 / SSH / ADB / 串口）的 Python 自动化库。核心业务是**会话**（连接与工作目录）、**命令**、**文件传输**、**日志与等待**，以及作为增量优化辅助的**过时判断** `rpm.stale`。
 
-**可视化（现状）：** 基于 Python AST 的控制器/服务实例卡片与多 Tab 日志；DAG/流程图类能力为规划方向，见 `doc/TODO.md`。
-
-**核心执行模型：** 在不同平台（本地、Linux/SSH、Android/ADB、串口）上执行命令、传输文件，并提供 Make 风格增量执行。
-
-**日志分流（概要）：** UI 层 `ui.*`（除 `ui.services.script_service`）仅终端输出、不进 Web 日志缓冲；脚本服务与任务脚本日志进「脚本」Tab；`client.*` 对端输出进各会话 Tab。不设「应用」Tab；细则见 `.cursor/rules/ui-conventions.mdc`「日志分流」。
+**推荐调用方式：** `import redpymake as rpm`，通过工厂 `rpm.local()` / `rpm.ssh(...)` / `rpm.adb(...)` / `rpm.serial(...)` 拿到 `Session`。
 
 ## 目录结构
 
-- `src/` — 核心库：`BaseControl` 基类及各平台实现、`UFile`、`make_style`
-- `ui/` — Streamlit Web 界面：`components/`(面板组件)、`services/`(业务服务)
-- `example/` — 示例/测试脚本，通过 `.env` + `argparse` 配置
-- `doc/` — 设计文档
+- `src/redpymake/` — 核心包（PEP 561：包内 `py.typed`）
+  - `__init__.py` — 顶层公开 API（`__all__` 明确定义）
+  - `_session.py` — `Session` 抽象基类：`run`/`at`/`path`/`wait`/`push`/`pull`/`copy`
+  - `_local.py` / `_ssh.py` / `_adb.py` / `_serial.py` — 各平台实现
+  - `_factory.py` — `local/ssh/adb/serial` 工厂 + 进程级默认 local
+  - `_command.py` / `_transfer.py` / `_path.py` — 数据对象
+  - `_logs.py` — 日志缓冲、tag、cursor、wait、订阅
+  - `_stale.py` — 顶级函数 `stale(...) -> bool`
+  - `exceptions.py` — 统一异常层次（`RedPyMakeError` 根）
+- `tests/` — 不依赖网络/真实设备的单元测试（集成测试用 `@pytest.mark.integration`）
+- `doc/core-lib-requirements.md` — **规范来源**：任何行为分歧以此文档为准
+
+## 约定
+
+- Python ≥ 3.10；核心库不依赖 Streamlit / NumPy / SciPy / pydub。
+- 命名：类 `PascalCase`；函数/变量 `snake_case`；实现细节前缀 `_`。
+- 结构化类型用 `dataclass`（`frozen=True` 优先）。
+- 中文注释与 docstring；与用户交流使用中文。
+- 不得抛出 Paramiko / RuntimeError 之类第三方或通用异常；一律包装为 `RedPyMakeError` 子类。
+- 库自身不调用 `logging.basicConfig()`；日志通过 `SessionLogs` 收集。
 
 ## 导入约定
 
-- `src/` 内部使用**相对导入**：`from .BaseControl import *`
-- `example/`、`ui/` 通过 `sys.path.insert(0, PROJECT_ROOT)` 后 `import src`
-
-## 命名约定
-
-- 类：`PascalCase`（`BaseControl`、`AdbCnet`、`LocalHost`）
-- 函数 / 变量：`snake_case`
-- 私有成员：`_leading_underscore`（`_host`、`_stream_and_tee`）
-- 使用 `dataclass` 和 `Enum` 做结构化类型定义
-
-## 语言
-
-- 代码注释和 docstring 使用**中文**
-- 与用户交流使用**中文**
+- 库内使用相对导入：`from ._logs import LogBuffer`。
+- 外部使用者：`import redpymake as rpm`；不允许从 `redpymake._session` 等下划线模块 import。
+- 可选平台（SSH / 串口）通过 `__init__.__getattr__` 惰性暴露，避免强制导入 paramiko/pyserial。

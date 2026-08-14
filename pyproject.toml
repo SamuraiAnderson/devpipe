@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redpymake"
+version = "0.5.0"
+description = "跨运行环境的 Python 自动化库：统一的会话接口用于命令执行、文件传输、日志收集与过时判断"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "RedPyMake contributors" }]
+keywords = ["automation", "ssh", "adb", "serial", "make", "session"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+ssh = ["paramiko>=3.0"]
+serial = ["pyserial>=3.5"]
+tftp = ["tftpy>=0.8"]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",
+    "paramiko>=3.0",
+    "pyserial>=3.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/RedPyMake/RedPyMake"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+redpymake = ["py.typed"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+markers = [
+    "integration: 需要真实设备或网络的集成测试；默认不运行 (使用 -m integration 运行)",
+]
+addopts = "-m 'not integration'"
