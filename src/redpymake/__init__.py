@@ -26,6 +26,7 @@ from ._logs import (
     SessionLogs,
 )
 from ._path import ResourcePath, ResourceStat
+from ._script import ScriptRun, ScriptSnapshot, script
 from ._session import Session
 from ._stale import PathSpec, StalePredicate, stale
 from ._transfer import TransferResult
@@ -76,6 +77,7 @@ __all__ = [
     "adb",
     "serial",
     "wsl",
+    "script",
     # 一级类型
     "Session",
     "LocalSession",
@@ -83,6 +85,8 @@ __all__ = [
     "AdbSession",
     "SerialSession",
     "WslSession",
+    "ScriptRun",
+    "ScriptSnapshot",
     # 数据对象
     "CommandResult",
     "TransferResult",

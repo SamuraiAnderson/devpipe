@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "RedPyMake contributors" }]
-keywords = ["automation", "ssh", "adb", "serial", "wsl", "make", "session"]
+keywords = ["automation", "ssh", "adb", "serial", "wsl", "make", "session", "script", "logging"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

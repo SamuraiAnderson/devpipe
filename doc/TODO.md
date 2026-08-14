@@ -140,3 +140,4 @@
 
 - 2026-08-15：新建；基于 v0.5 需求与 `9ce30b7` 实现现状拟定
 - 2026-08-15：新增 `WslSession` + `rpm.wsl(...)` 工厂（CORE-01 显式例外：只校验 `wsl.exe` 存在，不做 distro 级探测）；集成测试在 `RPM_TEST_WSL=1` 门控下运行
+- 2026-08-15：新增 CORE-09 脚本对象与日志分流：`rpm.script(name, dump_on_error, log_level, loggers)` + `ScriptRun` + `ScriptSnapshot`；`logging` 通过 handler 桥 + Session `subscribe` 转发合流到 `ScriptRun._merged`；`__exit__` 见异常时按 `dump_on_error` 值类型（单文件 / 目录包 / callable）自动落盘，不吞原异常

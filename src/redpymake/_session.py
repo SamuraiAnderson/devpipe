@@ -86,6 +86,16 @@ class Session(ABC):
         if default_cwd is not None:
             self.default_cwd = default_cwd
 
+        # CORE-09：仅 root Session 感知 ContextVar；进入 ``with rpm.script(...):``
+        # 后构造的会话自动 attach 到当前活跃的 ``ScriptRun``。视图与 root 共享
+        # ``LogBuffer``，已被 root 的订阅覆盖，无需重复登记。
+        if parent is None:
+            from ._script import _current_script
+
+            run = _current_script.get()
+            if run is not None:
+                run.attach(self)
+
     # ------------------------------------------------------------------
     # 元信息
     # ------------------------------------------------------------------

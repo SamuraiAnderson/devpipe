@@ -47,12 +47,18 @@ def test_local_factory_returns_local_session():
 
 
 def test_factory_type_names():
-    """§CORE-01：五类会话的类型名可通过顶层属性获取（惰性也算）。"""
+    """§CORE-01：五类会话的类型名可通过顶层属性获取（惰性也算）。
+
+    附带 §CORE-09：``rpm.script`` 工厂与 ``rpm.ScriptRun`` 类型也走同一契约。
+    """
     assert isinstance(rpm.LocalSession, type)
     assert isinstance(rpm.SshSession, type)
     assert isinstance(rpm.AdbSession, type)
     assert isinstance(rpm.SerialSession, type)
     assert isinstance(rpm.WslSession, type)
+    assert callable(rpm.script)
+    assert isinstance(rpm.ScriptRun, type)
+    assert isinstance(rpm.ScriptSnapshot, type)
 
 
 # ------------------------------------------------------------------- 生命周期

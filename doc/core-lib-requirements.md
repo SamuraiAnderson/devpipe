@@ -36,6 +36,7 @@ RedPyMake 是一个跨运行环境的 Python 自动化库。调用者通过统�
 - 跨环境文件传输（二级接口组 A）
 - 会话日志自动收集与等待（二级接口组 B）
 - 过时判断辅助函数 `rpm.stale(...)`（二级接口组 C）
+- 脚本对象与日志分流 `rpm.script(...)`（二级接口组 D）
 - 统一异常与结果对象
 - 标准 Python 包结构
 
@@ -133,7 +134,16 @@ rpm.stale(target, depends_on=sources) -> bool
 
 一个函数式辅助工具，用于在昂贵操作前判断是否可以跳过。**不是构建系统**，不管调度、并发、依赖图；策略可插拔，默认为文件时间戳。
 
-三组二级接口相互独立，可分别扩展。
+### 二级接口组 D：脚本对象与日志分流
+
+```python
+with rpm.script(name="build", dump_on_error="logs/") as run:
+    ...
+```
+
+一次脚本运行的容器。把用户脚本侧的标准 `logging` 与进程内所有 `Session` 的日志**合流**到同一份缓冲；退出时若捕获到未处理异常，按 `dump_on_error` **自动落盘**（单文件或多文件包）。详见 CORE-09。
+
+四组二级接口相互独立，可分别扩展。
 
 ---
 
@@ -706,6 +716,159 @@ RedPyMakeError
 
 ---
 
+## CORE-09：脚本对象与日志分流（二级接口组 D）
+
+### 动机
+
+调用者的日常场景往往是"跑一段脚本，其中可能开多个会话（local + ssh + adb），过程用 `logging` 打业务日志；一旦崩了要能把**全部现场**（业务 logging + 所有 session 日志）一键落盘做事后取证"。CORE-06 只解决了"每个会话独立收日志"，缺三块拼图：
+
+1. **"脚本"作为语义对象**：能持有一次运行的生命周期、注册表、异常边界；
+2. **`logging` → session 日志的桥**：把标准 `logging.LogRecord` 归一到与 `SessionLogRecord` 同构的合流缓冲；
+3. **异常自动落盘策略**：不由用户在 `try/except` 里手写，而由脚本对象在 `__exit__` 时按配置执行。
+
+CORE-09 只做这三块。**不新增日志类型**——"脚本日志"就是标准 `logging`，不引入 `ScriptLogs`；session 日志仍归 `SessionLogs`（CORE-06）。
+
+### 顶级入口
+
+```python
+def script(
+    name: str | None = None,
+    *,
+    dump_on_error: "str | os.PathLike[str] | bool | Callable[[ScriptSnapshot], None] | None" = None,
+    log_level: str = "INFO",
+    loggers: "Sequence[str] | None" = None,
+) -> ScriptRun: ...
+```
+
+返回 `ScriptRun`，只能作为上下文管理器使用：
+
+```python
+with rpm.script(name="build", dump_on_error="logs/") as run:
+    logging.getLogger("myapp").info("start")
+    local = rpm.local()                # 自动登记到 run
+    remote = rpm.ssh("10.0.0.1")       # 自动登记到 run
+    remote.run("make", "-j8")          # 命令日志同时进 remote.logs 与 run
+```
+
+- `name`：脚本名；用于落盘目录/文件名与 `meta.json`。缺省用 `"script"`。
+- `dump_on_error`：见"落盘策略"。
+- `log_level`：`"DEBUG" / "INFO" / "WARNING" / "ERROR"`（大小写不敏感），Handler 上的门槛。
+- `loggers`：opt-in 白名单；给出时**只**监听命名列表里的 logger 及其子 logger（`"myapp"` 会覆盖 `"myapp.sub"`），不再挂 root；缺省时挂 root。
+
+### 生命周期
+
+`__enter__`：
+1. 设置线程本地 `ContextVar[_current_script]`，指向当前 `ScriptRun`；
+2. 装 `_ScriptLoggingHandler`：`loggers` 缺省时装在 root logger，否则装在每个命名 logger 上；handler `level` 按 `log_level`；
+3. 记录 `started_at = time.time()`。
+
+`__exit__(exc_type, exc, tb)`：
+1. 无条件卸 handler 并 reset ContextVar（幂等）；
+2. `detach` 所有已登记 session（取消 `subscribe`）；
+3. `ended_at = time.time()`；
+4. 若 `exc is not None and dump_on_error not in (None, False)`：调 `_dump(exc, tb)`；
+5. **不吞异常**：原异常继续外抛；`_dump` 内部任何失败只走 `_diag_logger.exception(...)`，不掩盖原异常。
+
+### Session 登记（两种方式并存）
+
+**隐式自动**：Session 构造时（仅对 root，`parent is None`）读取 `_current_script`；有活跃 `ScriptRun` 就 `run.attach(self)`。`at()` 视图共享 root 的 `LogBuffer`，无需重复登记。
+
+**显式**：
+```python
+run.attach(sess) -> None
+run.detach(sess) -> None
+```
+
+登记按 `session.session_id` 去重，重复 `attach` 无副作用。attach 语义 = `unsub = sess.logs.subscribe(run._on_record)`，即"**拷贝转发**"每条新记录到 `run._merged`；不共享 `LogBuffer`，不破坏 CORE-06 的 per-session 语义。
+
+### `logging` 桥
+
+`_ScriptLoggingHandler` 收到 `LogRecord` 时，转成一条 `SessionLogRecord`：
+
+- `event = "user_log"`
+- `stream = "python"`
+- `level = record.levelname`
+- `message = record.getMessage()`
+- `session_id = f"script:{name}"`（区别于任何真实会话）
+- `fields = {"logger": record.name, "pathname": record.pathname, "lineno": record.lineno, "funcName": record.funcName}`
+- `timestamp = record.created`
+
+塞入 `run._merged`。这条不进任何 `Session` 的 `LogBuffer`（保持"session 侧只装 session 事件"的语义）。
+
+约束：
+- 库仍不 `logging.basicConfig()`（CORE-06 约束不变）；Script 只挂 Handler，不改任何 logger 的 `level`。
+- 用户仍需自己在脚本侧配 `StreamHandler` 才能在终端看到 logging 输出。CORE-09 只负责"事后落盘"，不主动接管 CLI。
+
+### 快照
+
+```python
+run.snapshot() -> ScriptSnapshot
+```
+
+```python
+@dataclass(frozen=True)
+class ScriptSnapshot:
+    name: str
+    started_at: float
+    ended_at: float | None
+    records: tuple[SessionLogRecord, ...]  # 按 (timestamp, session_id, sequence) 稳定排序
+    sessions: tuple[SessionInfo, ...]      # {id, kind, label}
+    exception: ExceptionInfo | None        # {type, message, traceback}
+```
+
+- 快照可在 `__exit__` 之前调用（此时 `exception=None`），也可在传给 callable sink 时使用。
+
+### 落盘策略
+
+`dump_on_error` 值分派：
+
+| 值 | 行为 |
+|----|------|
+| `None` / `False` | 关闭 |
+| `Callable[[ScriptSnapshot], None]` | 调 sink 一次，snapshot 已经填了 exception |
+| `str | os.PathLike`，`Path(p).suffix != ""` 且不以路径分隔符结尾 | **单文件**（方案 A） |
+| 其他 `str | os.PathLike` | **目录包**（方案 C） |
+
+**方案 A：单文件**
+
+写到目标路径。缺失的父目录自动 `makedirs(..., exist_ok=True)`。内容 = 排序后 `_merged` 逐行 `"{ISO time} [{level}] [{session_id}] {event}: {message}"`；末尾追加异常摘要（type + message + traceback）。
+
+**方案 C：目录包**
+
+在 `dump_on_error` 指定目录下创建子目录 `<name>-<YYYYmmddTHHMMSS>/`，写入：
+
+- `all.log`：同 A 格式的全量流。
+- `script.log`：仅 `event == "user_log"` 的记录，用 logging 的可读格式。
+- `<session_id_safe>.log`：每个已登记 session 一份，含该 session 的全部记录（`session_id_safe` = 把 `:`、`/`、`\`、空白替换为 `_`）。
+- `meta.json`：
+  ```json
+  {
+    "name": "build",
+    "started_at": 1234567890.12,
+    "ended_at": 1234567895.67,
+    "exception": {"type": "CommandError", "message": "...", "traceback": "..."},
+    "sessions": [{"id": "local:local#1", "kind": "local", "label": "local"}]
+  }
+  ```
+
+### 嵌套
+
+`ContextVar` 天然按线程/协程隔离。嵌套 `rpm.script()` 时：内层 `ScriptRun` 是独立作用域，内层 Session 只登记到内层；内层退出后 `ContextVar` 恢复为外层引用，外层继续收集。
+
+### 与 CORE-06 的关系
+
+- CORE-06 不变：`sess.logs.records / text / save / subscribe / tag / wait` 语义、`LogBuffer` 容量与线程模型、`operation_id` 关联全部保持。
+- CORE-09 是**"面向脚本"的合流层**，构建于 `SessionLogs.subscribe` 之上；不改 CORE-06 任何 API。
+
+### 明确不做的能力
+
+- 不做默认 CLI sink（不主动把日志打到 stderr）；用户仍自行配 StreamHandler。
+- 不做流式落盘（append-mode file handle）；落盘只在异常触发时一次性写出。
+- 不做每条 `subscribe` 的用户 API 装饰（想过滤请自己在 sink 里做）。
+- `run.snapshot()` 只读；不提供 `run.records()` / `run.text()` 等被动查询的完整 API 面（避免与 `SessionLogs` 重复）。
+
+---
+
 ## 5. 验收标准
 
 1. README 前十分钟示例可以完成本地命令、SSH 命令和文件复制。
@@ -720,6 +883,7 @@ RedPyMakeError
 10. UI 完全移除后，核心库仍可独立安装和运行。
 11. `run(...).wait(...)` 不会漏掉命令执行期间已产生的日志。
 12. 会话关闭后仍可读取已收集的日志。
+13. `with rpm.script(dump_on_error=...)`：块内未处理异常时按配置自动落盘（含标准 `logging` 与所有登记 session 的日志）；正常退出不落盘；落盘失败不掩盖原异常。
 
 ---
 
@@ -742,6 +906,10 @@ RedPyMakeError
 | 文件传输 | 二级接口组 A：`push` / `pull` / `copy` |
 | 日志与等待 | 二级接口组 B：`logs` / `wait` / `run().wait` |
 | 日志分组标签 | `session.logs.tag(...)`，与 `rpm.stale` 解耦的通用能力 |
+| 脚本对象 | 二级接口组 D：`rpm.script(name=..., dump_on_error=..., log_level=..., loggers=...)`，`ScriptRun` 只做容器 + 桥 + 异常边界，不新增日志类型 |
+| Session 登记方式 | 隐式（进入 `with rpm.script()` 后 root Session 构造时读 `ContextVar` 自动 attach）+ 显式（`run.attach(sess)`）并存 |
+| `logging` 捕获范围 | 默认 root logger + `log_level` 门槛；`loggers=[...]` 时改为 opt-in 白名单 |
+| 异常落盘触发 | 仅在 `__exit__` 收到未处理异常时；`dump_on_error` 按值类型分派：单文件 / 目录包 / callable / 关闭 |
 
 ---
 
