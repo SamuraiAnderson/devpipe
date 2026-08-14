@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import shlex
 import threading
@@ -195,11 +196,17 @@ class SshSession(Session):
                     operation_id=operation_id,
                 )
 
+        # 每个 pump 线程各自 copy 一份上下文（继承 ``logs.tag`` 等），
+        # 避免两线程共享同一 Context 时的 "context already entered" 错误。
+        ctx_out = contextvars.copy_context()
+        ctx_err = contextvars.copy_context()
         t_out = threading.Thread(
-            target=_pump, args=(chan.recv, stdout_parts, "stdout"), daemon=True
+            target=lambda: ctx_out.run(_pump, chan.recv, stdout_parts, "stdout"),
+            daemon=True,
         )
         t_err = threading.Thread(
-            target=_pump, args=(chan.recv_stderr, stderr_parts, "stderr"), daemon=True
+            target=lambda: ctx_err.run(_pump, chan.recv_stderr, stderr_parts, "stderr"),
+            daemon=True,
         )
         t_out.start()
         t_err.start()

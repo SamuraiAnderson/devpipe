@@ -1,0 +1,59 @@
+---
+description: RedPyMake 测试驱动开发（TDD）与"测试即需求"硬约束
+alwaysApply: true
+---
+
+# 测试即需求（Test-as-Contract）
+
+`tests/` 是 [doc/core-lib-requirements.md](mdc:doc/core-lib-requirements.md) 的可执行副本。任何需求条款都有对应的契约测试，用于保护重构、驱动开发。
+
+## 一一对应关系
+
+- `## CORE-01` ~ `## CORE-08` → `tests/test_core01_session.py` ~ `tests/test_core08_packaging.py`
+- `## 5. 验收标准` → `tests/test_acceptance.py`
+- SSH / ADB / 串口的真实设备用例 → `tests/integration/`（`@pytest.mark.integration`，默认不跑）
+
+## 强制流程（改动必读）
+
+1. **改需求先改文档 + 测试**：不允许"只改代码不改测试"。
+2. **红-绿-重构**：新增/修改 `src/redpymake/` 时，先在 `tests/test_coreXX_*.py` 加一条会失败的契约测试；再让它绿。
+3. **每条测试都可回溯到需求段落**：docstring 里以 `§CORE-XX/...` 引用规格，用于失败信息直接指向文档。
+
+## 硬约束
+
+- 任何 `src/redpymake/**` 的行为变更 PR/commit，diff 必须包含 `tests/test_coreXX_*.py` 的对应变更。
+- 需求条款调整必须同时更新对应测试文件顶部的"规格映射"注释和每条 test 的 docstring 引用。
+- 新平台会话（例如未来的 telnet）复用 `tests/_helpers/fake_remote.py` 的通用契约套件，通过参数化跑同一批 CORE-01/02/04 契约。
+- 测试用例通过**真实调用**（`session.run(...)`、`session.copy(...)`）触发行为进行断言，尽量避免直接 `sess.logs.buffer.append(...)` 之类绕过实现的测试。
+
+## 目录布局
+
+```text
+tests/
+  conftest.py                        # 通用 fixture
+  _helpers/                          # 测试辅助：fake_remote / ssh_mock / log_probe
+  test_core01_session.py             # § CORE-01
+  test_core02_run.py                 # § CORE-02
+  test_core03_path.py                # § CORE-03
+  test_core04_transfer.py            # § CORE-04
+  test_core05_stale.py               # § CORE-05
+  test_core06_logs.py                # § CORE-06
+  test_core07_exceptions.py          # § CORE-07
+  test_core08_packaging.py           # § CORE-08
+  test_acceptance.py                 # § 5. 验收标准
+  integration/                       # 需要真实设备
+    test_ssh_session.py
+    test_adb_session.py
+    test_serial_session.py
+```
+
+## 覆盖率与超时
+
+- 覆盖率目标：`pytest --cov=redpymake` ≥ 80%（§ 5/9）。
+- CI 硬超时：每条用例 30s（`--timeout=30`），避免 `wait()`/`subprocess` 挂死流水线。
+
+## 参考
+
+- [doc/core-lib-requirements.md](mdc:doc/core-lib-requirements.md) — 唯一规范来源
+- [tests/conftest.py](mdc:tests/conftest.py) — 通用 fixture 集合
+- [tests/_helpers/fake_remote.py](mdc:tests/_helpers/fake_remote.py) — 非本地会话的可测替身

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import shlex
 import shutil
@@ -185,8 +186,12 @@ class AdbSession(Session):
                 )
             popen.stderr.close()
 
-        t1 = threading.Thread(target=_pump_stdout, daemon=True)
-        t2 = threading.Thread(target=_pump_stderr, daemon=True)
+        # 每个 pump 线程各自 copy 一份上下文（继承 ``logs.tag`` 等），
+        # 避免两线程共享同一 Context 时的 "context already entered" 错误。
+        ctx1 = contextvars.copy_context()
+        ctx2 = contextvars.copy_context()
+        t1 = threading.Thread(target=lambda: ctx1.run(_pump_stdout), daemon=True)
+        t2 = threading.Thread(target=lambda: ctx2.run(_pump_stderr), daemon=True)
         t1.start()
         t2.start()
 

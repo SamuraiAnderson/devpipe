@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import shutil
 import subprocess
@@ -108,15 +109,18 @@ class LocalSession(Session):
             finally:
                 stream.close()
 
+        # 每个 pump 线程各自 copy 一份上下文，才能继承 ``logs.tag(...)`` 的
+        # ContextVar 值（满足 CORE-06 "with 块内产生的所有日志记录"），并避免
+        # 两线程共享同一 Context 时的 "context already entered" 错误。
+        ctx_out = contextvars.copy_context()
+        ctx_err = contextvars.copy_context()
         t_out = threading.Thread(
-            target=_pump,
-            args=(proc.stdout, stdout_parts, "stdout"),
+            target=lambda: ctx_out.run(_pump, proc.stdout, stdout_parts, "stdout"),
             name=f"local-stdout-{operation_id}",
             daemon=True,
         )
         t_err = threading.Thread(
-            target=_pump,
-            args=(proc.stderr, stderr_parts, "stderr"),
+            target=lambda: ctx_err.run(_pump, proc.stderr, stderr_parts, "stderr"),
             name=f"local-stderr-{operation_id}",
             daemon=True,
         )

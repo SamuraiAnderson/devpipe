@@ -33,6 +33,8 @@ tftp = ["tftpy>=0.8"]
 dev = [
     "pytest>=7",
     "pytest-cov>=4",
+    "pytest-timeout>=2.2",
+    "pytest-mock>=3.12",
     "paramiko>=3.0",
     "pyserial>=3.5",
 ]
@@ -56,4 +58,21 @@ testpaths = ["tests"]
 markers = [
     "integration: 需要真实设备或网络的集成测试；默认不运行 (使用 -m integration 运行)",
 ]
-addopts = "-m 'not integration'"
+# 默认排除集成测试；每条用例设 30s 硬超时避免 wait()/subprocess 挂死 CI。
+addopts = "-m 'not integration' --timeout=30"
+
+[tool.coverage.run]
+source = ["redpymake"]
+# _ssh / _adb / _serial 需要真实设备才能充分覆盖，走 tests/integration/。
+# 默认覆盖率报告聚焦"核心包"（对应验收标准 §5/9 的 80%）；
+# 跑集成测试时可通过 `pytest -m integration --cov=redpymake` 得到完整覆盖。
+omit = [
+    "src/redpymake/_ssh.py",
+    "src/redpymake/_adb.py",
+    "src/redpymake/_serial.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80
