@@ -43,3 +43,5 @@ Thumbs.db
 .env
 logs/
 history/
+# workspace 日志组 / CLI run NDJSON 的落盘位置，纯运行时产物
+.redpymake/

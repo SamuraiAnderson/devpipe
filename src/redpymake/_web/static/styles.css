@@ -1,0 +1,496 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-alt: #1e232c;
+  --border: #262b34;
+  --fg: #e5e9f0;
+  --muted: #8892a2;
+  --accent: #7fdbff;
+  --ok: #64d47b;
+  --warn: #ffb454;
+  --err: #ff6b6b;
+  --info: #9aa5b1;
+  --debug: #6c7580;
+  --mono: 'JetBrains Mono', 'Fira Code', Consolas, Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+header {
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+header h1 { margin: 0; font-size: 18px; }
+header .hint { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+.header-left { display: flex; flex-direction: column; }
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+}
+
+/* Log 切换器 */
+.log-current { position: relative; display: inline-block; }
+.log-eyebrow {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin-right: 6px;
+}
+.log-current-btn {
+  background: var(--panel-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 5px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: var(--mono);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 220px;
+  justify-content: space-between;
+}
+.log-current-btn:hover { border-color: var(--accent); }
+.log-current-count {
+  font-size: 11px;
+  margin-left: auto;
+}
+.log-current-btn .chev { color: var(--muted); font-size: 10px; }
+.log-dropdown {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  min-width: 320px;
+  max-height: 60vh;
+  overflow-y: auto;
+  z-index: 10;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.log-item {
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.log-item:last-child { border-bottom: 0; }
+.log-item:hover { background: var(--border); }
+.log-item.active { background: rgba(127, 219, 255, 0.12); color: var(--accent); }
+.log-item-name { flex: 1; }
+.log-item-meta { font-size: 11px; }
+.log-item-del {
+  background: transparent;
+  color: var(--muted);
+  border: 0;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.log-item-del:hover { color: var(--err); }
+.tb-btn.active { background: var(--accent); color: #0f1115; border-color: var(--accent); }
+main { padding: 16px 20px; }
+h2 { font-size: 15px; margin: 20px 0 8px; color: var(--accent); }
+pre {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 14px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* -------------------- 布局 -------------------- */
+/* AppShell：整页吃满视口、不出现文档级滚动条。
+   TopBar 高度随内容与换行变化，拿视口高度去减一个写死的常数必然溢出——改用
+   纵向 flex 让 Layout 自己吃剩余高度。视口锁定只挂在 body.app-shell 上，静态
+   HTML 报告页共用这份样式表但需要保持普通文档流滚动。 */
+body.app-shell {
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+body.app-shell > header { flex-shrink: 0; }
+.layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0;
+  flex: 1;
+  /* 关键：flex/grid 子项默认 min-height:auto，内容会把容器顶大，
+     下游的 overflow-y:auto 就永远不触发 */
+  min-height: 0;
+}
+.sidebar {
+  width: 260px;
+  border-right: 1px solid var(--border);
+  padding: 12px;
+  background: var(--panel);
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+}
+.sidebar h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  margin: 16px 0 6px;
+}
+.sidebar h3:first-child { margin-top: 0; }
+/* 段头带行内视图开关（Sessions 的 Split） */
+.sb-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sb-head-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 18px;
+  letter-spacing: 0;
+  cursor: pointer;
+  font-family: var(--mono);
+  text-transform: none;
+}
+.sb-head-btn:hover { border-color: var(--accent); color: var(--fg); }
+.sb-head-btn.active { background: var(--accent); color: #0f1115; border-color: var(--accent); }
+.sess-pick { cursor: pointer; }
+.sb-check { flex-shrink: 0; color: var(--muted); }
+.sess-pick.active .sb-check { color: var(--accent); }
+.sidebar ul { list-style: none; padding: 0; margin: 0; }
+.sidebar li {
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sidebar li:hover { background: var(--border); }
+.sidebar li.active { background: rgba(127, 219, 255, 0.12); color: var(--accent); }
+.sidebar li.hint { cursor: default; color: var(--muted); }
+.sidebar li.hint:hover { background: transparent; }
+.sidebar li strong { color: var(--accent); }
+
+/* Sidebar 条目：名字撑开 + 右侧行内操作按钮（悬停显现，避免视觉噪音） */
+.sb-item { cursor: default; }
+.sb-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sb-action {
+  flex-shrink: 0;
+  opacity: 0;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+  font-family: var(--mono);
+  transition: opacity 0.1s ease;
+}
+.sb-item:hover .sb-action,
+.sb-action:focus,
+.sb-action.action-stopping { opacity: 1; }
+.sb-action:hover:not(:disabled) { border-color: currentColor; }
+.sb-action:disabled { cursor: default; }
+.action-run:hover:not(:disabled) { color: var(--ok); }
+.action-stop { opacity: 0.7; }
+.action-stop:hover { color: var(--err); }
+.action-rerun:hover { color: var(--accent); }
+.action-stopping { color: var(--muted); font-style: italic; }
+.sb-action:disabled:not(.action-stopping) { opacity: 0.25; }
+
+.main-panel {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.panel-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.panel-view[hidden] { display: none; }
+/* 静态报告页的 section#timeline-root 没有 .panel-view 类，单独给它 flex 列。
+   规则必须避开 app 页：ID 选择器会盖过 .panel-view[hidden] 的 display:none，
+   隐藏的 RunDetailView 会继续按 flex:1 占位，把 LiveView 挤成半高。 */
+body:not(.app-shell) #timeline-root {
+  display: flex;
+  flex-direction: column;
+}
+.empty-hint {
+  padding: 30px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* 主区顶栏：只在 Run detail 态出现，用来回到常驻的 Live 流 */
+.main-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  flex-shrink: 0;
+}
+.main-toolbar[hidden] { display: none; }
+.back-to-live-btn {
+  background: var(--accent);
+  color: #0f1115;
+  border: 0;
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--mono);
+}
+.back-to-live-btn:hover { filter: brightness(1.12); }
+
+/* -------------------- Timeline -------------------- */
+.run-header {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-shrink: 0;
+}
+.run-title { font-size: 15px; color: var(--fg); }
+.run-status { font-size: 12px; }
+
+.timeline-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-alt);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.tb-btn {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 3px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  min-width: 36px;
+}
+.tb-btn:hover { border-color: var(--accent); }
+.tb-btn.active {
+  background: var(--accent);
+  color: #0f1115;
+  border-color: var(--accent);
+}
+.tb-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 4px;
+}
+.tb-speed {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+.tb-scrubber {
+  flex: 1;
+  min-width: 150px;
+  margin: 0 6px;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.tb-time {
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 130px;
+  text-align: right;
+}
+
+/* -------------------- PaneSet（单列 / 按 session 分栏） -------------------- */
+.pane-set {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.pane-set.split {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(260px, 1fr);
+  overflow-x: auto;
+}
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  border-left: 1px solid var(--border);
+}
+.pane:first-child { border-left: 0; }
+.pane-header {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  background: var(--panel-alt);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pane-script .pane-header { color: var(--accent); }
+/* 列本身就代表 session，行里再重复一次没意义。列窄，改成行内流式排版：
+   时间与事件在前，消息接着排、排不下自然折行——比硬切网格列可读。 */
+.pane-set.split .timeline-body { padding: 8px 10px; }
+.pane-set.split .tl-sid { display: none; }
+.pane-set.split .tl-row { display: block; }
+.pane-set.split .tl-ts,
+.pane-set.split .tl-ev { margin-right: 6px; }
+
+.timeline-body {
+  list-style: none;
+  padding: 8px 20px;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  min-height: 0;
+}
+/* LogRow：SessionCell 随视口收缩（`clamp` 上限 200px，窄窗口下整列让位给消息）。
+   四个格子都写死列位——没有 session_id 的记录只渲染三个 span，不显式定位就会
+   把消息挤进 SessionCell 那一列。 */
+.tl-row {
+  padding: 2px 0;
+  display: grid;
+  grid-template-columns:
+    92px
+    minmax(0, clamp(88px, 9vw, 130px))
+    minmax(0, clamp(64px, 10vw, 200px))
+    minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+.tl-ts { color: var(--muted); grid-column: 1; }
+.tl-ev { color: var(--accent); grid-column: 2; overflow: hidden; text-overflow: ellipsis; }
+.tl-sid { color: var(--muted); grid-column: 3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-msg { color: var(--fg); grid-column: 4; word-break: break-word; }
+
+@media (max-width: 960px) {
+  /* 窄窗口：SessionCell 收益不抵成本，整列隐藏，消息顶上 */
+  .tl-row { grid-template-columns: 82px minmax(0, 104px) minmax(0, 1fr); }
+  .tl-sid { display: none; }
+  .tl-msg { grid-column: 3; }
+}
+.tl-row.lvl-warn .tl-msg { color: var(--warn); }
+.tl-row.lvl-err .tl-msg { color: var(--err); }
+.tl-row.lvl-debug .tl-msg { color: var(--debug); }
+.tl-row.lvl-info .tl-msg { color: var(--fg); }
+
+/* -------------------- Live tail -------------------- */
+/* 一份日志流里多个 run 首尾相接，靠分隔条区分是谁的输出 */
+.run-separator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.5px;
+}
+.run-separator::before,
+.run-separator::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+.run-separator-text { white-space: nowrap; }
+.run-separator.sep-begin { color: var(--accent); }
+.run-separator.sep-begin::before,
+.run-separator.sep-begin::after { background: rgba(127, 219, 255, 0.28); }
+.run-separator.status-succeeded { color: var(--ok); }
+.run-separator.status-failed { color: var(--err); }
+.run-separator.status-cancelled,
+.run-separator.status-interrupted { color: var(--warn); }
+
+/* -------------------- 状态徽章 -------------------- */
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  margin-left: auto;
+  background: var(--border);
+  color: var(--muted);
+}
+.badge.status-running { background: rgba(255, 180, 84, 0.18); color: var(--warn); }
+.badge.status-succeeded { background: rgba(100, 212, 123, 0.15); color: var(--ok); }
+.badge.status-failed { background: rgba(255, 107, 107, 0.15); color: var(--err); }
+.badge.status-queued { background: var(--border); color: var(--muted); }
+.badge.status-cancelled { background: var(--border); color: var(--muted); }
+.badge.status-interrupted { background: rgba(255, 180, 84, 0.15); color: var(--warn); }
+
+.status-running { color: var(--warn); }
+.status-succeeded { color: var(--ok); }
+.status-failed { color: var(--err); }
+.status-queued { color: var(--muted); }
+.status-cancelled { color: var(--muted); }
+.status-interrupted { color: var(--warn); }
+.warn { color: var(--warn); }
+.hint { color: var(--muted); }
+
+/* -------------------- 报告页专属 -------------------- */
+#raw-log { padding: 0 20px 20px; }

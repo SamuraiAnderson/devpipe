@@ -160,6 +160,18 @@ class UnsupportedOperationError(RedPyMakeError):
     """当前平台不支持所请求的能力。用于替代直接暴露 NotImplementedError。"""
 
 
+class WorkspaceStoppedError(RedPyMakeError):
+    """用户通过 ``Workspace.stop_current()`` 请求终止当前 run。
+
+    协作式取消：借出会话在每次 ``run()`` / ``wait()`` 进入前检查停止标志，已置起
+    则抛出本异常，让脚本在**下一条命令的边界**退出。已经跑起来的子进程不强杀。
+    """
+
+    def __init__(self, message: str, *, run_id: str | None = None) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+
+
 __all__ = [
     "RedPyMakeError",
     "SessionError",
@@ -173,4 +185,5 @@ __all__ = [
     "InputNotFoundError",
     "LogWaitTimeoutError",
     "UnsupportedOperationError",
+    "WorkspaceStoppedError",
 ]

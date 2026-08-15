@@ -106,11 +106,14 @@
 ### P2-1 Web UI 基于日志订阅接口重建
 
 > 需求文档 §7：**基于新会话日志订阅接口重建**，不复用旧 Streamlit 代码。
+> **进入 v0.6 主干**：见 §CORE-10 / §CORE-11。以下勾选项已随 v0.6 落地。
 
-- [ ] 独立仓库 `redpymake-web`（或本仓库 `web/` 子包），依赖 `redpymake>=0.6`
-- [ ] 通过 `session.logs.subscribe(...)` 拿实时事件流，前端渲染
-- [ ] AST 脚本分析（可选）：静态卡片 + 动态运行侧栏，两者用同一份 `SessionLogRecord` 数据模型
-- [ ] 不再从核心库反向暴露"UI 友好的" API；核心 API 只负责日志正确产出
+- [x] 通过 `session.logs.subscribe(...)` 拿实时事件流，前端渲染（NDJSON live sink → WebSocket）
+- [x] AST 脚本分析：静态卡片 + 动态运行侧栏，两者用同一份 `SessionLogRecord` 数据模型
+- [x] 不再从核心库反向暴露"UI 友好的" API；核心 API 只负责日志正确产出
+- [ ] Diff / 回放对比视图（比较两次运行）
+- [ ] 内置身份认证（当前仅支持反代解决）
+- [ ] `stdout://` / `tcp://` sink 变体（当前仅 `file://`）
 
 ### P2-2 平台扩展
 
@@ -141,3 +144,5 @@
 - 2026-08-15：新建；基于 v0.5 需求与 `9ce30b7` 实现现状拟定
 - 2026-08-15：新增 `WslSession` + `rpm.wsl(...)` 工厂（CORE-01 显式例外：只校验 `wsl.exe` 存在，不做 distro 级探测）；集成测试在 `RPM_TEST_WSL=1` 门控下运行
 - 2026-08-15：新增 CORE-09 脚本对象与日志分流：`rpm.script(name, dump_on_error, log_level, loggers)` + `ScriptRun` + `ScriptSnapshot`；`logging` 通过 handler 桥 + Session `subscribe` 转发合流到 `ScriptRun._merged`；`__exit__` 见异常时按 `dump_on_error` 值类型（单文件 / 目录包 / callable）自动落盘，不吞原异常
+- 2026-08-15：新增 CORE-10 脚本发现与实时日志：`rpm.discover(root)` + `ScriptCard`（纯 AST 分析）+ NDJSON live sink（`REDPYMAKE_LIVE_SINK=file://...`）；顶层 CLI `redpymake discover` / `run` / `report`
+- 2026-08-15：新增 CORE-11 Workspace + Web UI：`rpm.workspace(root)` + `Workspace` + `WorkspaceRun`；工厂函数读 ContextVar 自动借出共享会话；串行队列 + `importlib.reload` 逐次运行；`redpymake serve` FastAPI + Jinja2 + htmx；Web 依赖走 `redpymake[web]` extra

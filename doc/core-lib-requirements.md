@@ -37,12 +37,13 @@ RedPyMake 是一个跨运行环境的 Python 自动化库。调用者通过统�
 - 会话日志自动收集与等待（二级接口组 B）
 - 过时判断辅助函数 `rpm.stale(...)`（二级接口组 C）
 - 脚本对象与日志分流 `rpm.script(...)`（二级接口组 D）
+- 脚本发现与实时日志（二级接口组 E，CORE-10）
+- Workspace 会话池 + 可视化 Web UI（二级接口组 F，CORE-11）
 - 统一异常与结果对象
 - 标准 Python 包结构
 
 ### 不包含
 
-- Web UI、AST 脚本分析、Web 日志分流
 - 全局控制器注册表
 - DAG 调度
 - 原生异步执行
@@ -143,7 +144,25 @@ with rpm.script(name="build", dump_on_error="logs/") as run:
 
 一次脚本运行的容器。把用户脚本侧的标准 `logging` 与进程内所有 `Session` 的日志**合流**到同一份缓冲；退出时若捕获到未处理异常，按 `dump_on_error` **自动落盘**（单文件或多文件包）。详见 CORE-09。
 
-四组二级接口相互独立，可分别扩展。
+### 二级接口组 E：脚本发现与实时日志
+
+```python
+cards = rpm.discover("./scripts")           # 列出目录下所有 rpm_*.py 的元数据
+os.environ["REDPYMAKE_LIVE_SINK"] = "file:///tmp/live.ndjson"  # 激活 sink
+```
+
+**文件级发现**：递归扫 `rpm_*.py`，AST 抽取 `with rpm.script(...)` 元信息；**运行时实时流**：通过环境变量激活 NDJSON 追加写，供外部工具（Web UI、CI）tail 拿到 `SessionLogRecord` 事件流。详见 CORE-10。
+
+### 二级接口组 F：Workspace 与 Web UI
+
+```python
+with rpm.workspace("./scripts") as ws:
+    ws.enqueue("rpm_hello.py")   # 串行队列：会话跨脚本复用、UI 单一活跃 run
+```
+
+`Workspace` 是"一次可视化 / 交互会话生命周期"内的运行时容器：会话池懒创建 + 跨脚本复用、`importlib.reload` 加载脚本、串行队列执行、`ScriptSnapshot` 历史归档。配合 `redpymake serve` 提供纯 Web UI（无桌面 App、无 TUI）。详见 CORE-11。
+
+六组二级接口相互独立，可分别扩展。
 
 ---
 
@@ -869,6 +888,523 @@ class ScriptSnapshot:
 
 ---
 
+## CORE-10：脚本发现与实时日志（二级接口组 E）
+
+### 动机
+
+要让"目录里的一堆 `.py` 脚本"能被外部工具（Web UI / CI / 编辑器插件）**发现**和**跟随观察**，需要两块拼图：
+
+1. **静态发现**：不 import、不执行任何脚本，仅通过文件名前缀 + AST 分析，就能列出所有可运行的 rpm 脚本与它们的元数据（名字、docstring、用到哪些 factory）。
+2. **实时流**：脚本运行时，把每条 `SessionLogRecord` 同步落到一份 NDJSON 文件，供外部进程按行 tail。
+
+CORE-10 只做这两块。**不引入新的日志类型**——落盘的还是 CORE-06 的 `SessionLogRecord`；**不引入新的入场句**——脚本身份仍是 `with rpm.script(...)`（CORE-09）。前缀与 sink 都是 CORE-09 之上的"取用便利"，不改任何既有 API。
+
+### 文件级发现
+
+**约定**：目录下**文件名匹配 `rpm_*.py`** 的 `.py` 文件被视为可发现的 rpm 脚本。可通过 `pyproject.toml` 覆盖：
+
+```toml
+[tool.redpymake.discovery]
+patterns = ["rpm_*.py"]                             # 默认唯一值
+exclude  = [".git", "__pycache__", ".venv",
+            "node_modules", "dist", "build"]
+```
+
+以 `_` 开头的 `.py` 文件（如 `_helpers.py`）在任何情况下都不发现，用作"库内部"约定。
+
+### 顶级入口
+
+```python
+def discover(
+    root: str | os.PathLike = ".",
+    *,
+    patterns: Sequence[str] | None = None,
+    exclude:  Sequence[str] | None = None,
+) -> list[ScriptCard]: ...
+
+@dataclass(frozen=True)
+class ScriptCard:
+    path: Path
+    module_name: str
+    script_name: str | None       # AST 抽取的 rpm.script(name=...) 字面量
+    docstring: str | None         # 模块首个 Expr 字符串
+    factories: tuple[str, ...]    # 静态可推：("local", "wsl", ...)
+    has_script_block: bool        # 是否发现 with rpm.script(...)
+    lineno: int | None            # 上述 with 块的行号
+    error: str | None = None      # 语法错误等降级信息；正常时为 None
+```
+
+要求：
+
+- **纯 AST 分析**，绝不 `import` 目标脚本，不执行其顶层代码；
+- 语法错误的文件不使整个 `discover(...)` 崩溃，返回时 `has_script_block=False` 且 `error` 非空；
+- `script_name` 仅当 `rpm.script(name="...")` 是字面量字符串时取得；变量表达式则为 `None`；
+- `factories` 静态识别 `redpymake.<X>(...)` 或 `rpm.<X>(...)` 调用，`<X>` 属于 `{"local","ssh","adb","serial","wsl"}` 集合；
+- `patterns=None` 时优先读取 `pyproject.toml`（由 `root` 向上找），否则退化为 `("rpm_*.py",)`；
+- 文件顺序按相对 `root` 的字典序稳定输出。
+
+### 运行时实时日志（NDJSON sink）
+
+**激活方式**：`ScriptRun.__enter__` 时读取环境变量 `REDPYMAKE_LIVE_SINK`：
+
+- `file:///abs/path/to/live.ndjson`：追加写；父目录不存在自动 `makedirs`；
+- 缺省或空字符串：不激活。
+
+**行格式**：每行一个 JSON 对象，字段与 `SessionLogRecord` 对齐：
+
+```json
+{"timestamp": 1723691234.5, "sequence": 42, "session_id": "wsl:default#1",
+ "event": "command_output", "level": "INFO", "stream": "stdout",
+ "message": "hello", "operation_id": "cmd-abc", "fields": {"phase": "smoke"}}
+```
+
+**元行**：`ScriptRun.__enter__` / `__exit__` 分别写一条元行，供 tail 端知道边界：
+
+```json
+{"timestamp": ..., "event": "script.begin", "name": "hello",
+ "pid": 12345, "started_at": ...}
+{"timestamp": ..., "event": "script.end",   "name": "hello",
+ "ended_at": ..., "exception": {"type": "...", "message": "...", "traceback": "..."} | null}
+```
+
+**语义要点**：
+
+- sink 与 CORE-09 的 `_dump_on_error` 落盘策略**正交**——sink 是每行流式追加，`dump_on_error` 是异常时一次性快照；两者可同时开启；
+- sink 通过 `SessionLogs.subscribe(...)` 注册，`ScriptRun.__exit__` 时自动 `unsubscribe` 并 close 文件；
+- 写入失败（磁盘满 / 权限）只走 `_diag_logger.exception(...)`，不掩盖用户代码异常；
+- 库仍不 `logging.basicConfig()`（保持 CORE-06 / CORE-09 约束）。
+
+### CLI
+
+新增 `redpymake` 入口点（`pyproject.toml [project.scripts]`）：
+
+```bash
+redpymake discover [ROOT] [--json]           # 列所有 ScriptCard
+redpymake run PATH [--sink FILE]             # 独立子进程跑单个脚本 + 挂 sink
+redpymake report NDJSON -o report.html       # 从 NDJSON 生成自包含 HTML
+redpymake serve [ROOT] [--host H --port P] [--no-open] [--resume-log]   # 见 CORE-11
+```
+
+- `discover` 默认输出人类可读树；`--json` 走结构化输出，供机器消费；
+- `run` 用 `subprocess.run([sys.executable, path])` 起子进程，环境变量 `REDPYMAKE_LIVE_SINK=file://<path>` 由 CLI 注入；透传脚本 exit code 作为自身 exit code；
+- `report` 是纯离线操作：读 NDJSON，输出**自包含**的 HTML（无外链、无网络请求），供 CI artifact / 邮件附件分享。
+
+### 明确不做的能力
+
+- 不支持 `stdout://` / `tcp://` 等 sink URI（第一版仅 `file://`）；
+- 不做流式压缩、rotate、文件锁；
+- 不做非 Python 脚本发现（`.sh` / `.ps1` 等）。
+
+---
+
+## CORE-11：Workspace 与 Web UI（二级接口组 F）
+
+### 动机
+
+`redpymake serve` 场景下，用户希望在同一个进程里**反复运行多个脚本**并共享会话（WSL 连接、SSH 连接、ADB 设备句柄），避免每次都重连。同时 UI 需要一个稳定的**状态所有者**：脚本清单、会话池、运行队列、当前活跃 run。
+
+`Workspace` 就是这个所有者。它与 `ScriptRun` **正交**：一个 workspace 可跑多个脚本，每个脚本内部依旧用 `with rpm.script(...)` 拿到自己的 `ScriptRun`。
+
+### 顶级入口
+
+```python
+def workspace(
+    root: str | os.PathLike = ".",
+    *,
+    logs_root: str | os.PathLike | None = None,      # 默认 <root>/.redpymake/logs/
+    ndjson_dir: str | os.PathLike | None = None,     # 兼容旧参数名；等价于 logs_root
+    discovery_patterns: Sequence[str] | None = None,
+    auto_close_sessions: bool = True,
+    log_name: str | None = None,                     # 新建活跃日志时的显示名；默认时间戳
+) -> Workspace: ...
+```
+
+`Workspace` 只能作为上下文管理器使用：`__exit__` 时把内部起过的所有会话按 `auto_close_sessions` 关掉。
+
+### 会话池
+
+`Workspace` 暴露与 `rpm.*` 工厂同名的方法，返回**共享借出**的会话：
+
+```python
+ws.local(**kw)  ws.wsl(distribution=None, **kw)
+ws.ssh(host, **kw)  ws.adb(serial=None, **kw)  ws.serial(port, **kw)
+ws.sessions() -> Mapping[str, Session]   # 只读快照
+```
+
+按 key 缓存与复用：
+
+| 工厂 | key |
+|------|-----|
+| `local()` | `"local"` |
+| `wsl(distribution)` | `f"wsl:{distribution or 'default'}"` |
+| `ssh(host, port, user)` | `f"ssh:{user}@{host}:{port}"` |
+| `adb(serial)` | `f"adb:{serial or 'default'}"` |
+| `serial(port, baudrate)` | `f"serial:{port}@{baudrate}"` |
+
+**同 key 冲突参数**（例如同一 wsl distro 但不同 `user`）抛 `ValueError("workspace session key conflict: ...")`，逼调用方显式区分。
+
+### ContextVar 联动：脚本代码零改动
+
+Workspace 通过 `contextvars.ContextVar[_active_workspace]` 让顶层工厂**在 workspace 作用域内自动借出**：
+
+```python
+# _factory.py（简化）
+def wsl(distribution=None, **kw):
+    ws = _active_workspace.get()
+    if ws is not None:
+        return ws.wsl(distribution, **kw)    # 借出共享会话（_BorrowedSession 代理）
+    return WslSession(distribution, **kw)    # 独立会话（CLI 直跑等价）
+```
+
+借出的代理会话：
+
+- `__enter__` 返回真会话；
+- `__exit__` **不 close** 真会话（Workspace 拥有生命周期），只做 ScriptRun 记账；
+- 其它属性/方法完全透传给真会话。
+
+**效果**：同一个 `rpm_hello.py`，`python rpm_hello.py` 直跑时创建独立会话并自动关，Workspace 里跑时借出共享会话并延续到下一个脚本。脚本源码不需要感知 workspace。
+
+### 脚本执行
+
+```python
+ws.enqueue(path) -> str                    # 入队，返回 run_id；不阻塞
+ws.stop_current() -> None
+ws.pause_queue()  ws.resume_queue()  ws.clear_queue()
+ws.current_run -> WorkspaceRun | None
+ws.runs -> Sequence[WorkspaceRun]          # queued + running + done，时间倒序
+ws.get_run(run_id) -> WorkspaceRun
+ws.iter_run_records(run_id) -> Iterator[dict]  # 读该 run 的 NDJSON
+ws.discover() -> list[ScriptCard]          # 委托到 CORE-10
+ws.refresh() -> None                       # 重扫脚本
+```
+
+**执行模型**：
+
+- 内部单线程 FIFO 队列 + 一个工作线程；**同一时刻至多一个脚本在跑**；
+- 用户随时可 `enqueue`（含正在跑的时候）；新增项追加到尾部；
+- 工作线程加载脚本：`importlib.util.spec_from_file_location(...)` + `spec.loader.exec_module(...)`，模块若已在 `sys.modules` 里则 `importlib.reload(module)` 刷新代码（**每次 ▶ 自动 reload**）；
+- 加载后要求脚本暴露可调用的 `main`；缺失时 `WorkspaceRun.status="failed"`, `exception="entry_missing"`；
+- 在 `_active_workspace` 已设定的作用域里调 `module.main()`；捕获全部异常写进 `WorkspaceRun.exception`，不让主进程挂；
+- 每次运行前设置 `REDPYMAKE_LIVE_SINK=file://<ndjson_path>`，由 CORE-10 的 sink 落盘；
+- 运行结束把 `ScriptRun.snapshot()` 写进 `WorkspaceRun.snapshot`。
+
+### `WorkspaceRun` 数据模型
+
+```python
+@dataclass(frozen=True)
+class WorkspaceRun:
+    id: str                          # 如 "hello#3"
+    script_path: Path
+    script_name: str                 # 从 ScriptCard 或 stem 取
+    status: str                      # "queued" | "running" | "succeeded" | "failed" | "cancelled"
+    started_at: float | None
+    ended_at:   float | None
+    exception:  str | None           # 简短错误概述；完整 traceback 走 NDJSON script.end 元行
+    ndjson_path: Path
+    snapshot: ScriptSnapshot | None
+```
+
+### 生命周期
+
+`Workspace.__enter__`：
+
+1. 校验 `root` 存在；
+2. 建 NDJSON 目录（默认 `<root>/.redpymake/runs/`），确保可写；
+3. 启动内部工作线程（daemon）；
+4. 返回 self。
+
+`Workspace.__exit__`：
+
+1. 停接受新 `enqueue`（后续调用抛 `RuntimeError("workspace is closed")`）；
+2. 若当前 run 仍在跑：向工作线程发终止请求；`stop_current` 等待其收尾；
+3. `auto_close_sessions=True`（默认）时关掉会话池中所有会话，捕获异常写诊断日志、不抛；
+4. 工作线程 join。
+
+### 事件订阅（供 UI 消费）
+
+`ws.subscribe(callback) -> Callable[[], None]`：注册回调，Workspace 状态变化时被调（会话新增/关闭、脚本队列变化、run 状态迁移、当前 run 增量记录、日志组变更）。事件对象是纯 dict，跨线程安全。Web UI 内部使用；不属于稳定用户 API。
+
+事件类型：
+
+| type | payload | 时机 |
+|------|---------|------|
+| `run.enqueued` | `{run_id, log_id}` | `enqueue` 成功 |
+| `run.started` | `{run_id}` | worker 开始跑 |
+| `run.finished` | `{run_id, status}` | worker 跑完（含失败 / 被 stop） |
+| `run.record` | `{run_id, record}` | 脚本内产生一条 `SessionLogRecord`（payload 恒为 record 形状） |
+| `run.meta` | `{run_id, record}` | 写下一条 `workspace.run.begin` / `workspace.run.end` 边界元行 |
+| `run.cancelled` | `{run_id}` | `cancel_run` 把一个 queued run 剔出队列 |
+| `run.stopping` | `{run_id}` | `stop_current` 收到停止请求（run 尚未收尾） |
+| `log.rotated` | `{log_id, previous_log_id}` | `rotate_log` 成功 |
+| `log.renamed` | `{log_id, name}` | `rename_log` 成功 |
+| `log.pinned` | `{log_id, pinned}` | `pin_log` 成功 |
+| `log.discarded` | `{log_id}` | `discard_log` 成功 |
+
+### 日志组（Workspace log groups）
+
+**动机**：一次 `serve` 交互期间会产生若干 run（脚本反复调），用户希望能**按主题分组**（"api 重构那一批"、"scratch 试验"、"CI-2026-08-15"）+ **跨 `serve` 重启保留**。
+
+**模型**：一个 workspace root 下可以有多份**命名日志**（`WorkspaceLog`），任意时刻恰好一份是**活跃**的。
+
+**关键语义：一份 workspace 日志 = 一条连续的 `stream.ndjson` 流。** Web UI 里跑的所有 run 的记录**都追加进同一个文件**——不做 per-run / per-script 分片。一份日志就是一次"录制会话"，里面的 run 只是流上的片段。用户可 rename / rotate（清空 = 归档旧的、起新的）/ pin / discard。
+
+这个决策带来的直接收益：一份日志 = 一个自包含 NDJSON 文件，可以直接喂给 `redpymake report`，导出 / 分享 / 归档零打包成本。
+
+**启动语义**：`Workspace(new_log_on_start=True)` 进入时把恢复出来的活跃日志降级为历史、另起一份新的活跃日志；若那份**没有 run（`run_count == 0`）则原地复用**，免得反复重启堆一串空日志。`redpymake serve` 默认走这条路——一次 `serve` 就是一次独立的录制会话，`--resume-log` 可续用上次那份。库内默认 `False`：REPL / 脚本里的 `rpm.workspace(root)` 仍然续用上次活跃日志。
+
+```python
+@dataclass(frozen=True)
+class WorkspaceLog:
+    id: str              # 目录名：<YYYY-MM-DDTHHMMSS>-<6-hex>
+    name: str            # 用户可编辑显示名；默认 = id 的时间戳部分
+    created_at: float
+    description: str
+    pinned: bool         # True 时 discard_log 拒绝硬删
+    root: Path           # <logs_root>/<id>/
+    run_count: int
+    is_active: bool
+```
+
+**API**：
+
+```python
+ws.current_log -> WorkspaceLog                       # 活跃日志（写入目标）
+ws.list_logs() -> list[WorkspaceLog]                 # 按 created_at 降序
+ws.get_log(log_id) -> WorkspaceLog
+ws.rename_log(log_id, name, description=None) -> WorkspaceLog
+ws.rotate_log(name=None) -> WorkspaceLog             # 归档当前 + 新建 + 变活跃；run in progress 时拒绝
+ws.pin_log(log_id, pinned=True) -> WorkspaceLog
+ws.discard_log(log_id) -> None                       # 硬删；活跃或 pinned 时拒绝
+ws.list_runs_in_log(log_id) -> list[WorkspaceRun]    # 惰性扫 stream.ndjson 重建
+```
+
+**磁盘布局**：
+
+```text
+<logs_root>/                                  # 默认 <root>/.redpymake/logs/
+  _active.json                                # {"log_id": "..."}；缺失/损坏则回退到最新的 log 或新建
+  <log_id>/
+    meta.json                                 # {id,name,created_at,description,pinned}
+    stream.ndjson                             # 唯一日志流；该 log 下所有 run 的记录顺序追加
+```
+
+**没有** `runs.index.jsonl`，**没有** `runs/` 子目录——run 摘要不单独存，一律从 `stream.ndjson` 的元行重建。
+
+### `stream.ndjson` 的结构
+
+一份 stream 是若干个 run 段首尾相接。每个 run 段由 Workspace 自己写的一对元行界定，中间夹着 CORE-10 sink 落的内容（`script.begin` / `SessionLogRecord` × N / `script.end`）：
+
+```text
+{"event":"workspace.run.begin","run_id":"hello#1","script_path":"...","script_name":"hello","log_id":"...","started_at":...,"timestamp":...}
+{"event":"script.begin","name":"hello","pid":1234,"started_at":...}      <- CORE-10 sink
+{"event":"command","session_id":"local-1","message":"hi",...}            <- SessionLogRecord
+...
+{"event":"script.end","name":"hello","ended_at":...,"exception":null}    <- CORE-10 sink
+{"event":"workspace.run.end","run_id":"hello#1","status":"succeeded","ended_at":...,"exception":null,"timestamp":...}
+{"event":"workspace.run.begin","run_id":"build#2",...}                   <- 下一个 run 紧接着
+...
+```
+
+**分工**：
+
+- CORE-10 sink（`_live_sink.py`）**不改**：继续负责 `script.begin` / `script.end` + 每条 `SessionLogRecord`；只是它的目标文件从 per-run 分片变成了该 log 的 `stream.ndjson`（`REDPYMAKE_LIVE_SINK=file://<log>/stream.ndjson`，sink 本来就是 append 模式）；
+- Workspace 负责在 sink 外侧追写 `workspace.run.begin` / `workspace.run.end`——这两条携带**只有 workspace 知道的元数据**（`run_id` / `script_path` / `status` / `exception`），不污染 CORE-10 的语义。
+
+**元行字段**：
+
+| event | 字段 |
+|-------|------|
+| `workspace.run.begin` | `run_id`, `script_path`, `script_name`, `log_id`, `started_at`, `timestamp` |
+| `workspace.run.end` | `run_id`, `status`, `ended_at`, `exception`, `timestamp` |
+
+**Rotate 语义**：
+
+- 若 `ws.current_run is not None`（有 run 在跑或队列非空且 worker 正处理中），`rotate_log` 抛 `RuntimeError("cannot rotate: a run is in progress")`；调用方（Web UI）应先提示用户等或终止；
+- 归档 = 停止对旧 log 的 `stream.ndjson` 写入（不物理删除）；
+- 新 log 直接成为活跃，`_active.json` 原子替换（tmp + rename）；
+- `ws.runs` 跟随活跃日志；历史日志的 runs 走 `list_runs_in_log(log_id)`。
+
+**跨实例恢复**：
+
+- `Workspace.__enter__`：扫 `<logs_root>/*/meta.json` 重建 `_logs`；读 `_active.json`；**顺序扫活跃日志的 `stream.ndjson`**，按 `workspace.run.begin` / `workspace.run.end` 配对重建 `_runs`（历史日志按需惰性扫）；
+- 若 `_active.json` 缺失或指向不存在的 log：优先选最新的历史 log 复活，都没有再新建（默认名 = 时间戳）；
+- **孤立 `workspace.run.begin`**（有 begin 无 end，即进程崩溃 / 断电 / 强杀留下的残段）→ 重建为 `status="interrupted"`；
+- `run_count` 从 stream 里 `workspace.run.begin` 的条数得出。
+
+**`WorkspaceRun` 字段变化**：
+
+- 新增 `log_id: str`（该 run 所属日志的 id）；
+- 新增 `stream_offset_begin: int | None` / `stream_offset_end: int | None`（该 run 段在 stream 里的字节区间，回放时可直接 seek，省掉全文件扫描）；
+- `ndjson_path` **保留**但语义改为"该 run 所在 log 的 `stream.ndjson`"（向后兼容旧调用方；要单 run 的记录请用 `iter_run_records`）。
+
+**`iter_run_records(run_id)` 的实现**：打开该 run 所属 log 的 `stream.ndjson`，若有 offset 区间则 seek，否则顺序扫；从 `workspace.run.begin(run_id)` 开始 yield，到匹配的 `workspace.run.end(run_id)` 停止。两条 workspace 元行本身也 yield（前端 timeline 需要它们做 run 分隔）。
+
+**新增队列指令**：
+
+```python
+ws.cancel_run(run_id) -> bool      # 只对 queued 有效；剔出队列 + 标 cancelled；不落盘 stream
+ws.rerun(run_id) -> str            # 等价 enqueue(get_run(run_id).script_path)，返回新 run_id
+ws.stop_current() -> bool          # 见下
+```
+
+**`stop_current` 语义（尽力而为，不强杀）**：
+
+- 设 `_stop_requested = True` 并广播 `run.stopping` 事件；
+- 借出会话（`_BorrowedSession`）在每次 `run()` / `wait()` **进入前**检查该标志，已置起则抛 `WorkspaceStoppedError`——脚本因此在**下一条命令的边界**终止；
+- **当前正在执行的子进程不强杀**：一条已经跑起来的长命令会跑完；
+- run 收尾时若标志被置起过，`status` 覆盖为 `"cancelled"`（即便脚本自己正常返回）；
+- 标志在每个 run 开始前重置。
+
+**`redpymake run`（CLI 独立子进程）不参与本机制**：它继续落独立的 per-script NDJSON 到 `<script_dir>/.redpymake/runs/`，与 workspace 日志目录树完全隔离。
+
+**CLI**：
+
+```powershell
+redpymake logs list [ROOT]
+redpymake logs rename [ROOT] LOG_ID NEW-NAME [--description "..."]
+redpymake logs rotate [ROOT] [--name X]
+redpymake logs pin [ROOT] LOG_ID [--no-pin]
+redpymake logs discard [ROOT] LOG_ID
+```
+
+**Web UI**：
+
+- 顶栏放**日志切换器**：`Log: <当前名 (N runs)> ▾` + `✎ rename`（inline 编辑）+ `⟳ New log`（= rotate）+ `★ Pin` + `🗑 Discard`；
+- 切换器下拉列出所有历史日志（按时间倒序，★ pinned 靠前）；点击历史项切换 sidebar Runs 的展示范围；
+- Rotate 遇到 running run 时前端弹提示："当前有 run 在跑，请等它跑完（或停掉队列 pause_queue）后再新建日志"，本地不重试。
+
+### Web UI 交互模型（主区两态 + Sidebar 行内操作）
+
+**主区两态**：
+
+| 态 | 进入方式 | 数据源 | 控件 |
+|----|---------|--------|------|
+| **Live tail**（默认） | 初始态；点 `⇥ Back to Live` | `state.liveBuffer`——挂钩**活跃日志**跨 run 持续累积的 WS 流 | 只有滚动跟随；无 playback |
+| **Run detail**（回放） | 点 Sidebar Runs 里任一条目 | 活跃 log 的 run 从 `liveBuffer` 按 `run_id` 过滤；历史 log 的 run 走 `GET /api/logs/{lid}/runs/{rid}/records` | 完整 playback：`▶/⏸` `⏮` `Step` `Speed` `scrubber` |
+
+**关键约束（用户明确要求）**：`state.liveBuffer` 挂钩**活跃日志**而非某个 run——切去看历史 run **不打断** live 累积，随时 `⇥ Back to Live` 都能看到最新尾部，中途新到的记录一条不丢。切换活跃日志（rotate / 选历史 log）时才重置 buffer。
+
+Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.1s) ───`），由 `workspace.run.begin/end` 元行驱动。
+
+**Sidebar 行内操作**：
+
+- **不做** Script 详情卡——点脚本名不弹面板；
+- Scripts 每条右侧一个 `▶`（悬停显现）：点它才 enqueue，点条目本身无副作用（防误触，同时省掉二次点击）；
+- Runs 每条右侧一个**按状态自动切换**的操作按钮：
+
+| run status | 按钮 | 动作 | 路由 |
+|------------|------|------|------|
+| `queued` | `⏹` | 剔出队列 | `DELETE /api/runs/{rid}` |
+| `running` | `⏹` | 请求停止；按下后按钮变灰 + 文案 `stopping…`，等 `run.finished` 事件到达才复位 | `POST /api/runs/{rid}/stop` |
+| `succeeded` / `failed` / `cancelled` / `interrupted` | `⟳` | 用同一脚本路径重跑（**不弹确认**） | `POST /api/runs/{rid}/rerun` |
+
+- 主区**只做展示不做操作**——所有运行控制都收敛在 Sidebar 行内；
+- Sidebar Runs 里"当前活跃 run"**不自动抢占**主区展示（用户不点就不切）。
+
+**按 session 分栏**（Live 与 Run detail 两态都支持）：
+
+- Sidebar 的 Sessions 段头有 SplitToggle；开启后每条 SessionItem 前出现 SessionCheck，勾中的 session 各占一列；一条都没勾时退回单列；
+- 列定义由 PaneSet 持有，**时钟与 PlaybackToolbar 始终只有一份**——Run detail 分栏回放时多列共享同一个播放头，不做多时钟同步；
+- 记录按 `session_id` 路由；脚本自身的 `user_log`（合成 id `script:<name>#N`）与 RunSeparator 固定进 ScriptPane；
+- 运行中冒出的新会话自动补一列，避免悄悄落进 ScriptPane；SessionList 同时列出"池里的会话"与"当前主区数据里出现过的会话"（后者用 `○` 区分），所以看历史 run 时也能勾选分栏；
+- 选择持久化在 `localStorage["rpm.split"]`，刷新页面后保持。
+
+### Web UI DOM 部件命名（交流约定）
+
+页面部件有稳定名字，讨论 / issue / commit message 一律用这套词，避免"左边那个列表"式的指代。名字与 DOM 锚点一一对应：
+
+| 部件名 | DOM 锚点 | 职责 |
+|--------|----------|------|
+| **AppShell** | `body.app-shell` | 视口锁定外壳：TopBar + Layout 两段 |
+| **TopBar** | `header` | 标题与全局日志控制，不参与滚动 |
+| **BrandBlock** | `.header-left` | 标题 + 一句话说明 |
+| **LogSwitcher** | `#log-switcher` | 当前日志组 + 切换/管理入口 |
+| **LogCurrentButton** | `#log-current-btn` | 显示当前日志名与 run 数，点开 LogDropdown |
+| **LogDropdown** | `#log-dropdown` | 历史日志列表（★ pinned 靠前），含 discard |
+| **LogActions** | `#log-rename-btn` / `#log-pin-btn` / `#log-rotate-btn` | rename / pin / rotate（New log） |
+| **Layout** | `.layout` | 两列网格：Sidebar + MainPanel，吃满 TopBar 以下高度 |
+| **Sidebar** | `aside.sidebar` | 左侧导航，三分区，**自带内部滚动** |
+| **SessionList** | `#sess-list` | 会话池现状（跨 run 存活的连接）+ 分栏勾选 |
+| **SplitToggle** | `#split-toggle` | Sessions 段头开关：主区单列 ⇄ 按 session 分栏 |
+| **SessionCheck** | `.sb-check` | 分栏模式下每条 SessionItem 的勾选标记 |
+| **ScriptList** / **ScriptItem** | `#scripts-list` / `li.sb-item` | 已发现脚本；条目右侧 RunAction |
+| **RunAction** | `button.sb-action.action-run` | `▶` enqueue，悬停显现 |
+| **RunList** / **RunItem** | `#runs-list` / `li.sb-item` | 当前查看日志组内的 run；含 StatusBadge |
+| **RunItemAction** | `button.sb-action` | 状态化：`.action-stop` / `.action-rerun` / `.action-stopping` |
+| **StatusBadge** | `.badge.status-*` | run 状态色块 |
+| **MainPanel** | `main.main-panel` | 主展示区，两态互斥 |
+| **MainToolbar** | `#main-toolbar` | 仅 Run detail 态出现 |
+| **BackToLiveButton** | `#back-to-live` | 切回常驻 LiveView |
+| **MainContextLabel** | `#main-context` | 当前在看哪个 run |
+| **LiveView** | `#live-root` | 活跃日志组实时尾部（`LiveTail` 实例） |
+| **LiveHeader** | `.run-header`（LiveView 内） | 日志名 + 行数/等待提示 |
+| **LiveBody** | `ol.live-body` | LiveView 的 PaneBody；追加式渲染，超 `LIVE_MAX_ROWS` 从头裁剪 |
+| **RunSeparator** | `li.run-separator` | 流内 run 边界标记，由 `workspace.run.begin/end` 元行驱动 |
+| **RunDetailView** | `#timeline-root` | 单 run 回放（`Timeline` 实例） |
+| **RunHeader** | `.run-header`（RunDetailView 内） | 脚本名 / run id / 状态 / 异常 |
+| **PlaybackToolbar** | `.timeline-toolbar` | Live·Play·Reset·Step·SpeedSelect·Scrubber·TimeLabel |
+| **PaneSet** | `.pane-set`（`.split` 为分栏态） | 日志行的落地容器；单列或按 session 多列 |
+| **Pane** / **PaneHeader** | `.pane` / `.pane-header` | 一列 = 一个 session；表头显示会话标签 |
+| **ScriptPane** | `.pane.pane-script` | 兜底列：脚本自身的 `user_log` 与 RunSeparator |
+| **PaneBody** / **TimelineBody** | `ol.timeline-body` | **内部滚动区**；每列各自滚动与 auto-scroll |
+| **LogRow** | `li.tl-row` | 一条记录：TsCell `.tl-ts` / EventCell `.tl-ev` / SessionCell `.tl-sid` / MsgCell `.tl-msg` |
+
+前端状态字段同样固定：`state.view`（`live` \| `run`）、`state.liveBuffer`（挂活跃日志）、`state.viewedLogId`（RunList 展示范围）、`state.currentRunId`（服务端在跑的 run，不抢主区）、`state.split`（`{enabled, sessionIds}`，持久化在 `localStorage["rpm.split"]`）。
+
+**AppShell 布局约束**：
+
+- 整页**不出现文档级滚动条**：`body.app-shell` 锁 `100vh` 且 `overflow: hidden`，纵向 flex 分 TopBar（不收缩）+ Layout（`flex: 1; min-height: 0`）；
+- 滚动只发生在三个内部容器：Sidebar、LiveBody、TimelineBody。每一级 flex/grid 子项都要显式 `min-height: 0`，否则内容会把容器顶大、`overflow-y: auto` 不生效；
+- **禁止**用 `calc(100vh - <常数>)` 顶掉 TopBar 高度——TopBar 高度随内容与换行变化，硬编码必然溢出；
+- 视口锁定规则**只挂在 `body.app-shell` 上**：`styles.css` 同时被静态 HTML 报告复用，报告页是普通的文档流滚动页面，不能被锁死；
+- LogRow 列宽随视口自适应（SessionCell 用 `clamp()` 收缩、窄窗口下整列隐藏）；`.tl-msg` 显式占位到消息列，避免无 `session_id` 的记录错位到 SessionCell。
+
+### Web UI
+
+`redpymake serve` 是 `Workspace` 的一个前端。要求：
+
+- FastAPI + Jinja2 SSR + htmx（局部刷新）+ alpine.js（前端小状态）+ WebSocket（实时推送）；
+- 前端资源（`htmx.min.js` / `alpine.min.js` / `styles.css` / `timeline.js`）**内联进 wheel** 的 `_web/static/`——不走 CDN；
+- 默认 `--host 127.0.0.1 --port 8765`；显式 `--host 0.0.0.0` 时向 stderr 打一行公网风险警告；
+- 启动即另起一份活跃日志（上一份为空则复用），`--resume-log` 续用上次；`--no-open` 关闭自动开浏览器；
+- 无内置认证（第一版）；
+- 关键路由：
+  - `GET /`：合并的 workspace 主页；侧栏三段 = sessions / scripts / runs，主区 = Live tail / Run detail 两态；
+  - `GET /api/scripts`：`Workspace.discover()` 的 JSON；
+  - `GET /api/sessions`：`Workspace.sessions()` 摘要；
+  - `GET /api/runs`：`Workspace.runs` 摘要；
+  - `POST /api/runs`（body: `{"path": "..."}`）：`Workspace.enqueue` 并返回 `run_id`；
+  - `GET /api/runs/{rid}/records`：该 run 的记录（从所属 log 的 stream 里过滤）；
+  - `POST /api/runs/{rid}/stop`：`Workspace.stop_current()`，仅当 `rid` 是当前 run；
+  - `POST /api/runs/{rid}/rerun`：`Workspace.rerun(rid)`，返回新 `run_id`；
+  - `DELETE /api/runs/{rid}`：`Workspace.cancel_run(rid)`，仅对 queued 有效；
+  - `POST /api/runs/stop`：`Workspace.stop_current()`（不带 rid 的旧入口，保留）；
+  - `GET /api/logs`｜`/api/logs/current`｜`/api/logs/{lid}`｜`/api/logs/{lid}/runs`｜`/api/logs/{lid}/runs/{rid}/records`；
+  - `PATCH /api/logs/{lid}`（rename）｜`POST /api/logs/rotate`｜`POST /api/logs/{lid}/pin`｜`DELETE /api/logs/{lid}`；
+  - `WS /ws`：多路复用 sessions / runs / log 变更 / 活跃日志的记录增量；
+- 核心库依赖零 UI；Web 走 `redpymake[web]` extra；
+- `Workspace` 是 `serve` 唯一的状态所有者，路由处理器**只读 workspace 状态、只调 workspace 指令**，不引入独立 UI 层业务状态。
+
+### 静态 HTML 报告
+
+`redpymake report NDJSON -o report.html`：
+
+- 读入一份 NDJSON，输出一个自包含 HTML；
+- 页面结构 = Web UI 主区（时间线 + 命令详情）的**只读快照版本**；
+- 数据以 `<script type="application/json" id="run-data">...</script>` 内嵌；
+- 前端脚本从该节点读并渲染，**不发任何网络请求**；
+- 页面尾部保留 `<pre>` 原始 NDJSON，方便机器解析。
+
+### 明确不做的能力
+
+- 并行运行多脚本（第一版仅串行队列）；
+- 主动"抢焦"当前 run 之外的 UI 面板（主区永远跟随 `workspace.current_run`）；
+- 桌面 App（PyQt / Tauri / Electron）与 TUI（`rich` / `textual`）—— 一律不做；
+- Diff / 回放对比 —— 后续版本；
+- 内置身份认证 / 权限系统 —— 后续版本，需要时用反代解决。
+
+---
+
 ## 5. 验收标准
 
 1. README 前十分钟示例可以完成本地命令、SSH 命令和文件复制。
@@ -884,6 +1420,14 @@ class ScriptSnapshot:
 11. `run(...).wait(...)` 不会漏掉命令执行期间已产生的日志。
 12. 会话关闭后仍可读取已收集的日志。
 13. `with rpm.script(dump_on_error=...)`：块内未处理异常时按配置自动落盘（含标准 `logging` 与所有登记 session 的日志）；正常退出不落盘；落盘失败不掩盖原异常。
+14. `rpm.discover(root)` 能返回目录内所有 `rpm_*.py` 的 `ScriptCard` 元数据；纯 AST 分析，不 import；语法错误文件不使整个函数崩溃。
+15. 设置 `REDPYMAKE_LIVE_SINK=file://...` 后，`ScriptRun` 在生命周期内把每条 `SessionLogRecord` 追加到目标 NDJSON；首尾各有 `script.begin` / `script.end` 元行；异常路径 `script.end.exception` 非空。
+16. `rpm.workspace(root)` 能串行运行多个脚本，脚本代码中的 `rpm.wsl()` / `rpm.ssh(...)` 等在 workspace 作用域内自动借出共享会话（无需修改脚本源码）；`__exit__` 关闭所有会话；模块每次 `▶` 自动 reload。
+17. `Workspace` 具备**日志组**：**一份日志 = 一份 `stream.ndjson`**，该日志下所有 run 的记录顺序追加进同一文件（不做 per-run 分片）；run 摘要从 `workspace.run.begin/end` 元行重建，孤立 begin 重建为 `interrupted`；用户可 rename / rotate / pin / discard；重开 workspace 时自动恢复上次活跃日志 + 其历史 runs（`serve` 的启动语义见第 20 条）；rotate 遇到 running run 时拒绝并给出明确错误。
+18. Web UI 主区分 **Live tail** 与 **Run detail** 两态：live buffer 挂钩**活跃日志**跨 run 持续累积，切去看历史 run 不打断 live，可随时切回并看到完整尾部；Sidebar Runs 每条按状态自动呈现 `⏹`（queued/running）或 `⟳`（终态）操作按钮；`stop_current` 是尽力而为的协作式取消（下一条命令边界生效，不强杀在跑的子进程）。
+19. Web UI 页面吃满视口、**无文档级滚动条**：`body.app-shell` 锁 `100vh`，滚动只出现在 Sidebar / LiveBody / TimelineBody 三个内部容器；样式表不含 `calc(100vh - <常数>)` 式的 TopBar 高度硬编码；视口锁定只作用于 `body.app-shell`，静态 HTML 报告页保持普通文档流；隐藏态的 RunDetailView 不占位（ID 选择器不得盖过 `.panel-view[hidden]`），LiveView 独占 MainPanel 全高。
+20. `redpymake serve` 每次启动另起一份活跃日志（上一份 `run_count == 0` 时复用），旧日志留在 `list_logs()` 与 LogDropdown 里可回看；`--resume-log` 续用上次；`rpm.workspace(root)` 默认行为不变。
+21. Web UI 支持按 session 分栏：SplitToggle 开启后 SessionList 的勾选项各占一列，脚本自身日志与 RunSeparator 进 ScriptPane；Live 与 Run detail 两态都可分栏，且回放时多列共享**同一个**播放头；勾选持久化到 `localStorage`。
 
 ---
 
@@ -910,6 +1454,27 @@ class ScriptSnapshot:
 | Session 登记方式 | 隐式（进入 `with rpm.script()` 后 root Session 构造时读 `ContextVar` 自动 attach）+ 显式（`run.attach(sess)`）并存 |
 | `logging` 捕获范围 | 默认 root logger + `log_level` 门槛；`loggers=[...]` 时改为 opt-in 白名单 |
 | 异常落盘触发 | 仅在 `__exit__` 收到未处理异常时；`dump_on_error` 按值类型分派：单文件 / 目录包 / callable / 关闭 |
+| 脚本发现 | 二级接口组 E：文件名前缀 `rpm_*.py`（`pyproject.toml [tool.redpymake.discovery] patterns` 可覆盖）+ AST 抽取元数据；不 import 目标脚本 |
+| 脚本身份 | 运行时依旧 `with rpm.script(...)`（CORE-09）；前缀只是文件级发现的锚点 |
+| 实时日志 sink | 环境变量 `REDPYMAKE_LIVE_SINK=file://...`；仅 file:// 一种传输；首/尾有 `script.begin` / `script.end` 元行；与 `dump_on_error` 正交 |
+| CLI 入口 | `redpymake discover` / `run` / `report` / `serve`；核心库零 UI 依赖，Web 走 `[web]` extra |
+| Workspace 会话池 | 懒创建 + 按 key 缓存 + 跨脚本复用；`__exit__` 时默认 `auto_close_sessions=True` 关全部 |
+| Workspace 执行模型 | 单线程串行队列 + `enqueue` 随时可加；`importlib.reload` 每次 ▶ 生效；主区跟随 `current_run` |
+| 脚本入口约定 | 必须 `def main() -> None`；`if __name__ == "__main__": main()` 保持 CLI 直跑等价 |
+| Web 技术栈 | FastAPI + Jinja2 SSR + htmx + alpine.js + WebSocket；无前端构建链；资源内联入 wheel |
+| Workspace 日志组 | 一份 workspace 恒有一个活跃日志；用户可 rename / rotate（=清空）/ pin / discard；跨 `serve` 实例自动恢复；`redpymake run`（CLI 独立子进程）不走这套 |
+| 日志存储粒度 | **一份日志 = 一份 `stream.ndjson`**（该 log 下所有 run 顺序追加进同一文件）；**不做** per-run / per-script 分片；一份日志即一个自包含可 `report` 的 NDJSON |
+| 日志目录布局 | `<logs_root>/<log_id>/{meta.json, stream.ndjson}`；活跃日志由 `_active.json` 指定；无 `runs.index.jsonl`、无 `runs/` 子目录 |
+| Run 摘要来源 | 不单独持久化；从 stream 里的 `workspace.run.begin` / `workspace.run.end` 元行配对重建；孤立 begin → `status="interrupted"` |
+| run 边界元行归属 | CORE-10 sink 不改（继续写 `script.begin/end`）；`workspace.run.begin/end` 由 Workspace 在 sink 外侧追写，携带 `run_id` 等 workspace 专属元数据 |
+| Rotate 冲突处理 | 有 run 在跑时 `rotate_log` 拒绝并抛 `RuntimeError`；UI 提示用户等或终止；后续版本考虑排队式 rotate |
+| Stop 语义 | 协作式尽力而为：设标志 + 借出会话在 `run()`/`wait()` 边界抛 `WorkspaceStoppedError`；**不强杀**在跑的子进程；run 终态覆盖为 `cancelled` |
+| Web UI 主区 | 两态：Live tail（挂钩活跃日志、跨 run 持续、可随时切回）与 Run detail（单 run 回放，含 playback 控件）；主区只展示不操作 |
+| Web UI 运行控制 | 全部收敛到 Sidebar 行内：Scripts 条目 `▶`、Runs 条目按状态 `⏹`/`⟳`；不做 Script 详情卡；Rerun 不弹确认；活跃 run 不自动抢占主区 |
+| Web UI 部件命名 | 固定一套 DOM 部件名（AppShell / TopBar / Sidebar / MainPanel / LiveView / RunDetailView…），文档与讨论统一使用 |
+| Web UI 页面滚动 | 视口锁定：`body.app-shell` 占满 `100vh` 不滚动，滚动条只在 Sidebar / LiveBody / TimelineBody 内部；禁止 `calc(100vh - 常数)` |
+| serve 启动日志 | 每次 `serve` 另起一份活跃日志（上一份为空则复用），`--resume-log` 续用；库内 `rpm.workspace()` 默认仍续用上次 |
+| 多 session 查看 | 按 session 分栏，列定义走 PaneSet；Live 与 Run detail 都支持，回放共享单一播放时钟；脚本自身日志进 ScriptPane |
 
 ---
 
@@ -920,4 +1485,7 @@ class ScriptSnapshot:
 - DAG 编排与原生 async
 - 远程进程 spawn / wait / kill
 - TFTP 作为 optional extra
-- Web UI 基于新会话日志订阅接口重建
+- Workspace 并行队列 / diff 视图 / 内置认证
+- Workspace 日志组的**排队式 rotate**（当前 rotate 遇 running run 会直接拒绝）
+- Workspace 日志组的跨机同步 / 云端归档
+- 实时 sink 的 `stdout://` / `tcp://` 变体

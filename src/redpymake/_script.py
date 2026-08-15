@@ -33,6 +33,7 @@ from itertools import count
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
+from ._live_sink import NdjsonLiveSink, sink_path_from_env
 from ._logs import SessionLogRecord
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -155,6 +156,8 @@ class ScriptRun:
         "_ended_at",
         "_active",
         "_script_session_id",
+        "_live_sink",
+        "_record_hook",
     )
 
     def __init__(
@@ -182,6 +185,11 @@ class ScriptRun:
         self._active = False
         # 用于给 user_log 记录标注一个稳定的 session_id（不与真实 Session 冲突）
         self._script_session_id = f"script:{self._name}#{next(_script_id_counter)}"
+        # CORE-10 实时 sink：__enter__ 时按环境变量激活
+        self._live_sink: NdjsonLiveSink | None = None
+        # CORE-11 Workspace record hook：__enter__ 时若发现活跃 Workspace 则借出
+        # 一个回调，把每条 record 转发到 workspace 的订阅者（例如 WebSocket）。
+        self._record_hook: Callable[[SessionLogRecord], None] | None = None
 
     # ------------------------------------------------------------------ 属性
 
@@ -212,6 +220,10 @@ class ScriptRun:
         self._cv_token = _current_script.set(self)
         # 2) 装 logging handler
         self._install_handler()
+        # 3) CORE-10：按环境变量激活实时 NDJSON sink
+        self._maybe_open_live_sink()
+        # 4) CORE-11：若在 Workspace 作用域内，借出 record hook（供 UI 实时消费）
+        self._maybe_bind_workspace_hook()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -242,7 +254,17 @@ class ScriptRun:
                     "ScriptRun.dump failed while handling %s", exc_type
                 )
 
-        # 5) 不吞异常
+        # 5) CORE-10：关闭实时 sink（写 script.end 元行）；失败不掩盖原异常
+        try:
+            self._close_live_sink(exc_type, exc, tb)
+        except Exception:  # pragma: no cover
+            _diag_logger.exception("failed to close live sink for %s", self._name)
+
+        # 6) CORE-11：解除 workspace record hook（幂等）
+        with self._lock:
+            self._record_hook = None
+
+        # 6) 不吞异常
         return None
 
     # ------------------------------------------------------------ handler 侧
@@ -319,6 +341,15 @@ class ScriptRun:
         """Session buffer 的订阅回调；追加到 merged。"""
         with self._lock:
             self._merged.append(record)
+            sink = self._live_sink
+            hook = self._record_hook
+        if sink is not None:
+            sink.on_record(record)
+        if hook is not None:
+            try:
+                hook(record)
+            except Exception:  # pragma: no cover - workspace hook 异常不能拖挂脚本
+                _diag_logger.exception("workspace record hook raised")
 
     def _append_user_log(self, record: logging.LogRecord) -> None:
         """logging handler 的转换出口。"""
@@ -341,6 +372,77 @@ class ScriptRun:
         )
         with self._lock:
             self._merged.append(session_record)
+            sink = self._live_sink
+            hook = self._record_hook
+        if sink is not None:
+            sink.on_record(session_record)
+        if hook is not None:
+            try:
+                hook(session_record)
+            except Exception:  # pragma: no cover
+                _diag_logger.exception("workspace record hook raised")
+
+    # ---------------------------------------------- CORE-11 workspace hook
+
+    def _maybe_bind_workspace_hook(self) -> None:
+        """若当前处于 ``Workspace`` 作用域内，借出一个记录回调。
+
+        ``__enter__`` 在**用户脚本主线程**执行；此线程通常继承了 ``Workspace._execute_run``
+        里对 ``_active_workspace`` 的 ``set``。这里读到 workspace 后向它请求 hook，
+        hook 会被保存在实例属性上——之后 Session 的 reader 子线程（不继承
+        ContextVar）通过属性直接访问，无线程安全隐患。
+        """
+        try:
+            from ._workspace import _active_workspace
+        except ImportError:  # pragma: no cover - 循环导入保护
+            return
+        ws = _active_workspace.get()
+        if ws is None:
+            return
+        try:
+            hook = ws._make_script_record_hook(self)  # noqa: SLF001 - 内部协议
+        except Exception:  # pragma: no cover - hook 构造异常仅记录
+            _diag_logger.exception("workspace hook install failed for %s", self._name)
+            return
+        if hook is None:
+            return
+        with self._lock:
+            self._record_hook = hook
+
+    # -------------------------------------------------- CORE-10 实时 sink
+
+    def _maybe_open_live_sink(self) -> None:
+        """按 ``REDPYMAKE_LIVE_SINK`` 环境变量激活实时 NDJSON sink。"""
+        path = sink_path_from_env()
+        if path is None:
+            return
+        try:
+            sink = NdjsonLiveSink(
+                path=path,
+                script_name=self._name,
+                started_at=self._started_at,
+            )
+            sink.open()
+        except Exception:  # pragma: no cover - sink 打开失败仅记录
+            _diag_logger.exception("failed to open live sink at %s", path)
+            return
+        with self._lock:
+            self._live_sink = sink
+
+    def _close_live_sink(self, exc_type, exc, tb) -> None:
+        with self._lock:
+            sink = self._live_sink
+            self._live_sink = None
+        if sink is None:
+            return
+        exc_info: dict[str, Any] | None = None
+        if exc is not None:
+            exc_info = {
+                "type": exc_type.__name__ if exc_type is not None else "Exception",
+                "message": str(exc),
+                "traceback": "".join(traceback.format_exception(exc_type, exc, tb)),
+            }
+        sink.close(ended_at=self._ended_at, exception=exc_info)
 
     # ----------------------------------------------------------------- 快照
 

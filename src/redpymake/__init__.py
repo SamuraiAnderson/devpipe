@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from ._command import CommandResult
+from ._discover import ScriptCard, discover
 from ._factory import adb, local, serial, ssh, wsl
 from ._local import LocalSession
 from ._logs import (
@@ -30,6 +31,7 @@ from ._script import ScriptRun, ScriptSnapshot, script
 from ._session import Session
 from ._stale import PathSpec, StalePredicate, stale
 from ._transfer import TransferResult
+from ._workspace import Workspace, WorkspaceLog, WorkspaceRun, workspace
 from .exceptions import (
     CommandError,
     CommandTimeoutError,
@@ -43,9 +45,10 @@ from .exceptions import (
     SessionError,
     TransferError,
     UnsupportedOperationError,
+    WorkspaceStoppedError,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 def __getattr__(name: str):
@@ -78,6 +81,8 @@ __all__ = [
     "serial",
     "wsl",
     "script",
+    "workspace",
+    "discover",
     # 一级类型
     "Session",
     "LocalSession",
@@ -87,6 +92,10 @@ __all__ = [
     "WslSession",
     "ScriptRun",
     "ScriptSnapshot",
+    "ScriptCard",
+    "Workspace",
+    "WorkspaceLog",
+    "WorkspaceRun",
     # 数据对象
     "CommandResult",
     "TransferResult",
@@ -115,4 +124,5 @@ __all__ = [
     "InputNotFoundError",
     "LogWaitTimeoutError",
     "UnsupportedOperationError",
+    "WorkspaceStoppedError",
 ]

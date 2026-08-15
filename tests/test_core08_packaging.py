@@ -21,8 +21,11 @@ import redpymake as rpm
 
 
 EXPECTED_PUBLIC = {
-    "local", "ssh", "adb", "serial",
+    "local", "ssh", "adb", "serial", "wsl",
+    "script", "workspace", "discover",
     "Session", "LocalSession", "SshSession", "AdbSession", "SerialSession",
+    "WslSession", "ScriptRun", "ScriptSnapshot", "ScriptCard",
+    "Workspace", "WorkspaceLog", "WorkspaceRun",
     "CommandResult", "TransferResult", "ResourcePath", "ResourceStat",
     "SessionLogs", "SessionLogRecord", "LogBuffer", "LogCursor", "LogMatch",
     "stale", "StalePredicate", "PathSpec",

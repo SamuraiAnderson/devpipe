@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "redpymake"
-version = "0.5.0"
+version = "0.6.0"
 description = "跨运行环境的 Python 自动化库：统一的会话接口用于命令执行、文件传输、日志收集与过时判断"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +30,12 @@ dependencies = []
 ssh = ["paramiko>=3.0"]
 serial = ["pyserial>=3.5"]
 tftp = ["tftpy>=0.8"]
+web = [
+    "fastapi>=0.110",
+    "jinja2>=3.1",
+    "uvicorn>=0.29",
+    "websockets>=12.0",
+]
 dev = [
     "pytest>=7",
     "pytest-cov>=4",
@@ -37,10 +43,18 @@ dev = [
     "pytest-mock>=3.12",
     "paramiko>=3.0",
     "pyserial>=3.5",
+    "fastapi>=0.110",
+    "jinja2>=3.1",
+    "uvicorn>=0.29",
+    "websockets>=12.0",
+    "httpx>=0.27",  # FastAPI TestClient 依赖
 ]
 
 [project.urls]
 Homepage = "https://github.com/RedPyMake/RedPyMake"
+
+[project.scripts]
+redpymake = "redpymake._cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -50,7 +64,12 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-redpymake = ["py.typed"]
+redpymake = [
+    "py.typed",
+    "_web/static/*.css",
+    "_web/static/*.js",
+    "_web/templates/*.html",
+]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
@@ -71,6 +90,8 @@ omit = [
     "src/redpymake/_adb.py",
     "src/redpymake/_serial.py",
     "src/redpymake/_wsl.py",
+    # Web UI 覆盖率通过端到端浏览器测试（后续版本）保证，单元层只覆盖 API 契约。
+    "src/redpymake/_web/server.py",
 ]
 
 [tool.coverage.report]
