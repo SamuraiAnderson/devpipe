@@ -81,6 +81,10 @@
     this.panes = [];
     this.byId = {};
     this.fallback = null;
+    this._splitInstance = null;
+    this._savedWidths = null;   // { paneId: percent }，宿主没接桥时的本地兜底
+    this.onLoadWidths = null;   // 取宽度偏好；见 bindPaneWidths
+    this.onResize = null;       // 拖动结束时回调，宿主拿去持久化
     this.setPanes([]);
   }
 
@@ -88,10 +92,44 @@
     return this.panes.length > 1;
   };
 
+  function sameIds(panes, ids) {
+    if (panes.length !== ids.length) return false;
+    for (var i = 0; i < panes.length; i++) {
+      if (panes[i].id !== ids[i]) return false;
+    }
+    return true;
+  }
+
+  // Split.js 要求 sizes 之和为 100；存下来的宽度可能只覆盖部分列（新列还没记录），
+  // 缺的按均分补，最后整体归一化。
+  function normalizeSizes(ids, saved) {
+    var fallback = 100 / ids.length;
+    var sizes = ids.map(function (id) {
+      var v = saved[id];
+      return (typeof v === "number" && isFinite(v) && v > 0) ? v : fallback;
+    });
+    var total = sizes.reduce(function (a, b) { return a + b; }, 0);
+    if (!total) return ids.map(function () { return fallback; });
+    return sizes.map(function (v) { return (v / total) * 100; });
+  }
+
+  // Live 与 Run detail 各有一个 PaneSet，共用宿主（server.py 的 IIFE）那份宽度偏好。
+  // 每次 resync 都回宿主取最新值，避免 Timeline 反复挂载时读到过期副本。
+  // 静态 report 场景没有宿主桥，静默退化为均分。
+  function bindPaneWidths(paneSet) {
+    if (typeof window === "undefined") return;
+    paneSet.onLoadWidths = function () {
+      return (typeof window.__rpmLoadWidths === "function") ? window.__rpmLoadWidths() : null;
+    };
+    paneSet.onResize = function (widths) {
+      if (typeof window.__rpmSaveWidths === "function") window.__rpmSaveWidths(widths);
+    };
+  }
+
   PaneSet.prototype._makeBody = function () {
     var cls = "timeline-body" + (this.bodyClass ? " " + this.bodyClass : "");
     var body = el("ol", { className: cls }, []);
-    var pane = { body: body, userScrolled: false };
+    var pane = { id: null, body: body, wrap: null, header: null, userScrolled: false };
     body.addEventListener("scroll", function () {
       var near = (body.scrollTop + body.clientHeight) >= (body.scrollHeight - 8);
       pane.userScrolled = !near;
@@ -99,35 +137,129 @@
     return pane;
   };
 
-  // defs: [] / null → 单列；否则每个 {id, label} 一列，外加一个 Script 兜底列
+  // defs: [] / null → 单列；否则每个 {id, label} 一列，外加一个 Script 兜底列。
+  //
+  // 按 id 做增量 diff，**不整棵重建**：留下来的列 DOM 身份不变，滚动位置、已渲染
+  // 的日志行、Split.js 拖出来的宽度都原样保留。一次 run 里会连续冒出新 session，
+  // 全量重建会让用户的视图每隔几秒抖一次。
+  //
+  // 返回 {added, removed}：调用方据此只给新列补灌历史数据。
   PaneSet.prototype.setPanes = function (defs) {
     var self = this;
-    this.container.innerHTML = "";
-    this.panes = [];
-    this.byId = {};
-    if (!defs || !defs.length) {
-      var only = this._makeBody();
-      only.id = null;
+    var wantSplit = !!(defs && defs.length);
+
+    if (!wantSplit) {
+      // 单列那个 body 没有 wrap，从分栏切回来复用不了，整体重建
+      if (this.isSplit()) {
+        this._destroySplit();
+        this.container.innerHTML = "";
+        this.panes = [];
+        this.byId = {};
+        this.fallback = null;
+      }
       this.container.classList.remove("split");
-      this.container.appendChild(only.body);
-      this.panes = [only];
-      this.fallback = only;
-      return;
+      if (!this.panes.length) {
+        var only = this._makeBody();
+        only.id = null;
+        this.container.appendChild(only.body);
+        this.panes = [only];
+        this.fallback = only;
+      }
+      return { added: [], removed: [] };
     }
+
+    var all = defs.concat([{ id: SCRIPT_PANE_ID, label: "Script" }]);
+    var nextIds = all.map(function (def) { return def.id; });
+
+    // 列集合没变（顶多 label 变了）→ 不碰 DOM 也不重建 Split，
+    // 否则每次轮询都会把用户拖出来的宽度打回默认值
+    if (this.isSplit() && sameIds(this.panes, nextIds)) {
+      all.forEach(function (def) {
+        self.byId[def.id].header.textContent = def.label || def.id;
+      });
+      return { added: [], removed: [] };
+    }
+
+    if (!this.isSplit()) {
+      this.container.innerHTML = "";
+      this.panes = [];
+      this.byId = {};
+      this.fallback = null;
+    }
+
+    // 先撤掉旧 Split 实例：它会把 gutter 从容器里摘掉，
+    // 否则下面重排 pane 时 gutter 会留在错误的位置上
+    this._destroySplit();
     this.container.classList.add("split");
-    defs.concat([{ id: SCRIPT_PANE_ID, label: "Script" }]).forEach(function (def) {
-      var pane = self._makeBody();
+
+    var wanted = {};
+    all.forEach(function (def) { wanted[def.id] = def; });
+
+    var removed = [];
+    Object.keys(this.byId).forEach(function (id) {
+      if (wanted[id]) return;
+      self.byId[id].wrap.remove();
+      delete self.byId[id];
+      removed.push(id);
+    });
+
+    var added = [];
+    all.forEach(function (def) {
+      var pane = self.byId[def.id];
+      if (pane) {
+        pane.header.textContent = def.label || def.id;
+        return;
+      }
+      pane = self._makeBody();
       pane.id = def.id;
-      var wrap = el("div", {
+      pane.header = el("div", { className: "pane-header", title: def.id }, [def.label || def.id]);
+      pane.wrap = el("div", {
         className: "pane" + (def.id === SCRIPT_PANE_ID ? " pane-script" : ""),
-      }, [
-        el("div", { className: "pane-header", title: def.id }, [def.label || def.id]),
-      ]);
-      wrap.appendChild(pane.body);
-      self.container.appendChild(wrap);
-      self.panes.push(pane);
+      }, [pane.header]);
+      pane.wrap.appendChild(pane.body);
       self.byId[def.id] = pane;
-      if (def.id === SCRIPT_PANE_ID) self.fallback = pane;
+      added.push(def.id);
+    });
+
+    // appendChild 一个已在 DOM 里的节点等于移动它，不会重建 —— 顺序对齐 defs
+    this.panes = all.map(function (def) {
+      var pane = self.byId[def.id];
+      self.container.appendChild(pane.wrap);
+      return pane;
+    });
+    this.fallback = this.byId[SCRIPT_PANE_ID];
+
+    this._resyncSplit();
+    return { added: added, removed: removed };
+  };
+
+  PaneSet.prototype._destroySplit = function () {
+    if (!this._splitInstance) return;
+    try {
+      this._splitInstance.destroy();   // 摘掉 gutter + 清掉它写的 inline flex-basis
+    } catch (e) { /* 容器已被清空时 Split 会抛，忽略 */ }
+    this._splitInstance = null;
+  };
+
+  // 只在列集合变化后调用。宽度优先用宿主存下来的百分比，新列按均分补。
+  // Split.js 缺席时（没引 vendor 脚本）静默降级为 flex 均分，不影响其它功能。
+  PaneSet.prototype._resyncSplit = function () {
+    if (!this.isSplit() || typeof Split !== "function") return;
+    var self = this;
+    var wraps = this.panes.map(function (p) { return p.wrap; });
+    var ids = this.panes.map(function (p) { return p.id; });
+    var saved = (typeof this.onLoadWidths === "function" && this.onLoadWidths())
+      || this._savedWidths || {};
+    this._splitInstance = Split(wraps, {
+      sizes: normalizeSizes(ids, saved),
+      minSize: 120,
+      gutterSize: 4,
+      onDragEnd: function (newSizes) {
+        var out = {};
+        ids.forEach(function (id, i) { out[id] = newSizes[i]; });
+        self._savedWidths = out;
+        if (typeof self.onResize === "function") self.onResize(out);
+      },
     });
   };
 
@@ -233,6 +365,7 @@
     this.root.appendChild(paneWrap);
 
     this.paneSet = new PaneSet(paneWrap);
+    bindPaneWidths(this.paneSet);
 
     this._nodes = {
       header: header, title: title, status: status,
@@ -536,6 +669,7 @@
     this.logName = "";
     this.count = 0;              // 已渲染的日志行数（不含分隔条）
     this._runStarts = {};        // run_id -> started_at，用于 end 分隔条算时长
+    this._paneFilter = null;     // 非空时只往这些列补行（分栏新增列的 buffer 重放）
     this._nodes = {};
     this.paneSet = null;
     this._buildDom();
@@ -550,22 +684,78 @@
 
     var paneWrap = el("div", { className: "pane-set" }, []);
 
+    // 命令输入栏
+    var commandBar = el("div", { className: "command-bar" }, [
+      el("div", { className: "command-bar-left" }, [
+        el("select", { id: "cmd-session-select", className: "command-session-select" }, [
+          el("option", { value: "" }, ["Select session…"])
+        ]),
+        el("label", { className: "command-option", title: "Shell mode (enables cd, pipes, etc.)" }, [
+          el("input", { type: "checkbox", id: "cmd-shell-mode", checked: true }),
+          "Shell"
+        ]),
+        el("span", { id: "cmd-hint", className: "hint" }, [])
+      ]),
+      el("div", { className: "command-bar-center" }, [
+        el("input", {
+          id: "cmd-input",
+          className: "command-input",
+          type: "text",
+          placeholder: "Type command and press Enter…",
+          autocomplete: "off",
+          spellcheck: "false"
+        })
+      ]),
+      el("div", { className: "command-bar-right" }, [
+        el("button", { id: "cmd-send-btn", className: "tb-btn", type: "button" }, ["Execute"]),
+        el("button", { id: "cmd-history-btn", className: "tb-btn hint", type: "button", title: "History (Up/Down)" }, ["▾"])
+      ])
+    ]);
+
     this.root.innerHTML = "";
     this.root.appendChild(header);
     this.root.appendChild(paneWrap);
+    this.root.appendChild(commandBar);
 
     this.paneSet = new PaneSet(paneWrap, {
       maxRows: LIVE_MAX_ROWS,
       bodyClass: "live-body",
     });
-    this._nodes = { header: header, title: title, status: status, paneWrap: paneWrap };
+    bindPaneWidths(this.paneSet);
+    this._nodes = {
+      header: header,
+      title: title,
+      status: status,
+      paneWrap: paneWrap,
+      commandBar: commandBar
+    };
+
+    // 初始化命令栏
+    this._initCommandBar();
   };
 
-  // 分栏：换列后 buffer 要重放一遍才填得满，records 由调用方（挂钩活跃日志的
-  // liveBuffer）提供
+  // 分栏：新出现的列是空的，要把 buffer 重放一遍才填得满；已经存在的列 DOM 原样
+  // 保留，绝不能跟着重放，否则日志会翻倍。records 由调用方（挂钩活跃日志的
+  // liveBuffer）提供。
   LiveTail.prototype.setPanes = function (defs, records) {
-    this.paneSet.setPanes(defs);
-    this.load(records || []);
+    var diff = this.paneSet.setPanes(defs);
+    if (!diff.added.length) return;
+
+    var filter = {};
+    diff.added.forEach(function (id) { filter[id] = true; });
+    // count / _runStarts 是跨 run 的累计量，重放只为补 DOM，不能把它们再算一遍
+    var savedCount = this.count;
+    var savedRunStarts = this._runStarts;
+    this._paneFilter = filter;
+    this._runStarts = {};
+    try {
+      (records || []).forEach(this.append, this);
+    } finally {
+      this._paneFilter = null;
+      this.count = savedCount;
+      this._runStarts = savedRunStarts;
+    }
+    this._updateHeader();
   };
 
   LiveTail.prototype.setLog = function (name) {
@@ -589,6 +779,19 @@
 
   LiveTail.prototype.append = function (r) {
     if (!r) return;
+
+    // 目标：LiveBody ≈ session 对端 shell 的镜像 + 少量控制流标记。
+    //
+    // 脚本内 sess.run 与手动 CommandBar 都走同一套显示规则；两者靠 __rid
+    // 是否存在区分脉络（有 = 脚本；无 = 手动），视觉打标在 _nodeForRecord。
+
+    // sink 层的 script.begin/end 与 workspace 元行重复，不占屏
+    if (r.event === "script.begin" || r.event === "script.end") return;
+
+    // 成功的命令收尾（exit=0）静默——新命令直接接在上一条输出后，像 shell 一样。
+    // level=WARNING/ERROR 的（非 0 退出、超时）保留，自带 warn/err 颜色显眼。
+    if (r.event === "command_end" && r.level === "INFO") return;
+
     if (r.event === "workspace.run.begin") {
       if (r.run_id) this._runStarts[r.run_id] = r.started_at || r.timestamp;
       this._appendNode(this._separatorNode(
@@ -598,21 +801,13 @@
       this._updateHeader();
       return;
     }
+    // workspace.run.end 与 sidebar 的 run 状态徽章重复，不占屏；
+    // _runStarts 也用不着了，顺手清一下防止堆积
     if (r.event === "workspace.run.end") {
-      var started = this._runStarts[r.run_id];
-      var dur = (typeof started === "number" && typeof r.ended_at === "number")
-        ? " (" + (r.ended_at - started).toFixed(1) + "s)"
-        : "";
-      var st = r.status || "finished";
-      this._appendNode(this._separatorNode(
-        (r.run_id || "run") + " · " + st + dur,
-        "sep-end status-" + st
-      ), null);
-      this._updateHeader();
+      if (r.run_id) delete this._runStarts[r.run_id];
       return;
     }
-    // sink 自己的 script.begin/end 与 workspace 元行重复，不再单独占一行
-    if (r.event === "script.begin" || r.event === "script.end") return;
+
     this.count += 1;
     this._appendNode(this._nodeForRecord(r), r.session_id);
     this._updateHeader();
@@ -624,9 +819,23 @@
     ]);
   };
 
-  LiveTail.prototype._nodeForRecord = Timeline.prototype._nodeForRecord;
+  // LiveBody 专用的简化版节点：隐藏时间戳、事件标签等装饰符，节省空间。
+  // 手动 CommandBar 通道（__rid 缺失）打 ev-manual 视觉标，与脚本流区分。
+  LiveTail.prototype._nodeForRecord = function (r) {
+    var cls = "tl-row " + severityClass(r.level);
+    if (!r.__rid) cls += " ev-manual";
+    var line = el("li", { className: cls }, []);
+    var msg = el("span", { className: "tl-msg" }, [r.message || ""]);
+    line.appendChild(msg);
+    return line;
+  };
 
   LiveTail.prototype._appendNode = function (node, sessionId) {
+    // 重放历史 buffer 时只补新增的列（见 setPanes），老列不能再收一遍
+    if (this._paneFilter) {
+      var target = this.paneSet.paneFor(sessionId);
+      if (!target || !this._paneFilter[target.id]) return;
+    }
     // sessionId 为空（run 分隔条、脚本自身日志）→ 落 Script 兜底列
     this.paneSet.append(sessionId, node);
     this.paneSet.autoScroll();
@@ -644,6 +853,356 @@
     s.textContent = this.count
       ? this.count + " record" + (this.count === 1 ? "" : "s")
       : "waiting for activity…";
+  };
+
+  // ---------- CommandBar （Web UI 手动命令执行） ----------
+
+  var CMD_SESSION_KEY = "rpm.cmd.session";
+  var CMD_HISTORY_KEY = "rpm.cmd.history";
+  var MAX_LOCAL_HISTORY = 50;
+
+  // 初始化 CommandBar
+  LiveTail.prototype._initCommandBar = function () {
+    var self = this;
+    var cmdInput = document.getElementById("cmd-input");
+    var cmdSendBtn = document.getElementById("cmd-send-btn");
+    var cmdHistoryBtn = document.getElementById("cmd-history-btn");
+    var cmdSessionSelect = document.getElementById("cmd-session-select");
+
+    if (!cmdInput || !cmdSendBtn || !cmdSessionSelect) return;
+
+    // 命令历史状态
+    this._cmdHistory = this._loadHistoryFromStorage();
+    this._historyIndex = -1;
+    this._historyFilter = "";
+    this._runningCommands = {};
+
+    // 恢复上次选择的 session
+    var lastSession = null;
+    try { lastSession = localStorage.getItem(CMD_SESSION_KEY); } catch (e) {}
+    if (lastSession) {
+      this._pendingSessionSelect = lastSession;
+    }
+
+    // 键盘事件
+    cmdInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        self._executeCommand();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        self._navigateHistory(-1);
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        self._navigateHistory(1);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        self._clearInput();
+      } else if (e.key === "l" && e.ctrlKey) {
+        e.preventDefault();
+        self._requestHistoryClear();
+      } else {
+        // 用户在编辑时重置历史浏览状态
+        if (self._historyIndex >= 0) {
+          self._historyIndex = -1;
+          self._historyFilter = "";
+        }
+      }
+    });
+
+    // 按钮事件
+    if (cmdSendBtn) {
+      cmdSendBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        self._executeCommand();
+      });
+    }
+
+    if (cmdHistoryBtn) {
+      cmdHistoryBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        self._toggleHistoryDropdown();
+      });
+    }
+
+    // Session 选择变化
+    cmdSessionSelect.addEventListener("change", function () {
+      try { localStorage.setItem(CMD_SESSION_KEY, this.value); } catch (e) {}
+      self._updateHistoryForSession(this.value);
+    });
+  };
+
+  // 更新 Session 选择器
+  LiveTail.prototype.updateSessionSelect = function (sessions) {
+    var select = document.getElementById("cmd-session-select");
+    if (!select) return;
+
+    var currentValue = select.value;
+    select.innerHTML = "";
+
+    var firstOption = true;
+    Object.keys(sessions).forEach(function (sid) {
+      var opt = el("option", { value: sid }, [sid]);
+      select.appendChild(opt);
+      if (firstOption && !currentValue) {
+        currentValue = sid;
+        firstOption = false;
+      }
+    });
+
+    if (currentValue && sessions[currentValue]) {
+      select.value = currentValue;
+    } else if (select.options.length > 0) {
+      select.value = select.options[0].value;
+      try { localStorage.setItem(CMD_SESSION_KEY, select.value); } catch (e) {}
+    }
+
+    this._updateHistoryForSession(select.value);
+  };
+
+  // 执行命令
+  LiveTail.prototype._executeCommand = function () {
+    var cmdInput = document.getElementById("cmd-input");
+    var cmdSessionSelect = document.getElementById("cmd-session-select");
+    var cmdShellMode = document.getElementById("cmd-shell-mode");
+    var cmdBar = this._nodes.commandBar;
+
+    if (!cmdInput || !cmdSessionSelect) return;
+
+    var command = cmdInput.value.trim();
+    var sessionId = cmdSessionSelect.value;
+
+    if (!command) return;
+    if (!sessionId) {
+      this._showHint("Please select a session first", "warn");
+      return;
+    }
+
+    // 禁用输入
+    cmdInput.disabled = true;
+    if (cmdBar) cmdBar.classList.add("running");
+
+    fetch("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        command: command,
+        shell: cmdShellMode ? cmdShellMode.checked : true,
+        timeout: 30
+      })
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.command_id) {
+        // 标记为运行中
+        if (!window.__cmdRunning) window.__cmdRunning = {};
+        window.__cmdRunning[data.command_id] = {
+          command: command,
+          sessionId: sessionId,
+          startTime: Date.now() / 1000
+        };
+      }
+    })
+    .catch(function (err) {
+      console.error("Command execution failed:", err);
+    })
+    .finally(function () {
+      // 清空输入
+      cmdInput.value = "";
+      cmdInput.disabled = false;
+      if (cmdBar) cmdBar.classList.remove("running");
+      cmdInput.focus();
+    });
+  };
+
+  // 浏览历史
+  LiveTail.prototype._navigateHistory = function (direction) {
+    var cmdInput = document.getElementById("cmd-input");
+    var cmdSessionSelect = document.getElementById("cmd-session-select");
+    if (!cmdInput || !cmdSessionSelect) return;
+
+    var sessionId = cmdSessionSelect.value;
+    if (!sessionId) return;
+
+    var history = this._cmdHistory[sessionId] || [];
+    if (history.length === 0) return;
+
+    // 第一次浏览时保存当前输入
+    if (this._historyIndex < 0) {
+      this._historyFilter = cmdInput.value;
+    }
+
+    var newIndex = this._historyIndex + direction;
+    if (newIndex < 0) newIndex = 0;
+    if (newIndex >= history.length) {
+      // 回到用户正在编辑的内容
+      this._historyIndex = -1;
+      cmdInput.value = this._historyFilter;
+      return;
+    }
+
+    this._historyIndex = newIndex;
+    cmdInput.value = history[history.length - 1 - newIndex].command;
+  };
+
+  // 清空输入
+  LiveTail.prototype._clearInput = function () {
+    var cmdInput = document.getElementById("cmd-input");
+    if (cmdInput) {
+      cmdInput.value = "";
+      this._historyIndex = -1;
+      this._historyFilter = "";
+    }
+  };
+
+  // 显示提示
+  LiveTail.prototype._showHint = function (message, type) {
+    var hint = document.getElementById("cmd-hint");
+    if (!hint) return;
+    hint.textContent = message;
+    hint.className = "hint" + (type === "warn" ? " lvl-warn" : "");
+    setTimeout(function () {
+      if (hint.textContent === message) hint.textContent = "";
+    }, 3000);
+  };
+
+  // 请求清空历史
+  LiveTail.prototype._requestHistoryClear = function () {
+    var cmdSessionSelect = document.getElementById("cmd-session-select");
+    var sessionId = cmdSessionSelect ? cmdSessionSelect.value : null;
+
+    if (confirm("Clear command history" + (sessionId ? " for " + sessionId : "") + "?")) {
+      fetch("/api/commands/history" + (sessionId ? "?session_id=" + encodeURIComponent(sessionId) : ""), {
+        method: "DELETE"
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.ok) {
+          // 清空本地缓存
+          if (sessionId) {
+            delete this._cmdHistory[sessionId];
+          } else {
+            this._cmdHistory = {};
+          }
+          this._saveHistoryToStorage();
+        }
+      }.bind(this))
+      .catch(function (err) {
+        console.error("Failed to clear history:", err);
+      });
+    }
+  };
+
+  // 切换历史下拉菜单
+  LiveTail.prototype._toggleHistoryDropdown = function () {
+    var existing = document.querySelector(".history-dropdown");
+    if (existing) {
+      existing.remove();
+      return;
+    }
+
+    var cmdSessionSelect = document.getElementById("cmd-session-select");
+    var sessionId = cmdSessionSelect ? cmdSessionSelect.value : null;
+    if (!sessionId) return;
+
+    var history = this._cmdHistory[sessionId] || [];
+    if (history.length === 0) {
+      this._showHint("No history for this session");
+      return;
+    }
+
+    var cmdHistoryBtn = document.getElementById("cmd-history-btn");
+    if (!cmdHistoryBtn) return;
+
+    var dropdown = el("div", { className: "history-dropdown" }, []);
+    history.slice().reverse().forEach(function (item) {
+      var div = el("div", { className: "history-item" }, [
+        el("span", { className: "cmd-ts" }, [new Date(item.timestamp * 1000).toLocaleTimeString()]),
+        el("span", { className: "cmd-text" }, [item.command])
+      ]);
+      div.addEventListener("click", function () {
+        var cmdInput = document.getElementById("cmd-input");
+        if (cmdInput) cmdInput.value = item.command;
+        dropdown.remove();
+      });
+      dropdown.appendChild(div);
+    });
+
+    var rect = cmdHistoryBtn.getBoundingClientRect();
+    dropdown.style.position = "fixed";
+    dropdown.style.bottom = (window.innerHeight - rect.top + 4) + "px";
+    dropdown.style.right = (window.innerWidth - rect.right) + "px";
+
+    document.body.appendChild(dropdown);
+
+    setTimeout(function () {
+      var closeDropdown = function (e) {
+        if (!dropdown.contains(e.target) && e.target !== cmdHistoryBtn) {
+          dropdown.remove();
+          document.removeEventListener("click", closeDropdown);
+        }
+      };
+      setTimeout(function () {
+        document.addEventListener("click", closeDropdown);
+      }, 0);
+    }, 0);
+  };
+
+  // 从 localStorage 加载历史
+  LiveTail.prototype._loadHistoryFromStorage = function () {
+    try {
+      var raw = localStorage.getItem(CMD_HISTORY_KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      return typeof parsed === "object" ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  };
+
+  // 保存历史到 localStorage
+  LiveTail.prototype._saveHistoryToStorage = function () {
+    try {
+      localStorage.setItem(CMD_HISTORY_KEY, JSON.stringify(this._cmdHistory));
+    } catch (e) {}
+  };
+
+  // 更新当前 session 的历史
+  LiveTail.prototype._updateHistoryForSession = function (sessionId) {
+    if (!sessionId) return;
+    if (!this._cmdHistory[sessionId]) {
+      this._cmdHistory[sessionId] = [];
+    }
+  };
+
+  // 从服务器加载历史
+  LiveTail.prototype._loadHistoryFromServer = function (sessionId) {
+    var self = this;
+    fetch("/api/commands/history?limit=100")
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var history = {};
+        (data || []).forEach(function (item) {
+          var sid = item.session_id;
+          if (!history[sid]) history[sid] = [];
+          history[sid].push({
+            command: item.command,
+            timestamp: item.timestamp,
+            exit_code: item.exit_code,
+            duration: item.duration
+          });
+        });
+        // 合并到现有历史
+        for (var sid in history) {
+          if (!self._cmdHistory[sid]) self._cmdHistory[sid] = [];
+          self._cmdHistory[sid] = history[sid];
+        }
+        self._saveHistoryToStorage();
+      })
+      .catch(function (err) {
+        console.error("Failed to load history:", err);
+      });
   };
 
   // ---------- public factory ----------

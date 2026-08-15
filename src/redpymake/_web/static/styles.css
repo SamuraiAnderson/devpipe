@@ -363,20 +363,31 @@ body:not(.app-shell) #timeline-root {
   flex: 1;
   min-height: 0;
 }
+/* 宽度全权交给 Split.js（写 flex-basis），这里只定布局模型与下限。
+   注意不要改回 grid —— grid-auto-columns 会覆盖 Split.js 的尺寸。 */
 .pane-set.split {
-  display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(260px, 1fr);
-  overflow-x: auto;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
 }
 .pane {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  min-width: 0;
-  border-left: 1px solid var(--border);
+  min-width: 120px;
+  overflow: hidden;
 }
-.pane:first-child { border-left: 0; }
+
+/* Split.js 注入的分隔条 */
+.pane-set.split > .gutter {
+  background: var(--border);
+  cursor: col-resize;
+  flex: 0 0 auto;
+  transition: background 0.15s;
+}
+.pane-set.split > .gutter:hover {
+  background: var(--accent);
+}
 .pane-header {
   flex-shrink: 0;
   padding: 4px 10px;
@@ -466,6 +477,14 @@ body:not(.app-shell) #timeline-root {
 .run-separator.status-cancelled,
 .run-separator.status-interrupted { color: var(--warn); }
 
+/* 手动 CommandBar 通道的行 —— 与脚本流交织，靠左侧竖线 + 淡色背景区分谁敲的。
+   record 从 pushLive(rec, null) 进来时 __rid 缺失，_nodeForRecord 会打上 ev-manual。 */
+.tl-row.ev-manual {
+  background: rgba(127, 219, 255, 0.06);
+  border-left: 2px solid var(--accent);
+  padding-left: 8px;
+}
+
 /* -------------------- 状态徽章 -------------------- */
 .badge {
   display: inline-block;
@@ -491,6 +510,155 @@ body:not(.app-shell) #timeline-root {
 .status-interrupted { color: var(--warn); }
 .warn { color: var(--warn); }
 .hint { color: var(--muted); }
+
+/* -------------------- Command Bar -------------------- */
+.command-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  flex-shrink: 0;
+}
+
+.command-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.command-option {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.command-option input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
+.command-bar-center {
+  flex: 1;
+  min-width: 0;
+}
+
+.command-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.command-session-select {
+  background: var(--panel-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  max-width: 180px;
+  min-width: 120px;
+  cursor: pointer;
+}
+
+.command-session-select:hover {
+  border-color: var(--accent);
+}
+
+.command-session-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.command-input {
+  width: 100%;
+  background: var(--panel-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.command-input:focus {
+  border-color: var(--accent);
+}
+
+.command-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.command-input::placeholder {
+  color: var(--muted);
+}
+
+/* 命令运行状态 */
+.command-bar.running .command-input {
+  border-color: var(--warn);
+}
+
+.command-bar.running .tb-btn {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+/* 历史下拉菜单 */
+.history-dropdown {
+  position: fixed;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  min-width: 320px;
+  max-height: 300px;
+  overflow-y: auto;
+  z-index: 100;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.history-item {
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.history-item:last-child {
+  border-bottom: 0;
+}
+
+.history-item:hover {
+  background: var(--panel-alt);
+}
+
+.history-item .cmd-ts {
+  color: var(--muted);
+  font-size: 10px;
+  min-width: 60px;
+}
+
+.history-item .cmd-text {
+  color: var(--fg);
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* -------------------- 报告页专属 -------------------- */
 #raw-log { padding: 0 20px 20px; }

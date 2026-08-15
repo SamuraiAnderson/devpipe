@@ -22,12 +22,15 @@ def render_report(ndjson_path: Path, output_path: Path) -> None:
     meta = _extract_meta(records)
     css = _read_static("styles.css")
     js = _read_static("timeline.js")
+    # 分栏拖动依赖 Split.js；内联进来报告才能在 file:// 下照样拖
+    split_js = _read_static("vendor/split.min.js")
     data_json = json.dumps({"meta": meta, "records": records}, ensure_ascii=False)
     raw_body = "\n".join(_format_line(r) for r in records)
     title = html.escape(meta.get("name") or ndjson_path.stem)
     html_doc = _HTML_TEMPLATE.format(
         title=title,
         css=css,
+        split_js=split_js,
         js=js,
         data_json=data_json,
         raw_body=html.escape(raw_body),
@@ -97,6 +100,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   </section>
 </main>
 <script type="application/json" id="run-data">{data_json}</script>
+<script>{split_js}</script>
 <script>{js}</script>
 </body>
 </html>

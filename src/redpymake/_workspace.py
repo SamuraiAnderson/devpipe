@@ -307,6 +307,9 @@ class Workspace:
         self._subscribers: list[Callable[[dict], None]] = []
         self._subscribers_lock = threading.Lock()
 
+        # 命令执行器（懒加载，用于 Web UI 手动命令执行）
+        self._command_executor: Any | None = None
+
     # ------------------------------------------------------ 生命周期
 
     @property
@@ -389,6 +392,18 @@ class Workspace:
     def sessions(self) -> Mapping[str, "Session"]:
         with self._pool_lock:
             return dict(self._pool)
+
+    def get_session_by_id(self, session_id: str) -> "Session | None":
+        """根据 session_id 从会话池获取 session。
+
+        用于 Web UI 命令执行等需要精确匹配 session 的场景。
+        返回 None 如果 session 不存在或已关闭。
+        """
+        with self._pool_lock:
+            for sess in self._pool.values():
+                if sess.session_id == session_id and not sess.closed:
+                    return sess
+        return None
 
     def _get_or_create(
         self, key: str, factory: Callable[[], "Session"]
@@ -547,6 +562,22 @@ class Workspace:
         if log is None:
             raise RuntimeError("workspace active log missing from registry")
         return log
+
+    @property
+    def active_log(self) -> WorkspaceLog | None:
+        """当前活跃日志，如果不存在则返回 None（非异常版本）。"""
+        with self._logs_lock:
+            if self._active_log_id is None:
+                return None
+            return self._logs.get(self._active_log_id)
+
+    @property
+    def command_executor(self) -> Any:
+        """命令执行器，用于 Web UI 手动命令执行（懒加载）。"""
+        if self._command_executor is None:
+            from ._web.commands import CommandExecutor
+            self._command_executor = CommandExecutor(self)
+        return self._command_executor
 
     def list_logs(self) -> list[WorkspaceLog]:
         """按 ``created_at`` 逆序（新→旧）返回全部日志组。"""

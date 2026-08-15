@@ -236,6 +236,74 @@ def build_app(ws: "Workspace") -> FastAPI:
             raise HTTPException(409, str(exc))
         return {"ok": True}
 
+    # -------------------------------------------------- 手动命令执行 (Web UI 终端)
+
+    @app.post("/api/commands")
+    async def api_execute_command(payload: dict) -> Any:
+        """执行手动命令，返回 command_id 用于跟踪。
+
+        请求体：{"session_id": "...", "command": "...", "shell": false, "cwd": null, "timeout": 30}
+        返回：{"command_id": "...", "session_id": "...", "status": "running", "started_at": ...}
+
+        输出通过 WebSocket 的 cmd.output/cmd.finished/cmd.error 事件流式推送。
+        """
+        session_id = payload.get("session_id")
+        command = payload.get("command")
+        if not session_id or not command:
+            raise HTTPException(400, "missing 'session_id' or 'command' in body")
+
+        shell = payload.get("shell", False)
+        cwd = payload.get("cwd")
+        timeout = payload.get("timeout", 30.0)
+
+        try:
+            cmd_id = ws.command_executor.execute(
+                session_id=session_id,
+                command=command,
+                shell=bool(shell),
+                cwd=cwd,
+                timeout=float(timeout),
+            )
+            return {
+                "command_id": cmd_id,
+                "session_id": session_id,
+                "status": "running",
+                "started_at": __import__("time").time(),
+            }
+        except Exception as exc:
+            _diag_logger.exception("api_execute_command failed")
+            raise HTTPException(500, f"command execution failed: {exc}")
+
+    @app.get("/api/commands/history")
+    async def api_get_command_history(
+        session_id: str | None = None, limit: int = 100
+    ) -> Any:
+        """获取命令历史。
+
+        参数：
+        - session_id: 可选，过滤特定 session
+        - limit: 最大返回条数
+        """
+        try:
+            return ws.command_executor.get_history(session_id=session_id, limit=limit)
+        except Exception as exc:
+            _diag_logger.exception("api_get_command_history failed")
+            raise HTTPException(500, f"failed to get history: {exc}")
+
+    @app.delete("/api/commands/history")
+    async def api_clear_command_history(session_id: str | None = None) -> Any:
+        """清空命令历史。
+
+        参数：
+        - session_id: 可选，清空特定 session；为空则清空全部
+        """
+        try:
+            ok = ws.command_executor.clear_history(session_id=session_id)
+            return {"ok": ok}
+        except Exception as exc:
+            _diag_logger.exception("api_clear_command_history failed")
+            raise HTTPException(500, f"failed to clear history: {exc}")
+
     @app.websocket("/ws")
     async def ws_endpoint(sock: WebSocket) -> None:
         await sock.accept()
@@ -323,6 +391,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
     <div id="timeline-root" class="panel-view" hidden></div>
   </main>
 </div>
+<script src="/static/vendor/split.min.js"></script>
 <script src="/static/timeline.js"></script>
 <script>
 (function () {
@@ -330,45 +399,298 @@ _INDEX_HTML = r"""<!DOCTYPE html>
   // 切回 Live 依然能看到完整尾部。只有换日志组时才重置。
   var LIVE_BUFFER_MAX = 8000;
 
-  var state = {
+  var SPLIT_STORAGE_KEY = "rpm.split";
+
+  // ================================================== store（事务化）
+  //
+  // 用户动作 / 服务端事件 → dispatch(action) → reducer 纯函数算出新 state
+  // → 订阅者把 state 投影到 DOM。
+  //
+  // 硬规矩：reducer 里不许 fetch、不许碰 localStorage、不许碰 DOM。副作用一律
+  // 留在 dispatch 的调用方或订阅者里。这样 action 序列就是一份可回放的操作史，
+  // 也是将来把 UI 操作并进 timeline replay 的接口。
+  //
+  // 组件实例与高频 buffer 不进 store（见 refs）——它们只在当前渲染帧有意义，
+  // 塞进来只会让每条日志都触发一次全量状态复制。
+
+  function assign(base, patch) {
+    var out = {}, k;
+    for (k in base) if (Object.prototype.hasOwnProperty.call(base, k)) out[k] = base[k];
+    for (k in patch) if (Object.prototype.hasOwnProperty.call(patch, k)) out[k] = patch[k];
+    return out;
+  }
+
+  function createStore(reducer, initial) {
+    var current = initial;
+    var subs = [];
+    return {
+      getState: function () { return current; },
+      dispatch: function (action) {
+        var next = reducer(current, action);
+        if (next === current) return current;   // 无变化的 action 不惊动订阅者
+        var prev = current;
+        current = next;
+        if (window.__rpmTraceActions) console.debug("[act]", action.type, action);
+        for (var i = 0; i < subs.length; i++) subs[i](current, prev, action);
+        return current;
+      },
+      subscribe: function (fn) {
+        subs.push(fn);
+        return function () {
+          var i = subs.indexOf(fn);
+          if (i >= 0) subs.splice(i, 1);
+        };
+      },
+    };
+  }
+
+  var initialState = {
     view: "live",            // "live" | "run"
     viewedRunId: null,       // view === "run" 时主区在看哪个 run
     currentRunId: null,      // 服务端当前正在跑的 run（只影响 sidebar，不抢主区）
-    liveTail: null,          // LiveTail 实例，常驻不销毁
-    timeline: null,          // Run detail 的 Timeline 实例
-    liveBuffer: [],
-    liveBufferLogId: null,   // liveBuffer 属于哪个 log
-    runsById: {},
+    scripts: [],
     scriptsByPath: {},
+    runs: [],                // 当前浏览范围内的 run 列表（服务端顺序）
+    runsById: {},
     logs: [],
     currentLogId: null,
     viewedLogId: null,       // sidebar Runs 展示范围；默认 = currentLogId
     stopping: {},            // rid -> true：已按下 stop，等 run.finished 复位
-    // 分栏：勾选的 session 各占一列，Live 与 Run detail 共用同一套列定义
-    split: { enabled: false, sessionIds: [] },
-    sessionsSeen: {},        // session_id -> label；池里的 + 数据里出现过的
-    poolSessions: {},        // session_id -> true：当前还在池里（未关闭）
-    _paneTimer: null,
+    // 会话唯一事实来源：池里的 + 主区数据里出现过的历史会话都记在这
+    // sid -> { label, live }；live=false 表示不在池里（历史 run 的会话）
+    sessions: {},
+    // 分栏：order 是列顺序的唯一权威，widths 存 Split.js 拖出来的百分比
+    split: { enabled: false, order: [], widths: {} },
   };
 
-  var SPLIT_STORAGE_KEY = "rpm.split";
+  // 非事务态：组件实例与高频 buffer，不参与 reducer
+  var refs = {
+    liveTail: null,          // LiveTail 实例，常驻不销毁
+    timeline: null,          // Run detail 的 Timeline 实例
+    liveBuffer: [],
+    liveBufferLogId: null,   // liveBuffer 属于哪个 log
+    paneTimer: null,
+    persistTimer: null,
+  };
+
+  // 只有 kind:label#N 形态的才是真会话；script:* 是脚本自身 user_log 的合成 id
+  function isValidSessionId(sid) {
+    return typeof sid === "string" && !isScriptSession(sid)
+      && /^[^:]+:[^#]+#\d+$/.test(sid);
+  }
+
+  // 轮询回来的数据大多没变；这几个浅比较让空转的 poll 不触发任何重绘
+  function sameSessions(a, b) {
+    var ka = Object.keys(a), kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (var i = 0; i < ka.length; i++) {
+      var k = ka[i];
+      if (!b[k] || b[k].label !== a[k].label || b[k].live !== a[k].live) return false;
+    }
+    return true;
+  }
+
+  function sameList(a, b, fields) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      for (var j = 0; j < fields.length; j++) {
+        if (a[i][fields[j]] !== b[i][fields[j]]) return false;
+      }
+    }
+    return true;
+  }
+
+  function reducer(state, action) {
+    switch (action.type) {
+
+      case "SPLIT_PREF_LOADED":
+        return assign(state, {
+          split: { enabled: action.enabled, order: action.order, widths: action.widths },
+        });
+
+      case "SPLIT_TOGGLE": {
+        var enabled = !state.split.enabled;
+        var order = state.split.order;
+        // 首次开启：把见过的会话全部铺开；sessions 的键天然唯一，无需去重
+        if (enabled && !order.length) order = Object.keys(state.sessions);
+        return assign(state, {
+          split: assign(state.split, { enabled: enabled, order: order }),
+        });
+      }
+
+      case "PANE_TOGGLE": {
+        var at = state.split.order.indexOf(action.sid);
+        var nextOrder;
+        if (at >= 0) {
+          nextOrder = state.split.order.slice();
+          nextOrder.splice(at, 1);
+        } else {
+          if (!isValidSessionId(action.sid)) return state;
+          nextOrder = state.split.order.concat([action.sid]);
+        }
+        return assign(state, { split: assign(state.split, { order: nextOrder }) });
+      }
+
+      case "PANE_RESIZED":
+        return assign(state, { split: assign(state.split, { widths: action.widths }) });
+
+      case "SESSION_APPEARED": {
+        if (!isValidSessionId(action.sid)) return state;
+        var prev = state.sessions[action.sid];
+        var label = action.label || (prev && prev.label) || action.sid;
+        var live = action.live === undefined ? (prev ? prev.live : false) : !!action.live;
+        if (prev && prev.label === label && prev.live === live) return state;
+        var sessions = assign(state.sessions, {});
+        sessions[action.sid] = { label: label, live: live };
+        var split = state.split;
+        // 分栏开着时新冒出来的会话直接给一列，免得它悄悄落进 Script 兜底列
+        if (!prev && split.enabled && split.order.indexOf(action.sid) < 0) {
+          split = assign(split, { order: split.order.concat([action.sid]) });
+        }
+        return assign(state, { sessions: sessions, split: split });
+      }
+
+      case "SESSIONS_SYNCED": {
+        // 池外（历史 run）的会话保留，只把 live 标记降下来
+        var synced = {};
+        Object.keys(state.sessions).forEach(function (sid) {
+          synced[sid] = assign(state.sessions[sid], { live: false });
+        });
+        var split2 = state.split;
+        (action.list || []).forEach(function (s) {
+          if (!isValidSessionId(s.session_id)) return;
+          var known = !!state.sessions[s.session_id];
+          synced[s.session_id] = { label: s.kind + " / " + s.label, live: !s.closed };
+          if (!known && split2.enabled && split2.order.indexOf(s.session_id) < 0) {
+            split2 = assign(split2, { order: split2.order.concat([s.session_id]) });
+          }
+        });
+        if (split2 === state.split && sameSessions(synced, state.sessions)) return state;
+        return assign(state, { sessions: synced, split: split2 });
+      }
+
+      case "SCRIPTS_LOADED": {
+        var scripts = action.scripts || [];
+        if (sameList(scripts, state.scripts, ["path", "error", "script_name"])) return state;
+        var byPath = {};
+        scripts.forEach(function (c) { byPath[c.path] = c; });
+        return assign(state, { scripts: scripts, scriptsByPath: byPath });
+      }
+
+      case "RUNS_LOADED": {
+        var runs = action.runs || [];
+        if (sameList(runs, state.runs, ["id", "status", "ended_at"])) return state;
+        var byId = assign(state.runsById, {});
+        var running = null;
+        runs.forEach(function (r) {
+          byId[r.id] = r;
+          if (r.status === "running") running = r.id;
+        });
+        return assign(state, { runs: runs, runsById: byId, currentRunId: running });
+      }
+
+      case "RUN_DETAIL_LOADED": {
+        var withRun = assign(state.runsById, {});
+        withRun[action.run.id] = action.run;
+        return assign(state, { runsById: withRun });
+      }
+
+      case "RUN_STOP_REQUESTED": {
+        if (state.stopping[action.rid]) return state;
+        var marked = assign(state.stopping, {});
+        marked[action.rid] = true;
+        return assign(state, { stopping: marked });
+      }
+
+      // 乐观置灰的回滚点：请求被拒 / run 真的结束了，都在这里复位
+      case "RUN_STOP_FAILED":
+      case "RUN_FINISHED": {
+        if (!state.stopping[action.rid]) return state;
+        var cleared = assign(state.stopping, {});
+        delete cleared[action.rid];
+        return assign(state, { stopping: cleared });
+      }
+
+      case "VIEW_CHANGED": {
+        var vr = action.viewedRunId || null;
+        if (state.view === action.view && state.viewedRunId === vr) return state;
+        return assign(state, { view: action.view, viewedRunId: vr });
+      }
+
+      case "LOGS_LOADED": {
+        var logs = action.logs || [];
+        var same = sameList(logs, state.logs,
+          ["id", "name", "is_active", "pinned", "run_count"]);
+        var active = logs.filter(function (l) { return l.is_active; })[0] || null;
+        if (!active) return same ? state : assign(state, { logs: logs });
+        var switched = state.currentLogId && state.currentLogId !== active.id;
+        var viewed = (!state.viewedLogId || switched) ? active.id : state.viewedLogId;
+        if (same && state.currentLogId === active.id && state.viewedLogId === viewed) return state;
+        return assign(state, { logs: logs, currentLogId: active.id, viewedLogId: viewed });
+      }
+
+      case "LOG_SELECTED":
+        if (state.viewedLogId === action.logId) return state;
+        return assign(state, { viewedLogId: action.logId });
+
+      case "LOG_ROTATED":
+        return assign(state, { currentLogId: action.logId, viewedLogId: action.logId });
+
+      case "LOG_DISCARDED":
+        if (state.viewedLogId !== action.logId) return state;
+        return assign(state, { viewedLogId: state.currentLogId });
+
+      default:
+        return state;
+    }
+  }
+
+  var store = createStore(reducer, initialState);
+  var dispatch = store.dispatch;
+
+  // 读侧别名：所有 state.xxx 读取保持原样，只有写入换成 dispatch。
+  // 必须是第一个订阅者，后面的渲染订阅者才能读到最新值。
+  var state = initialState;
+  store.subscribe(function (next) { state = next; });
 
   function loadSplitPref() {
+    var saved;
     try {
       var raw = window.localStorage.getItem(SPLIT_STORAGE_KEY);
       if (!raw) return;
-      var saved = JSON.parse(raw);
-      if (saved && typeof saved === "object") {
-        state.split.enabled = !!saved.enabled;
-        state.split.sessionIds = saved.sessionIds || [];
-      }
-    } catch (e) { /* localStorage 不可用（隐私模式等）→ 用默认值 */ }
+      saved = JSON.parse(raw);
+    } catch (e) { return; /* localStorage 不可用（隐私模式等）→ 用默认值 */ }
+    if (!saved || typeof saved !== "object") return;
+    // sessionIds 是旧 schema，读到就迁到 order 并回写一次
+    var legacy = !saved.order && saved.sessionIds;
+    var ids = saved.order || saved.sessionIds || [];
+    var order = [];
+    for (var i = 0; i < ids.length; i++) {
+      if (isValidSessionId(ids[i]) && order.indexOf(ids[i]) < 0) order.push(ids[i]);
+    }
+    dispatch({
+      type: "SPLIT_PREF_LOADED",
+      enabled: !!saved.enabled,
+      order: order,
+      widths: (saved.widths && typeof saved.widths === "object") ? saved.widths : {},
+    });
+    if (legacy || order.length !== ids.length) persistSplit(true);
   }
 
-  function saveSplitPref() {
-    try {
-      window.localStorage.setItem(SPLIT_STORAGE_KEY, JSON.stringify(state.split));
-    } catch (e) { /* ignore */ }
+  // 订阅者副作用：state.split 一变就落盘，攒一拍避免拖动时高频写
+  function persistSplit(immediate) {
+    if (refs.persistTimer) {
+      clearTimeout(refs.persistTimer);
+      refs.persistTimer = null;
+    }
+    var write = function () {
+      refs.persistTimer = null;
+      try {
+        window.localStorage.setItem(SPLIT_STORAGE_KEY, JSON.stringify(state.split));
+      } catch (e) { /* ignore */ }
+    };
+    if (immediate) write();
+    else refs.persistTimer = setTimeout(write, 250);
   }
 
   function el(tag, attrs, children) {
@@ -411,77 +733,74 @@ _INDEX_HTML = r"""<!DOCTYPE html>
     return typeof sid === "string" && sid.indexOf("script:") === 0;
   }
 
-  // 记下见过的 session：池里的、以及主区数据里出现过的（历史 run 的会话不在池里）
+  // 记下见过的 session：池里的、以及主区数据里出现过的（历史 run 的会话不在池里）。
+  // 每条日志都会走这里，reducer 认得出重复就原样返回，dispatch 会短路掉。
   function noteSession(sid, label) {
-    if (!sid || isScriptSession(sid)) return false;
-    var known = Object.prototype.hasOwnProperty.call(state.sessionsSeen, sid);
-    state.sessionsSeen[sid] = label || state.sessionsSeen[sid] || sid;
-    if (known) return false;
-    // 分栏开着时新冒出来的会话直接给一列，免得它悄悄落进 Script 兜底列
-    if (state.split.enabled && state.split.sessionIds.indexOf(sid) < 0) {
-      state.split.sessionIds.push(sid);
-      saveSplitPref();
-      schedulePanes();
-    }
-    return true;
+    dispatch({ type: "SESSION_APPEARED", sid: sid, label: label });
   }
 
+  // order 是唯一权威；只需过滤掉还没见过的 sid，不需要任何去重补丁
   function paneDefs() {
     if (!state.split.enabled) return [];
-    var defs = [];
-    state.split.sessionIds.forEach(function (sid) {
-      if (isScriptSession(sid)) return;
-      defs.push({ id: sid, label: state.sessionsSeen[sid] || sid });
-    });
-    return defs;   // 空数组 → PaneSet 退回单列
+    return state.split.order
+      .filter(function (sid) { return !!state.sessions[sid]; })
+      .map(function (sid) { return { id: sid, label: state.sessions[sid].label }; });
   }
 
   function applyPanes() {
     var defs = paneDefs();
-    if (state.liveTail) state.liveTail.setPanes(defs, state.liveBuffer);
-    if (state.timeline) state.timeline.setPanes(defs);
+    // setPanes 内部按 id diff，列没变时是廉价空转，可以放心多调
+    if (refs.liveTail) refs.liveTail.setPanes(defs, refs.liveBuffer);
+    if (refs.timeline) refs.timeline.setPanes(defs);
   }
 
-  // 一次 run 里会连续冒出好几个新 session，攒一拍再重建列
-  function schedulePanes() {
-    if (state._paneTimer) return;
-    state._paneTimer = setTimeout(function () {
-      state._paneTimer = null;
+  // 一次 run 里会连续冒出好几个新 session，攒一拍再重建列；
+  // 用户自己点的（toggle）要立刻响应，不能等这 150ms
+  function schedulePanes(immediate) {
+    if (immediate) {
+      if (refs.paneTimer) { clearTimeout(refs.paneTimer); refs.paneTimer = null; }
       applyPanes();
-      refreshSessions();
+      return;
+    }
+    if (refs.paneTimer) return;
+    refs.paneTimer = setTimeout(function () {
+      refs.paneTimer = null;
+      applyPanes();
     }, 150);
   }
 
+  // PaneSet（timeline.js）与宿主之间的宽度桥：Live 和 Run detail 两个 PaneSet
+  // 共用 state.split.widths，拖任意一个另一个下次重建时就跟上。
+  window.__rpmLoadWidths = function () {
+    return state.split.widths || {};
+  };
+  window.__rpmSaveWidths = function (widths) {
+    dispatch({ type: "PANE_RESIZED", widths: widths });
+  };
+
   function toggleSplit() {
-    state.split.enabled = !state.split.enabled;
-    if (state.split.enabled && !state.split.sessionIds.length) {
-      state.split.sessionIds = Object.keys(state.sessionsSeen);
-    }
-    saveSplitPref();
-    document.getElementById("split-toggle").classList.toggle("active", state.split.enabled);
-    applyPanes();
-    refreshSessions();
+    dispatch({ type: "SPLIT_TOGGLE" });
   }
 
   function toggleSessionPane(sid) {
-    var idx = state.split.sessionIds.indexOf(sid);
-    if (idx >= 0) state.split.sessionIds.splice(idx, 1);
-    else state.split.sessionIds.push(sid);
-    saveSplitPref();
-    applyPanes();
-    refreshSessions();
+    dispatch({ type: "PANE_TOGGLE", sid: sid });
+  }
+
+  function syncSplitButton() {
+    document.getElementById("split-toggle")
+      .classList.toggle("active", state.split.enabled);
   }
 
   // -------------------------------------------------- 主区：Live tail / Run detail
 
   function ensureLiveTail() {
-    if (!state.liveTail) {
-      state.liveTail = window.__RedPyMakeTimeline.mountLive(document.getElementById("live-root"));
+    if (!refs.liveTail) {
+      refs.liveTail = window.__RedPyMakeTimeline.mountLive(document.getElementById("live-root"));
       var log = activeLog();
-      if (log) state.liveTail.setLog(log.name);
-      if (state.split.enabled) state.liveTail.setPanes(paneDefs(), state.liveBuffer);
+      if (log) refs.liveTail.setLog(log.name);
+      if (state.split.enabled) refs.liveTail.setPanes(paneDefs(), refs.liveBuffer);
     }
-    return state.liveTail;
+    return refs.liveTail;
   }
 
   function pushLive(rec, rid) {
@@ -489,14 +808,14 @@ _INDEX_HTML = r"""<!DOCTYPE html>
     // 打标便于 Run detail 直接从 buffer 里切片，省一次服务端往返
     if (rid) rec.__rid = rid;
     noteSession(rec.session_id);
-    state.liveBuffer.push(rec);
-    if (state.liveBuffer.length > LIVE_BUFFER_MAX) state.liveBuffer.shift();
+    refs.liveBuffer.push(rec);
+    if (refs.liveBuffer.length > LIVE_BUFFER_MAX) refs.liveBuffer.shift();
     ensureLiveTail().append(rec);
   }
 
   function resetLiveBuffer(logId) {
-    state.liveBuffer = [];
-    state.liveBufferLogId = logId || null;
+    refs.liveBuffer = [];
+    refs.liveBufferLogId = logId || null;
     var tail = ensureLiveTail();
     tail.clear();
     var log = activeLog();
@@ -504,27 +823,24 @@ _INDEX_HTML = r"""<!DOCTYPE html>
   }
 
   function showLive() {
-    state.view = "live";
-    state.viewedRunId = null;
-    state.timeline = null;
+    refs.timeline = null;
     document.getElementById("timeline-root").hidden = true;
     document.getElementById("live-root").hidden = false;
     document.getElementById("main-toolbar").hidden = true;
+    dispatch({ type: "VIEW_CHANGED", view: "live", viewedRunId: null });
     ensureLiveTail().scrollToEnd();
     refreshRuns();
   }
 
   function showRunDetail(rid) {
-    state.view = "run";
-    state.viewedRunId = rid;
     document.getElementById("live-root").hidden = true;
     document.getElementById("timeline-root").hidden = false;
-    var toolbar = document.getElementById("main-toolbar");
-    toolbar.hidden = false;
+    document.getElementById("main-toolbar").hidden = false;
     document.getElementById("main-context").textContent = "Run detail · " + rid;
+    dispatch({ type: "VIEW_CHANGED", view: "run", viewedRunId: rid });
 
     var known = state.runsById[rid];
-    var buffered = state.liveBuffer.filter(function (r) { return r.__rid === rid; });
+    var buffered = refs.liveBuffer.filter(function (r) { return r.__rid === rid; });
     if (buffered.length && known) {
       mountRunTimeline(known, buffered);
       refreshRuns();
@@ -536,7 +852,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
       : "/api/runs/" + encodeURIComponent(rid) + "/records";
     fetch(url).then(function (r) { return r.json(); }).then(function (data) {
       if (!data || !data.run) return;
-      state.runsById[rid] = data.run;
+      dispatch({ type: "RUN_DETAIL_LOADED", run: data.run });
       mountRunTimeline(data.run, data.records || []);
       refreshRuns();
     });
@@ -545,7 +861,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
   function mountRunTimeline(run, records) {
     // 历史 run 的会话早已不在池里，只能从记录里认出来，否则没法勾选分栏
     (records || []).forEach(function (r) { noteSession(r.session_id); });
-    state.timeline = window.__RedPyMakeTimeline.mount(document.getElementById("timeline-root"), {
+    refs.timeline = window.__RedPyMakeTimeline.mount(document.getElementById("timeline-root"), {
       meta: {
         name: (run.script_name || run.id) + "  ·  " + run.id,
         started_at: run.started_at,
@@ -555,7 +871,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
       },
       records: records,
     });
-    state.timeline.setPanes(paneDefs());
+    refs.timeline.setPanes(paneDefs());
     refreshSessions();
   }
 
@@ -563,15 +879,19 @@ _INDEX_HTML = r"""<!DOCTYPE html>
 
   function refreshScripts() {
     fetch("/api/scripts").then(function (r) { return r.json(); }).then(function (data) {
+      dispatch({ type: "SCRIPTS_LOADED", scripts: data || [] });
+    });
+  }
+
+  function renderScriptList() {
       var list = document.getElementById("scripts-list");
       list.innerHTML = "";
-      state.scriptsByPath = {};
+      var data = state.scripts;
       if (!data.length) {
         list.appendChild(el("li", { className: "hint" }, ["(none)"]));
         return;
       }
       data.forEach(function (c) {
-        state.scriptsByPath[c.path] = c;
         var label = c.script_name || c.path.split(/[\\/]/).pop();
         // 没有 rpm.script(...) 块的脚本能跑，但不会有聚合日志——标个警示
         var warn = c.has_script_block ? "" : " \u26A0";
@@ -589,39 +909,43 @@ _INDEX_HTML = r"""<!DOCTYPE html>
         li.appendChild(btn);
         list.appendChild(li);
       });
-    });
   }
 
   function refreshSessions() {
     fetch("/api/sessions").then(function (r) { return r.json(); }).then(function (data) {
-      state.poolSessions = {};
-      (data || []).forEach(function (s) {
-        if (!s.closed) state.poolSessions[s.session_id] = true;
-        state.sessionsSeen[s.session_id] = s.kind + " / " + s.label;
-      });
-      renderSessions();
+      dispatch({ type: "SESSIONS_SYNCED", list: data || [] });
     });
+  }
+
+  // 命令栏只能挑池里还活着的会话
+  function syncSessionSelect() {
+    if (!refs.liveTail || !refs.liveTail.updateSessionSelect) return;
+    var pool = {};
+    Object.keys(state.sessions).forEach(function (sid) {
+      if (state.sessions[sid].live) pool[sid] = true;
+    });
+    refs.liveTail.updateSessionSelect(pool);
   }
 
   function renderSessions() {
     var list = document.getElementById("sess-list");
     list.innerHTML = "";
     // 池里的会话 + 主区数据里出现过的历史会话，后者用空心点区分
-    var ids = Object.keys(state.sessionsSeen);
+    var ids = Object.keys(state.sessions);
     if (!ids.length) {
       list.appendChild(el("li", { className: "hint" }, ["(none)"]));
       return;
     }
     ids.forEach(function (sid) {
-      var live = !!state.poolSessions[sid];
-      var label = (live ? "\u25CF " : "\u25CB ") + (state.sessionsSeen[sid] || sid);
+      var live = !!state.sessions[sid].live;
+      var label = (live ? "\u25CF " : "\u25CB ") + state.sessions[sid].label;
       if (!state.split.enabled) {
         list.appendChild(el("li", { className: "sb-item", title: sid }, [
           el("span", { className: "sb-label" }, [label]),
         ]));
         return;
       }
-      var on = state.split.sessionIds.indexOf(sid) >= 0;
+      var on = state.split.order.indexOf(sid) >= 0;
       var li = el("li", {
         className: "sb-item sess-pick" + (on ? " active" : ""),
         title: sid + (on ? "\n\n已分栏显示" : "\n\n点一下加一列"),
@@ -664,40 +988,41 @@ _INDEX_HTML = r"""<!DOCTYPE html>
       ? "/api/logs/" + encodeURIComponent(state.viewedLogId) + "/runs"
       : "/api/runs";
     fetch(url).then(function (r) { return r.json(); }).then(function (data) {
-      var list = document.getElementById("runs-list");
-      list.innerHTML = "";
-      if (!data.length) {
-        list.appendChild(el("li", { className: "hint" }, ["(none)"]));
-        return;
-      }
-      var running = null;
-      data.slice().reverse().forEach(function (r) {
-        state.runsById[r.id] = r;
-        if (r.status === "running") running = r.id;
-        // 主区看的是哪个 run 才高亮；正在跑的那条不自动抢占主区
-        var cls = "sb-item" + (r.id === state.viewedRunId && state.view === "run" ? " active" : "");
-        var li = el("li", { className: cls, title: r.script_path || r.id }, [
-          el("span", {
-            className: "sb-label",
-            onclick: function () { showRunDetail(r.id); },
-          }, [statusIcon(r.status) + " " + r.id]),
-          el("span", { className: "badge status-" + r.status }, [r.status]),
-        ]);
-        li.appendChild(runActionButton(r));
-        list.appendChild(li);
-      });
-      state.currentRunId = running;
-      // 主区正在看的 run 状态变了 → 同步头部（不改变用户所在视图）
-      if (state.view === "run" && state.timeline) {
-        var cur = state.runsById[state.viewedRunId];
-        if (cur) {
-          state.timeline.setMeta({
-            status: cur.status,
-            ended_at: cur.ended_at,
-            exception: cur.exception ? { type: "Exception", message: cur.exception } : null,
-          });
-        }
-      }
+      dispatch({ type: "RUNS_LOADED", runs: data || [] });
+    });
+  }
+
+  function renderRuns() {
+    var list = document.getElementById("runs-list");
+    list.innerHTML = "";
+    if (!state.runs.length) {
+      list.appendChild(el("li", { className: "hint" }, ["(none)"]));
+      return;
+    }
+    state.runs.slice().reverse().forEach(function (r) {
+      // 主区看的是哪个 run 才高亮；正在跑的那条不自动抢占主区
+      var cls = "sb-item" + (r.id === state.viewedRunId && state.view === "run" ? " active" : "");
+      var li = el("li", { className: cls, title: r.script_path || r.id }, [
+        el("span", {
+          className: "sb-label",
+          onclick: function () { showRunDetail(r.id); },
+        }, [statusIcon(r.status) + " " + r.id]),
+        el("span", { className: "badge status-" + r.status }, [r.status]),
+      ]);
+      li.appendChild(runActionButton(r));
+      list.appendChild(li);
+    });
+  }
+
+  // 主区正在看的 run 状态变了 → 同步头部（不改变用户所在视图）
+  function syncTimelineMeta() {
+    if (state.view !== "run" || !refs.timeline) return;
+    var cur = state.runsById[state.viewedRunId];
+    if (!cur) return;
+    refs.timeline.setMeta({
+      status: cur.status,
+      ended_at: cur.ended_at,
+      exception: cur.exception ? { type: "Exception", message: cur.exception } : null,
     });
   }
 
@@ -714,17 +1039,15 @@ _INDEX_HTML = r"""<!DOCTYPE html>
   }
 
   function stopRun(rid) {
-    // 尽力而为：按下即置灰 + stopping…，等 run.finished 事件才复位
-    state.stopping[rid] = true;
-    refreshRuns();
+    // 乐观更新：按下即置灰 + stopping…，等 run.finished 事件才复位；
+    // 请求被拒或网络挂了就 dispatch 回滚
+    dispatch({ type: "RUN_STOP_REQUESTED", rid: rid });
     fetch("/api/runs/" + encodeURIComponent(rid) + "/stop", { method: "POST" })
       .then(function (r) {
-        if (!r.ok) {
-          delete state.stopping[rid];
-          refreshRuns();
-        }
+        if (!r.ok) dispatch({ type: "RUN_STOP_FAILED", rid: rid });
       })
-      .catch(function () { delete state.stopping[rid]; refreshRuns(); });
+      .catch(function () { dispatch({ type: "RUN_STOP_FAILED", rid: rid }); })
+      .then(function () { refreshRuns(); });
   }
 
   function cancelRun(rid) {
@@ -742,18 +1065,16 @@ _INDEX_HTML = r"""<!DOCTYPE html>
 
   function refreshLogs() {
     fetch("/api/logs").then(function (r) { return r.json(); }).then(function (data) {
-      state.logs = data || [];
-      var active = activeLog();
-      if (active) {
-        var switched = state.currentLogId && state.currentLogId !== active.id;
-        state.currentLogId = active.id;
-        if (!state.viewedLogId || switched) state.viewedLogId = active.id;
-        // liveBuffer 挂钩活跃日志：日志一换就重置
-        if (state.liveBufferLogId !== active.id) resetLiveBuffer(active.id);
-        else if (state.liveTail) state.liveTail.setLog(active.name);
-      }
-      renderLogSwitcher();
+      dispatch({ type: "LOGS_LOADED", logs: data || [] });
     });
+  }
+
+  // liveBuffer 挂钩活跃日志：日志一换就重置
+  function syncLiveLog() {
+    var active = activeLog();
+    if (!active) return;
+    if (refs.liveBufferLogId !== active.id) resetLiveBuffer(active.id);
+    else if (refs.liveTail) refs.liveTail.setLog(active.name);
   }
 
   function renderLogSwitcher() {
@@ -802,11 +1123,10 @@ _INDEX_HTML = r"""<!DOCTYPE html>
 
   function switchToLog(logId) {
     // 只切 sidebar Runs 的浏览范围；活跃日志（写入目标）不变，Live 也不断
-    state.viewedLogId = logId;
+    dispatch({ type: "LOG_SELECTED", logId: logId });
     document.getElementById("log-dropdown").hidden = true;
     if (state.view === "run") showLive();
     refreshRuns();
-    renderLogSwitcher();
   }
 
   function rotateLog() {
@@ -824,8 +1144,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
       }
       return r.json();
     }).then(function (newLog) {
-      state.viewedLogId = newLog.id;
-      state.currentLogId = newLog.id;
+      dispatch({ type: "LOG_ROTATED", logId: newLog.id });
       resetLiveBuffer(newLog.id);
       showLive();
       refreshLogs();
@@ -868,7 +1187,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
         }
       })
       .then(function () {
-        if (state.viewedLogId === logId) state.viewedLogId = state.currentLogId;
+        dispatch({ type: "LOG_DISCARDED", logId: logId });
         refreshLogs();
         refreshRuns();
       })
@@ -883,13 +1202,13 @@ _INDEX_HTML = r"""<!DOCTYPE html>
     if (ev.type === "run.record" || ev.type === "run.meta") {
       pushLive(ev.record, ev.run_id);
       // 主区正在回放这个 run（且它还在跑）→ 同步喂给 timeline
-      if (state.view === "run" && state.viewedRunId === ev.run_id && state.timeline) {
-        state.timeline.appendLive(ev.record);
+      if (state.view === "run" && state.viewedRunId === ev.run_id && refs.timeline) {
+        refs.timeline.appendLive(ev.record);
       }
       return;
     }
     if (ev.type === "run.finished") {
-      delete state.stopping[ev.run_id];
+      dispatch({ type: "RUN_FINISHED", rid: ev.run_id });
       refreshRuns();
       refreshSessions();
       refreshLogs();
@@ -902,8 +1221,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
       return;
     }
     if (ev.type === "log.rotated") {
-      state.viewedLogId = ev.log_id;
-      state.currentLogId = ev.log_id;
+      dispatch({ type: "LOG_ROTATED", logId: ev.log_id });
       resetLiveBuffer(ev.log_id);
       showLive();
       refreshLogs();
@@ -912,6 +1230,63 @@ _INDEX_HTML = r"""<!DOCTYPE html>
     }
     if (ev.type === "log.renamed" || ev.type === "log.pinned" || ev.type === "log.discarded") {
       refreshLogs();
+      return;
+    }
+    // 手动命令执行事件
+    if (ev.type === "cmd.output") {
+      // 手动通道也走 LiveBody；__rid 保持 null，LiveTail 会据此打 ev-manual 标。
+      // 保留服务端带来的 event / level，让"成功 command_end 隐藏"等规则同样生效。
+      var rec = {
+        timestamp: Date.now() / 1000,
+        sequence: 0,
+        session_id: ev.session_id,
+        event: ev.event || "command_output",
+        level: ev.level || "INFO",
+        stream: ev.stream || "stdout",
+        message: ev.data || "",
+        operation_id: ev.command_id
+      };
+      pushLive(rec, null);
+      return;
+    }
+    if (ev.type === "cmd.finished") {
+      var cmdInfo = window.__cmdRunning && window.__cmdRunning[ev.command_id];
+      if (cmdInfo) {
+        // 保存到 LiveTail 的历史
+        if (refs.liveTail && refs.liveTail._cmdHistory) {
+          var sid = cmdInfo.sessionId;
+          if (!refs.liveTail._cmdHistory[sid]) {
+            refs.liveTail._cmdHistory[sid] = [];
+          }
+          refs.liveTail._cmdHistory[sid].push({
+            command: cmdInfo.command,
+            timestamp: cmdInfo.startTime,
+            exit_code: ev.exit_code,
+            duration: ev.duration
+          });
+          // 限制历史条数
+          if (refs.liveTail._cmdHistory[sid].length > 100) {
+            refs.liveTail._cmdHistory[sid] = refs.liveTail._cmdHistory[sid].slice(-100);
+          }
+          // 持久化到 localStorage
+          refs.liveTail._saveHistoryToStorage();
+        }
+        delete window.__cmdRunning[ev.command_id];
+      }
+      // 刷新命令输入框状态
+      var cmdBar = document.querySelector(".command-bar");
+      if (cmdBar) cmdBar.classList.remove("running");
+      var cmdInput = document.getElementById("cmd-input");
+      if (cmdInput) cmdInput.disabled = false;
+      return;
+    }
+    if (ev.type === "cmd.error") {
+      // 显示错误
+      console.error("Command error:", ev.error);
+      var cmdBar = document.querySelector(".command-bar");
+      if (cmdBar) cmdBar.classList.remove("running");
+      var cmdInput = document.getElementById("cmd-input");
+      if (cmdInput) cmdInput.disabled = false;
       return;
     }
   }
@@ -927,6 +1302,38 @@ _INDEX_HTML = r"""<!DOCTYPE html>
       sock.onclose = function () { setTimeout(connectWs, 2000); };
     } catch (e) { /* ignore */ }
   }
+
+  // -------------------------------------------------- 订阅者：state → DOM
+  //
+  // 每个订阅者靠 slice 的引用比较自己判脏：reducer 只给真正变了的分支换新对象，
+  // 所以 `next.x !== prev.x` 就是一次廉价的 dirty check。空转的轮询不会重绘。
+
+  store.subscribe(function (next, prev, action) {
+    if (next.sessions !== prev.sessions || next.split !== prev.split) {
+      renderSessions();
+      syncSessionSelect();
+      // 用户自己点的要立刻响应；数据驱动的攒一拍，避免一次 run 里连开好几列
+      schedulePanes(action.type === "PANE_TOGGLE"
+        || action.type === "SPLIT_TOGGLE"
+        || action.type === "SPLIT_PREF_LOADED");
+    }
+    if (next.split !== prev.split) {
+      syncSplitButton();
+      persistSplit();
+    }
+    if (next.runs !== prev.runs || next.stopping !== prev.stopping
+        || next.view !== prev.view || next.viewedRunId !== prev.viewedRunId) {
+      renderRuns();
+    }
+    if (next.runsById !== prev.runsById) syncTimelineMeta();
+    if (next.scripts !== prev.scripts) renderScriptList();
+    if (next.logs !== prev.logs || next.viewedLogId !== prev.viewedLogId) {
+      renderLogSwitcher();
+    }
+    if (next.logs !== prev.logs || next.currentLogId !== prev.currentLogId) {
+      syncLiveLog();
+    }
+  });
 
   // -------------------------------------------------- 绑定 + 启动
 
@@ -945,9 +1352,19 @@ _INDEX_HTML = r"""<!DOCTYPE html>
     if (dd) dd.hidden = true;
   });
 
+  // devtools 入口：__rpmTraceActions = true 打开操作流日志，
+  // __rpmStore.getState() 看当前事务态
+  window.__rpmTraceActions = false;
+  window.__rpmStore = store;
+
   loadSplitPref();
-  document.getElementById("split-toggle").classList.toggle("active", state.split.enabled);
+  syncSplitButton();
   ensureLiveTail();
+  // 首屏：列表都还空着，先照当前 state 画一次，后面全由订阅者驱动
+  renderScriptList();
+  renderSessions();
+  renderRuns();
+  renderLogSwitcher();
   refreshScripts();
   refreshSessions();
   refreshLogs();

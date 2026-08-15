@@ -68,6 +68,7 @@ redpymake = [
     "py.typed",
     "_web/static/*.css",
     "_web/static/*.js",
+    "_web/static/vendor/*.js",
     "_web/templates/*.html",
 ]
 
