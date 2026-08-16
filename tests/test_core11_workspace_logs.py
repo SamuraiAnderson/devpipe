@@ -5,6 +5,8 @@
     §CORE-11/logs/active-pointer-persisted     → test_active_pointer_is_persisted_across_instances
     §CORE-11/logs/run-boundaries-persisted     → test_run_persists_to_active_log_index
     §CORE-11/logs/single-stream-per-log        → test_stream_ndjson_is_single_file_across_runs
+    §CORE-11/logs/session-fanout-dir           → test_log_dir_holds_per_session_mirror
+    §CORE-11/logs/session-fanout-run-meta      → test_run_boundary_meta_mirrored_to_script_file
     §CORE-11/logs/interrupted-reconstruction   → test_interrupted_run_reconstructed_as_interrupted
     §CORE-11/logs/rename                       → test_rename_log_persists_to_meta
     §CORE-11/logs/rename-rejects-empty         → test_rename_rejects_empty_name
@@ -206,8 +208,10 @@ def test_stream_ndjson_is_single_file_across_runs(tmp_path: Path):
             rids.append(rid)
 
         log = ws.current_log
-        # 目录里只有 meta + 唯一一份流
-        assert sorted(p.name for p in log.root.iterdir()) == ["meta.json", "stream.ndjson"]
+        # 目录里只有 meta + 唯一一份流 + 按 session 分文件的旁路镜像目录
+        assert sorted(p.name for p in log.root.iterdir()) == [
+            "meta.json", "sessions", "stream.ndjson",
+        ]
         assert log.run_count == 3
 
         events = _stream_events(log)
@@ -231,6 +235,53 @@ def test_stream_ndjson_is_single_file_across_runs(tmp_path: Path):
             assert sliced[-1]["run_id"] == rid
             others = {r for r in rids if r != rid}
             assert not (others & {r.get("run_id") for r in sliced})
+
+
+def test_log_dir_holds_per_session_mirror(tmp_path: Path):
+    """§CORE-11/logs/session-fanout-dir：日志组目录下按 session 分文件镜像主流。
+
+    分文件是旁路：stream.ndjson 仍是权威合并流，镜像里每一行都能在主流里找到。
+    """
+    script = _write(tmp_path, "rpm_fanout.py", _SIMPLE_SCRIPT)
+    with rpm.workspace(tmp_path) as ws:
+        rid = ws.enqueue(script)
+        assert _wait_until(lambda: ws.get_run(rid).status == "succeeded", timeout=15)
+
+        log = ws.current_log
+        sessions_dir = log.root / "sessions"
+        assert sessions_dir.is_dir()
+
+        mirrors = sorted(p.name for p in sessions_dir.iterdir())
+        assert "__script__.ndjson" in mirrors
+        # 脚本里开了一个 local session，除 __script__ 外至少还有一份
+        assert len(mirrors) >= 2, mirrors
+
+        stream_lines = {
+            line for line in log.stream_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        }
+        for name in mirrors:
+            for line in (sessions_dir / name).read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    assert line in stream_lines, f"{name} 里有主流中不存在的行: {line}"
+
+
+def test_run_boundary_meta_mirrored_to_script_file(tmp_path: Path):
+    """§CORE-11/logs/session-fanout-run-meta：workspace.run.begin/end 进 __script__.ndjson。"""
+    script = _write(tmp_path, "rpm_meta.py", _SIMPLE_SCRIPT)
+    with rpm.workspace(tmp_path) as ws:
+        rid = ws.enqueue(script)
+        assert _wait_until(lambda: ws.get_run(rid).status == "succeeded", timeout=15)
+
+        script_file = ws.current_log.root / "sessions" / "__script__.ndjson"
+        events = [
+            (e.get("event"), e.get("run_id"))
+            for e in (json.loads(l) for l in script_file.read_text(encoding="utf-8").splitlines() if l.strip())
+        ]
+        assert ("workspace.run.begin", rid) in events
+        assert ("workspace.run.end", rid) in events
+        # 脚本层元行也在，且不夹带任何 session 记录
+        assert ("script.begin", None) in events
+        assert ("script.end", None) in events
 
 
 def test_interrupted_run_reconstructed_as_interrupted(tmp_path: Path):

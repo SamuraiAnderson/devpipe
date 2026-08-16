@@ -9,6 +9,12 @@
     §CORE-10/sink/unsubscribe-on-exit    → test_sink_unsubscribes_after_exit
     §CORE-10/sink/schema-fields          → test_sink_line_schema_matches_session_log_record
     §CORE-10/sink/does-not-alter-core09  → test_sink_does_not_alter_core09_behavior
+    §CORE-10/sink/fanout-per-session     → test_sink_mirrors_each_session_into_own_file
+    §CORE-10/sink/fanout-script-file     → test_sink_routes_sessionless_lines_to_script_file
+    §CORE-10/sink/fanout-name-safety     → test_session_filename_is_filesystem_safe
+    §CORE-10/sink/fanout-name-collision  → test_session_filename_disambiguates_collisions
+    §CORE-10/sink/fanout-mirrors-stream  → test_fanout_lines_are_verbatim_copies_of_stream
+    §CORE-10/sink/fanout-write-only      → test_fanout_absent_when_sink_inactive
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from pathlib import Path
 import pytest
 
 import redpymake as rpm
+from redpymake._live_sink import session_log_filename
 
 
 def _read_ndjson(path: Path) -> list[dict]:
@@ -139,3 +146,104 @@ def test_sink_does_not_alter_core09_behavior(tmp_path: Path, python_probe, monke
     dump_text = dump_path.read_text(encoding="utf-8")
     assert "BOTH" in dump_text
     assert "RuntimeError" in dump_text
+
+
+# ---------- 按 session 分文件（fan-out） ----------
+
+
+def _lines(path: Path) -> list[str]:
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_sink_mirrors_each_session_into_own_file(tmp_path: Path, python_probe, monkeypatch):
+    """§CORE-10/sink/fanout-per-session：每个 session 的记录另落一份 sessions/<slug>.ndjson。"""
+    target = tmp_path / "live.ndjson"
+    monkeypatch.setenv("REDPYMAKE_LIVE_SINK", f"file://{target.as_posix()}")
+    with rpm.script("fanout"):
+        with rpm.local() as first:
+            first.run(*python_probe("print('AAA')"))
+        with rpm.local() as second:
+            second.run(*python_probe("print('BBB')"))
+
+    records = _read_ndjson(target)
+    sids = sorted({r["session_id"] for r in records if r.get("session_id")})
+    assert len(sids) == 2, f"expected two sessions in stream, got {sids!r}"
+
+    sessions_dir = tmp_path / "sessions"
+    texts = {}
+    for sid in sids:
+        path = sessions_dir / session_log_filename(sid)
+        assert path.exists(), f"missing per-session file for {sid!r}: {path}"
+        rows = _read_ndjson(path)
+        assert rows, f"per-session file for {sid!r} is empty"
+        assert all(r.get("session_id") == sid for r in rows), f"foreign rows leaked into {path}"
+        texts[sid] = path.read_text(encoding="utf-8")
+
+    # 两路输出各归各家，互不串门
+    holders = {sid: ("AAA" in text, "BBB" in text) for sid, text in texts.items()}
+    assert sorted(holders.values()) == [(False, True), (True, False)], holders
+
+
+def test_sink_routes_sessionless_lines_to_script_file(tmp_path: Path, monkeypatch):
+    """§CORE-10/sink/fanout-script-file：无 session_id 的行落 sessions/__script__.ndjson。"""
+    target = tmp_path / "live.ndjson"
+    monkeypatch.setenv("REDPYMAKE_LIVE_SINK", f"file://{target.as_posix()}")
+    with rpm.script("scriptonly"):
+        pass
+
+    script_file = tmp_path / "sessions" / "__script__.ndjson"
+    assert script_file.exists()
+    events = [r.get("event") for r in _read_ndjson(script_file)]
+    assert events == ["script.begin", "script.end"]
+
+
+def test_session_filename_is_filesystem_safe():
+    """§CORE-10/sink/fanout-name-safety：session_id 里的 : # @ 等字符不得进文件名。"""
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    for sid in ("wsl:default#1", "ssh:user@10.0.0.2:22#3", "adb:emulator-5554#1", "a/b\\c"):
+        name = session_log_filename(sid)
+        assert name.endswith(".ndjson")
+        stem = name[: -len(".ndjson")]
+        assert stem, f"empty stem for {sid!r}"
+        assert set(stem) <= allowed, f"unsafe chars in {name!r} for {sid!r}"
+
+
+def test_session_filename_disambiguates_collisions():
+    """§CORE-10/sink/fanout-name-collision：安全化后可能撞名的 id 必须落到不同文件。"""
+    # 安全化会把 : 和 # 都换成 _，裸替换会让这两个 id 撞到一起
+    assert session_log_filename("wsl:default#1") != session_log_filename("wsl_default_1")
+    # 保留名不能被真实 session 抢占
+    assert session_log_filename("__script__") != "__script__.ndjson"
+    # 无 session_id 一律归 __script__
+    assert session_log_filename(None) == "__script__.ndjson"
+    assert session_log_filename("") == "__script__.ndjson"
+    # 同一个 id 必须稳定
+    assert session_log_filename("wsl:default#1") == session_log_filename("wsl:default#1")
+
+
+def test_fanout_lines_are_verbatim_copies_of_stream(tmp_path: Path, python_probe, monkeypatch):
+    """§CORE-10/sink/fanout-mirrors-stream：分文件是主流的逐字符镜像，顺序一致。"""
+    target = tmp_path / "live.ndjson"
+    monkeypatch.setenv("REDPYMAKE_LIVE_SINK", f"file://{target.as_posix()}")
+    with rpm.script("verbatim"):
+        with rpm.local() as sess:
+            sess.run(*python_probe("print('ONE'); print('TWO')"))
+
+    stream_lines = _lines(target)
+    sid = next(
+        json.loads(line)["session_id"]
+        for line in stream_lines
+        if json.loads(line).get("session_id")
+    )
+    expected = [line for line in stream_lines if json.loads(line).get("session_id") == sid]
+    mirrored = _lines(tmp_path / "sessions" / session_log_filename(sid))
+    assert mirrored == expected
+
+
+def test_fanout_absent_when_sink_inactive(tmp_path: Path, python_probe, monkeypatch):
+    """§CORE-10/sink/fanout-write-only：sink 未激活时不产生 sessions/ 目录。"""
+    monkeypatch.delenv("REDPYMAKE_LIVE_SINK", raising=False)
+    with rpm.script("nofanout"):
+        with rpm.local() as sess:
+            sess.run(*python_probe("print('x')"))
+    assert not (tmp_path / "sessions").exists()

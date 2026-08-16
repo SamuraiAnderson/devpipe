@@ -14,7 +14,9 @@
    的记录顺序追加进同一个文件（不做 per-run 分片）；每次运行前把
    ``REDPYMAKE_LIVE_SINK`` 指向活跃日志的 stream，CORE-10 的 sink 自然生效。
    Workspace 在 sink 外侧追写 ``workspace.run.begin`` / ``workspace.run.end``
-   元行界定 run 边界——run 摘要不单独持久化，一律从这两条元行重建。
+   元行界定 run 边界——run 摘要不单独持久化，一律从这两条元行重建。sink 同时把
+   每行按 ``session_id`` 镜像到 ``<log>/sessions/``（CORE-10 fan-out），两条 run
+   边界元行无 session，跟着进 ``sessions/__script__.ndjson``；镜像只写不读。
 
 规范来源：doc/core-lib-requirements.md § CORE-11。
 """
@@ -41,6 +43,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
 
 from ._discover import ScriptCard, discover as _discover_fn
+from ._live_sink import SESSIONS_DIRNAME, session_log_filename
 from ._logs import SessionLogRecord
 from .exceptions import WorkspaceStoppedError
 
@@ -80,8 +83,9 @@ _STATUS_INTERRUPTED = "interrupted"
 class WorkspaceLog:
     """一组同批次运行的容器（§CORE-11 日志组）。
 
-    磁盘布局：``<logs_root>/<id>/{meta.json, stream.ndjson}``。该日志下所有 run
-    的记录都顺序追加进同一份 ``stream.ndjson``；唯一活跃日志由
+    磁盘布局：``<logs_root>/<id>/{meta.json, stream.ndjson, sessions/}``。该日志下
+    所有 run 的记录都顺序追加进同一份 ``stream.ndjson``；``sessions/`` 是按会话分
+    文件的旁路镜像（只写不读，见 CORE-10 fan-out）；唯一活跃日志由
     ``<logs_root>/_active.json`` 指定。
     """
 
@@ -98,6 +102,11 @@ class WorkspaceLog:
     def stream_path(self) -> Path:
         """该日志组唯一的 NDJSON 流文件。"""
         return self.root / _STREAM_FILENAME
+
+    @property
+    def sessions_dir(self) -> Path:
+        """按 session 分文件的镜像目录；权威数据仍在 ``stream_path``。"""
+        return self.root / SESSIONS_DIRNAME
 
     def to_dict(self) -> dict:
         return {
@@ -1187,10 +1196,24 @@ class Workspace:
                     fp.write(line + "\n")
                     fp.flush()
                     after = fp.tell()
-            return after if return_end_offset else before
         except OSError:  # pragma: no cover - 磁盘错误仅记录
             _diag_logger.exception("failed to append meta line to %s", stream_path)
             return None
+        # run 边界元行没有 session_id，镜像进 __script__.ndjson，与 sink 那侧
+        # 的 script.begin/end 汇成同一份"脚本视角"的流
+        self._mirror_meta_to_sessions(stream_path, line)
+        return after if return_end_offset else before
+
+    @staticmethod
+    def _mirror_meta_to_sessions(stream_path: Path, line: str) -> None:
+        """把一条无 session 的元行镜像到 ``sessions/__script__.ndjson``（旁路，失败不影响主流）。"""
+        target = stream_path.parent / SESSIONS_DIRNAME / session_log_filename(None)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "a", encoding="utf-8", newline="\n") as fp:
+                fp.write(line + "\n")
+        except OSError:  # pragma: no cover - 镜像是旁路，坏了只记录
+            _diag_logger.exception("failed to mirror meta line to %s", target)
 
     def _bump_log_run_count(self, log_id: str) -> None:
         """``run_count`` 是从 stream 派生的；run 收尾时同步递增内存副本。"""
