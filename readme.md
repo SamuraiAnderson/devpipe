@@ -1,72 +1,109 @@
 # RedPyMake
 
-一个跨运行环境（本地 / SSH / ADB / 串口）的 Python 自动化库：用统一的会话接口
-执行命令、传输文件、收集日志、按需做过时判断。
-
-- **单一入口**：`import redpymake as rpm`
-- **平台无关的调用**：`session.run(...)` / `session.push(...)` / `session.wait(...)`
-- **可选平台依赖**：SSH 与串口按需 `pip install redpymake[ssh,serial]`
-- **无 UI 依赖**：核心库不引入 Streamlit / NumPy / SciPy / pydub
+统一的 `Session` 接口，跨 local / ssh / adb / serial / wsl 执行命令、传输文件、收集日志。
+Python 3.10+，核心零依赖。
 
 ## 安装
 
-需要 Python 3.10+。
-
 ```bash
-pip install -e .          # 仅核心
-pip install -e ".[ssh]"   # SSH 支持
-pip install -e ".[serial]"  # 串口支持
-pip install -e ".[dev]"   # 开发（含测试依赖）
+pip install -e .            # 核心
+pip install -e ".[ssh]"     # paramiko
+pip install -e ".[serial]"  # pyserial
+pip install -e ".[web]"     # fastapi + uvicorn
 ```
 
-## 前十分钟
+## 工厂
 
-### 本地命令
+| 工厂 | 依赖 |
+| --- | --- |
+| `rpm.local()` | — |
+| `rpm.ssh(host, *, user=None, port=22, password=None, key_filename=None)` | `[ssh]` |
+| `rpm.adb(serial=None, *, adb_path=None)` | `adb` 在 PATH |
+| `rpm.serial(port, *, baudrate=115200)` | `[serial]` |
+| `rpm.wsl(distribution=None, *, user=None)` | Windows |
 
-```python
-import redpymake as rpm
+返回同一 `Session` 接口，`run` / `at` / `path` / `push` / `pull` / `wait` / `logs` 通用。
 
-with rpm.local() as here:
-    res = here.run("python", "-c", "print('hi')")
-    print(res.stdout)
-```
-
-### SSH 命令与文件传输
+## 用法
 
 ```python
 import redpymake as rpm
 
 with rpm.ssh("192.168.1.10", user="root") as remote:
-    workspace = remote.at("/workspace")
-
-    # 命令执行
-    workspace.run("cmake", "-B", "build")
-
-    # 增量：只有源比目标新才重新构建
-    target = workspace.path("build/app")
-    sources = [workspace.path("src/main.c"), workspace.path("src/utils.c")]
-    if rpm.stale(target, depends_on=sources, name="build_app"):
-        workspace.run("cmake", "--build", "build", "-j8")
-
-    # 跨会话推送
-    local = rpm.local()
-    remote.pull(target, local.path("dist/app"))
-
-    # 保存整个会话的日志
-    remote.logs.save("logs/build.log")
+    print(remote.run("uname", "-a").stdout)
+    print(remote.at("/tmp").run("pwd").stdout.strip())
 ```
 
-### 串口日志等待
+### 命令
+
+```python
+res = remote.run("make", "-j8")               # 非零抛 CommandError
+res = remote.run("test", "-f", "x", check=False)   # 手动判断 res.ok
+remote.run("cat a | grep b", shell=True)      # shell=True 时不接受额外 argv
+```
+
+### 传输
+
+```python
+here = rpm.local()
+remote.push(here.path("dist/app"), remote.path("/opt/app"))
+remote.pull(remote.path("/var/log/x.log"), here.path("logs/x.log"))
+```
+
+### 等日志
 
 ```python
 import re
-import redpymake as rpm
 
 with rpm.serial("COM3", baudrate=115200) as uart:
     uart.run("reboot").wait("U-Boot", timeout=10)
     uart.wait(re.compile(r"login:\s*$"), timeout=60)
-    uart.run("root").wait("#", timeout=5)
 ```
+
+`run(...).wait(...)` 用 run 前保存的游标搜索，不会漏掉命令期间产生的匹配。
+
+### 过时判断
+
+```python
+build = remote.at("/workspace")
+target = build.path("build/app")
+sources = [build.path("src/main.c"), build.path("src/utils.c")]
+
+if rpm.stale(target, depends_on=sources, name="build_app"):
+    build.run("cmake", "--build", "build", "-j8")
+```
+
+### 脚本对象
+
+```python
+import logging
+
+with rpm.script("nightly", dump_on_error="logs/"):
+    logging.getLogger("build").info("start")
+    here = rpm.local()
+    remote = rpm.ssh("10.0.0.1")
+    remote.run("make", "-j8")
+```
+
+作用域内的会话自动登记；异常时把业务 `logging` + 每个会话的输出打包写入 `logs/nightly-<ts>/`；原异常照抛。
+
+### CLI 与 Web UI
+
+命名为 `rpm_*.py` 的脚本可被发现：
+
+```bash
+redpymake discover examples/
+redpymake run rpm_build.py --sink run.ndjson
+redpymake report run.ndjson -o run.html
+redpymake serve examples/wsl_session         # 127.0.0.1:8765
+```
+
+`redpymake serve` 背后是 `rpm.workspace(...)`，同一目标在多次 run 之间复用连接。
+
+## 示例
+
+- [`examples/quickstart/`](examples/quickstart/README.md) — 最小 SSH 示例
+- [`examples/wsl_session/`](examples/wsl_session/README.md) — 传输 / stale / wait / script / 长流水线
 
 ## 接口分层
 
@@ -75,23 +112,20 @@ with rpm.serial("COM3", baudrate=115200) as uart:
 | 一级：核心执行 | `session.at`, `session.run`, `session.path` | 会话、工作目录、命令、路径 |
 | 二级 A：文件传输 | `session.push`, `session.pull`, `session.copy` | 方向明确的便利接口，底层统一为 copy |
 | 二级 B：日志与等待 | `session.logs`, `session.wait`, `run(...).wait` | 自动收集、订阅、tag、等待 |
-| 二级 C：过时判断 | `rpm.stale(target, depends_on=...)` | 增量优化辅助（不是构建系统） |
+| 二级 C：过时判断 | `rpm.stale(target, depends_on=...)` | 增量优化辅助 |
+| 二级 D：脚本对象 | `rpm.script(...)` | 多会话日志合流、异常自动落盘 |
+| 二级 E：工作区与可视化 | `rpm.workspace(...)`, `rpm.discover(...)` | 连接复用、脚本发现、Web UI 后端 |
 
-## 语义要点
+所有异常继承 `RedPyMakeError`，不会漏出 paramiko 原生异常或裸 `RuntimeError`。
 
-- `run()` 默认 `check=True`：非零退出立即抛 `CommandError`；`check=False` 返回 `CommandResult` 让调用者判断。
-- 位置参数模式 `run("make", "-j8")` 安全传参、不解析 shell 元字符；需要管道时用 `run(..., shell=True)`（不接受额外位置参数）。
-- `at()` 返回**新的视图**并共享同一连接与日志，不修改原会话；单次覆盖用 `run(cwd=...)`。
-- `ResourcePath` 绑定所属会话，`session.push(local_path, remote_path)` 无需手工判断平台。
-- `rpm.stale(...)` 只返回 `bool`；策略默认 `"mtime"`，依赖不存在始终抛 `InputNotFoundError`。
-- `run(...).wait(...)` 使用命令执行前保存的游标搜索，不会漏掉命令期间产生的匹配。
-- 会话关闭后仍可读取已收集的日志，但拒绝新的 `run` / `push` / `wait`。
+## 容易踩的坑
 
-完整需求与验收标准见 [`doc/core-lib-requirements.md`](doc/core-lib-requirements.md)。
+- `run()` 默认 `check=True`：非零退出立即抛 `CommandError`；`check=False` 才返回结果让调用者判断。
+- `at()` 返回**新的视图**并共享同一连接与日志，不修改原会话；只想覆盖一次用 `run(cwd=...)`。
+- `session.wait(pattern)` 默认从"下一条"开始扫，匹配不到调用之前的历史；覆盖命令执行期间的输出用 `run(...).wait(pattern)`。
+- 会话关闭后仍可读取已收集的日志，但会拒绝新的 `run` / `push` / `wait`。
+- `rpm.wsl()` 只校验 `wsl.exe` 存在，发行版没装会延迟到首次 `run()` 时以 `CommandError` 报出来。
 
-## 测试
+## 完整规格
 
-```bash
-pytest              # 默认单元测试，不依赖网络或真实设备
-pytest -m integration   # 需要真实 SSH / ADB / 串口设备
-```
+[`doc/core-lib-requirements.md`](doc/core-lib-requirements.md)
