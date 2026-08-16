@@ -136,11 +136,11 @@ def test_acceptance_6_stale_is_plain_function(local_session, tmp_path):
 
 
 def test_acceptance_7_no_integration_default(pytestconfig):
-    """§5/7：默认 ``pytest`` 命令不跑 integration。"""
+    """§5/7：默认 ``pytest`` 命令既不跑 integration，也不跑浏览器 e2e。"""
     ini = pytestconfig.getini("addopts") or ""
-    assert "not integration" in " ".join(
-        ini if isinstance(ini, list) else [ini]
-    )
+    addopts = " ".join(ini if isinstance(ini, list) else [ini])
+    assert "not integration" in addopts
+    assert "not e2e" in addopts, "浏览器 e2e 需要 playwright 二进制，默认套件必须排除"
 
 
 # 5/8 -----------------------------------------------------------------
@@ -156,6 +156,23 @@ def test_acceptance_8_integration_scaffold_present():
         content = f.read_text(encoding="utf-8")
         assert "pytest.mark.integration" in content, (
             f"{name} must mark tests with @pytest.mark.integration"
+        )
+
+
+def test_acceptance_8_e2e_suite_is_marked():
+    """§5/8：``tests/e2e/`` 下每个用例文件都必须带 e2e 标记。
+
+    漏标一个文件，默认 ``pytest`` 就会去拉浏览器——在没装 chromium 的机器上直接
+    红一片，正是这条分层要防的事。
+    """
+    root = Path(__file__).parent / "e2e"
+    assert root.is_dir(), "tests/e2e/ must exist for §CORE-11 Web UI 端到端验证"
+    files = sorted(root.glob("test_*.py"))
+    assert files, "tests/e2e/ 至少要有一个用例文件"
+    for f in files:
+        content = f.read_text(encoding="utf-8")
+        assert "pytest.mark.e2e" in content, (
+            f"{f.name} must mark tests with pytest.mark.e2e"
         )
 
 

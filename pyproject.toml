@@ -36,6 +36,12 @@ web = [
     "uvicorn>=0.29",
     "websockets>=12.0",
 ]
+# 浏览器端到端测试（§CORE-11 Web UI 端到端验证）。不并入 dev：浏览器二进制需要
+# 额外的 `playwright install chromium`（约 150MB），不该拖进默认开发装。
+e2e = [
+    "pytest-playwright>=0.5",
+    "playwright>=1.44",
+]
 dev = [
     "pytest>=7",
     "pytest-cov>=4",
@@ -77,9 +83,10 @@ minversion = "7.0"
 testpaths = ["tests"]
 markers = [
     "integration: 需要真实设备或网络的集成测试；默认不运行 (使用 -m integration 运行)",
+    "e2e: 需要浏览器的 Web UI 端到端测试；默认不运行 (使用 -m e2e 运行)",
 ]
-# 默认排除集成测试；每条用例设 30s 硬超时避免 wait()/subprocess 挂死 CI。
-addopts = "-m 'not integration' --timeout=30"
+# 默认排除集成测试与浏览器 e2e；每条用例设 30s 硬超时避免 wait()/subprocess 挂死 CI。
+addopts = "-m 'not integration and not e2e' --timeout=30"
 
 [tool.coverage.run]
 source = ["redpymake"]
@@ -91,7 +98,9 @@ omit = [
     "src/redpymake/_adb.py",
     "src/redpymake/_serial.py",
     "src/redpymake/_wsl.py",
-    # Web UI 覆盖率通过端到端浏览器测试（后续版本）保证，单元层只覆盖 API 契约。
+    # server.py 的主体是路由 + 内联前端资源。`pytest -m e2e` 会在测试进程内起
+    # uvicorn，把路由代码真正跑一遍（实测 ~44%），但默认套件不跑 e2e，不排除的话
+    # 默认报告会被这千余行拉偏。
     "src/redpymake/_web/server.py",
 ]
 

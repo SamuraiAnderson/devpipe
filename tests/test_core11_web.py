@@ -3,8 +3,6 @@
 规格映射：
     §CORE-11/web/routes/index         → test_web_index_returns_html
     §CORE-11/web/dom-names            → test_web_index_exposes_named_dom_anchors
-    §CORE-11/web/layout/app-shell     → test_static_styles_lock_viewport
-                                      → test_hidden_panel_view_does_not_take_space
     §CORE-11/web/split                → test_static_styles_define_split_panes
                                       → test_timeline_js_exposes_paneset
     §CORE-11/web/live-rail            → test_livebody_has_chrono_rail_styles
@@ -14,12 +12,15 @@
     §CORE-11/web/api/runs             → test_web_api_runs_reflects_workspace
     §CORE-11/web/api/start-run        → test_web_api_start_run_enqueues
 
-Web 测试整体走 FastAPI `TestClient`；WebSocket 与浏览器行为标 integration。
+本文件走 FastAPI `TestClient`，只锁 HTTP 契约与静态资源的可获取性。**布局与交互
+断言不在这里**：视口锁定、隐藏面板占位、LogRow 响应式列宽已交给
+`tests/e2e/`（`§CORE-11/web/e2e/...`）在真实浏览器里量，字符串检查证明不了布局
+成立。剩下的 `styles.css` / `timeline.js` 文本断言只是"这条规则别被删掉"的护栏，
+待相应 e2e 覆盖到位后同样让位。
 """
 
 from __future__ import annotations
 
-import re
 import time
 from pathlib import Path
 
@@ -105,35 +106,17 @@ def test_web_index_exposes_named_dom_anchors(web_app):
         assert anchor in body, f"缺少命名部件锚点 {anchor}"
 
 
-def test_static_styles_lock_viewport(web_app):
-    """§CORE-11/web/layout/app-shell：整页视口锁定，滚动只在内部容器。"""
-    client, _ws = web_app
-    res = client.get("/static/styles.css")
-    assert res.status_code == 200
-    css = res.text
-    assert "body.app-shell" in css
-    # TopBar 高度不可硬编码——高度随内容/换行变化，减常数必然溢出
-    assert "calc(100vh - " not in css
-    # 三个内部滚动容器
-    for selector in (".sidebar", ".timeline-body"):
-        assert selector in css
-    # LogRow 消息列写死列位，避免无 session_id 的记录错位进 SessionCell
-    assert ".tl-msg" in css and "grid-column: 4" in css
+def test_static_styles_are_served(web_app):
+    """§CORE-11/web/routes/index：index 引用的两份静态资源确实可取。
 
-
-def test_hidden_panel_view_does_not_take_space(web_app):
-    """§CORE-11/web/layout/app-shell：隐藏态 RunDetailView 不得占位。
-
-    ID 选择器 (1,0,0) 会盖过 `.panel-view[hidden]` (0,2,0)，隐藏的回放面板会继续
-    按 flex:1 占位，把 LiveView 挤成半高——所以那条 flex 规则必须避开 app 页。
+    布局本身由 `tests/e2e/test_e2e_app_shell.py` 在浏览器里验；这里只保证 wheel
+    里内联的静态资源挂载正确（§CORE-11「前端资源内联进 wheel，不走 CDN」）。
     """
     client, _ws = web_app
-    css = client.get("/static/styles.css").text
-    assert ".panel-view[hidden]" in css
-    assert re.search(r"(?m)^#timeline-root\s*\{", css) is None, (
-        "裸 #timeline-root 规则会压过 .panel-view[hidden]"
-    )
-    assert "body:not(.app-shell) #timeline-root" in css
+    for path in ("/static/styles.css", "/static/timeline.js"):
+        res = client.get(path)
+        assert res.status_code == 200, f"{path} 未挂载"
+        assert res.text.strip()
 
 
 def test_static_styles_define_split_panes(web_app):
@@ -183,27 +166,6 @@ def test_livetail_js_exposes_cdf_sync_api(web_app):
         assert token in js, f"缺少 ChronoRail 符号 {token}"
     # rail 只给 LiveTail 开；Run detail 已经有 playhead，不建第二根时间轴
     assert "rail: true" in js
-
-
-def test_css_logrow_uses_clamp_for_responsive_sessioncell(web_app):
-    """§CORE-11/web/layout/app-shell：SessionCell 用 clamp() 实现响应式列宽。"""
-    client, _ws = web_app
-    css = client.get("/static/styles.css").text
-    # LogRow 的 grid-template-columns 里要有 clamp()
-    assert "clamp(" in css, "SessionCell 应使用 clamp() 实现响应式列宽"
-    # .tl-sid 的 grid-column: 3 确保它固定在第三列
-    assert ".tl-sid" in css and "grid-column: 3" in css
-
-
-def test_css_media_query_hides_sessioncell_on_narrow(web_app):
-    """§CORE-11/web/layout/app-shell：窄窗口下 SessionCell 整列隐藏。"""
-    client, _ws = web_app
-    css = client.get("/static/styles.css").text
-    # 有 @media (max-width: 960px) 查询
-    assert "@media (max-width: 960px)" in css
-    # 窄窗口下关键的响应式规则都存在
-    assert ".tl-sid { display: none; }" in css
-    assert ".tl-msg { grid-column: 3; }" in css
 
 
 def test_web_api_scripts_returns_cards(web_app):

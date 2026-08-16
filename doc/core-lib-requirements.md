@@ -1449,6 +1449,25 @@ LiveBody 每列右侧有一条窄轨 ChronoRail，解决"多个 session 各滚�
 - 核心库依赖零 UI；Web 走 `redpymake[web]` extra；
 - `Workspace` 是 `serve` 唯一的状态所有者，路由处理器**只读 workspace 状态、只调 workspace 指令**，不引入独立 UI 层业务状态。
 
+### Web UI 端到端验证（Playwright）
+
+Web UI 的行为分两层验证，边界按"要不要真实渲染"划：
+
+| 层 | 位置 | 手段 | 覆盖 |
+|----|------|------|------|
+| HTTP 契约 | `tests/test_core11_web*.py` | FastAPI `TestClient` | 路由的状态码、JSON 形状、状态迁移 |
+| 端到端 | `tests/e2e/` | Playwright + 真实 uvicorn | 渲染后果、WS 推送、用户交互 |
+
+**分层理由**：`TestClient` 是内存传输，浏览器连不上，e2e 必须起真实 uvicorn 监听真实端口；反过来，纯 HTTP 契约不需要浏览器就能锁死，留在 `TestClient` 层跑得更快。二者不重复覆盖同一条断言。
+
+**默认不跑**：e2e 需要浏览器二进制（`playwright install chromium`），走 `redpymake[e2e]` extra，用例标 `@pytest.mark.e2e`，默认 `addopts` 排除。显式 `pytest -m e2e` 启用。这与 `integration` 是同一套取舍：验收标准 §5/7 的"默认单测无需网络、真实设备或浏览器"必须成立。
+
+**断言取向：验后果，不验写法**。e2e 断言的是浏览器算出来的结果（`getBoundingClientRect`、`getComputedStyle`、`scrollHeight`），不是样式表里有没有某个字符串。凡是 e2e 能验的布局约束，`styles.css` / `timeline.js` 的文本断言就该让位——后者只在"这条规则被删掉就回归"且 e2e 成本过高时保留。
+
+**测试钩子契约**：`window.__rpmStore` 是**稳定的可观测入口**，e2e 可以 `getState()` 读前端状态（`view` / `viewedRunId` / `split` 等，字段见上文"前端状态字段"），也可以 `dispatch(action)` 直接驱动状态迁移。它属于对外契约的一部分：改名或改形状必须同步改 e2e。`window.__rpmTraceActions` 保持为调试开关，不进契约。
+
+**规格 id 前缀**：e2e 用例的 docstring 引用 `§CORE-11/web/e2e/...`，与 `TestClient` 层的 `§CORE-11/web/...` 区分开，便于失败信息直接定位到本节。
+
 ### 静态 HTML 报告
 
 `redpymake report NDJSON -o report.html`：
@@ -1477,8 +1496,8 @@ LiveBody 每列右侧有一条窄轨 ChronoRail，解决"多个 session 各滚�
 4. 所有 `run()` 返回相同类型 `CommandResult`。
 5. 文件传输通过 `push` / `pull` / `copy` 完成，调用者不写平台分支。
 6. 过时判断使用顶级函数 `rpm.stale(...) -> bool`；不再出现 `target_count`、`Rule`、`.run()` / `.call()` 链式。
-7. 默认单元测试不需要网络或真实设备。
-8. SSH、ADB、串口测试标记为集成测试。
+7. 默认单元测试不需要网络、真实设备或浏览器。
+8. SSH、ADB、串口测试标记为集成测试（`integration`）；浏览器端到端测试标记为 `e2e`，两者默认都不跑。
 9. 核心包测试覆盖率建议不低于 80%。
 10. UI 完全移除后，核心库仍可独立安装和运行。
 11. `run(...).wait(...)` 不会漏掉命令执行期间已产生的日志。
