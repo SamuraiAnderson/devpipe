@@ -967,6 +967,22 @@ class ScriptCard:
  "ended_at": ..., "exception": {"type": "...", "message": "...", "traceback": "..."} | null}
 ```
 
+**按 session 分文件（fan-out）**：主文件之外，sink 把每条记录**同时镜像**一份到 `<sink 所在目录>/sessions/` 下的按会话分文件：
+
+```text
+<sink 所在目录>/
+  live.ndjson                        # 主文件：全量顺序流，权威
+  sessions/
+    wsl_default_1-3f2a1c9d.ndjson    # 每个 session_id 一份
+    __script__.ndjson                # 无 session_id 的行
+```
+
+- 主文件语义**不变**：仍是全量顺序流；run 切片（CORE-11 的字节偏移）、`report`、回放一律以它为准。分文件是纯旁路镜像，行内容与主文件里的对应行逐字符相同；
+- 文件名由 `session_id` 派生：保留 `[A-Za-z0-9._-]`，其余字符（`:` `#` `@` 路径分隔符等）替换为 `_`；一旦发生替换、超长（> 64 字符）或撞上保留名 `__script__`，追加 `-<sha1(session_id)[:8]>` 后缀，保证不同 id 不会共用一份文件；
+- 没有 `session_id` 的行落 `__script__.ndjson`：`script.begin` / `script.end`，以及 CORE-11 里 Workspace 在 sink 外侧追写的 `workspace.run.begin` / `workspace.run.end`。它与 Web 分栏的 Script 兜底列同义；
+- 分文件写入失败只走 `_diag_logger.exception(...)`，**不得影响主文件**；分文件句柄随 sink 一起 `close()`；
+- 分文件**只写不读**：库自身不从它们重建任何状态，删掉不影响任何功能。
+
 **语义要点**：
 
 - sink 与 CORE-09 的 `_dump_on_error` 落盘策略**正交**——sink 是每行流式追加，`dump_on_error` 是异常时一次性快照；两者可同时开启；
@@ -1186,9 +1202,13 @@ ws.list_runs_in_log(log_id) -> list[WorkspaceRun]    # 惰性扫 stream.ndjson �
   <log_id>/
     meta.json                                 # {id,name,created_at,description,pinned}
     stream.ndjson                             # 唯一日志流；该 log 下所有 run 的记录顺序追加
+    history.json                              # 命令历史：{version, log_id, sessions: {session_id: [{command,timestamp,exit_code,duration}]}}
+    sessions/                                 # 按 session 分文件的旁路镜像（见 CORE-10 fan-out）
+      <slug>.ndjson                           # 每个 session_id 一份
+      __script__.ndjson                       # 无 session_id 的行：script.begin/end + workspace.run.begin/end
 ```
 
-**没有** `runs.index.jsonl`，**没有** `runs/` 子目录——run 摘要不单独存，一律从 `stream.ndjson` 的元行重建。
+**没有** `runs.index.jsonl`，**没有** `runs/` 子目录——run 摘要不单独存，一律从 `stream.ndjson` 的元行重建。`sessions/` 同理只写不读：它是给人和外部工具按会话 tail / grep 用的，库自身的重建路径一律只认 `stream.ndjson`。
 
 ### `stream.ndjson` 的结构
 
@@ -1207,8 +1227,8 @@ ws.list_runs_in_log(log_id) -> list[WorkspaceRun]    # 惰性扫 stream.ndjson �
 
 **分工**：
 
-- CORE-10 sink（`_live_sink.py`）**不改**：继续负责 `script.begin` / `script.end` + 每条 `SessionLogRecord`；只是它的目标文件从 per-run 分片变成了该 log 的 `stream.ndjson`（`REDPYMAKE_LIVE_SINK=file://<log>/stream.ndjson`，sink 本来就是 append 模式）；
-- Workspace 负责在 sink 外侧追写 `workspace.run.begin` / `workspace.run.end`——这两条携带**只有 workspace 知道的元数据**（`run_id` / `script_path` / `status` / `exception`），不污染 CORE-10 的语义。
+- CORE-10 sink（`_live_sink.py`）负责 `script.begin` / `script.end` + 每条 `SessionLogRecord`；它的目标文件是该 log 的 `stream.ndjson`（`REDPYMAKE_LIVE_SINK=file://<log>/stream.ndjson`，sink 本来就是 append 模式），同时按 CORE-10 的 fan-out 规则镜像到 `<log>/sessions/`；
+- Workspace 负责在 sink 外侧追写 `workspace.run.begin` / `workspace.run.end`——这两条携带**只有 workspace 知道的元数据**（`run_id` / `script_path` / `status` / `exception`），不污染 CORE-10 的语义；这两条无 `session_id`，除主流外同样镜像进 `<log>/sessions/__script__.ndjson`。
 
 **元行字段**：
 
@@ -1311,43 +1331,60 @@ Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.
 
 ### Web UI DOM 部件命名（交流约定）
 
-页面部件有稳定名字，讨论 / issue / commit message 一律用这套词，避免"左边那个列表"式的指代。名字与 DOM 锚点一一对应：
+页面部件有稳定名字，讨论 / issue / commit message 一律用这套词，避免"左边那个列表"式的指代。名字与 DOM 锚点一一对应，树形结构如下：
 
-| 部件名 | DOM 锚点 | 职责 |
-|--------|----------|------|
-| **AppShell** | `body.app-shell` | 视口锁定外壳：TopBar + Layout 两段 |
-| **TopBar** | `header` | 标题与全局日志控制，不参与滚动 |
-| **BrandBlock** | `.header-left` | 标题 + 一句话说明 |
-| **LogSwitcher** | `#log-switcher` | 当前日志组 + 切换/管理入口 |
-| **LogCurrentButton** | `#log-current-btn` | 显示当前日志名与 run 数，点开 LogDropdown |
-| **LogDropdown** | `#log-dropdown` | 历史日志列表（★ pinned 靠前），含 discard |
-| **LogActions** | `#log-rename-btn` / `#log-pin-btn` / `#log-rotate-btn` | rename / pin / rotate（New log） |
-| **Layout** | `.layout` | 两列网格：Sidebar + MainPanel，吃满 TopBar 以下高度 |
-| **Sidebar** | `aside.sidebar` | 左侧导航，三分区，**自带内部滚动** |
-| **SessionList** | `#sess-list` | 会话池现状（跨 run 存活的连接）+ 分栏勾选 |
-| **SplitToggle** | `#split-toggle` | Sessions 段头开关：主区单列 ⇄ 按 session 分栏 |
-| **SessionCheck** | `.sb-check` | 分栏模式下每条 SessionItem 的勾选标记 |
-| **ScriptList** / **ScriptItem** | `#scripts-list` / `li.sb-item` | 已发现脚本；条目右侧 RunAction |
-| **RunAction** | `button.sb-action.action-run` | `▶` enqueue，悬停显现 |
-| **RunList** / **RunItem** | `#runs-list` / `li.sb-item` | 当前查看日志组内的 run；含 StatusBadge |
-| **RunItemAction** | `button.sb-action` | 状态化：`.action-stop` / `.action-rerun` / `.action-stopping` |
-| **StatusBadge** | `.badge.status-*` | run 状态色块 |
-| **MainPanel** | `main.main-panel` | 主展示区，两态互斥 |
-| **MainToolbar** | `#main-toolbar` | 仅 Run detail 态出现 |
-| **BackToLiveButton** | `#back-to-live` | 切回常驻 LiveView |
-| **MainContextLabel** | `#main-context` | 当前在看哪个 run |
-| **LiveView** | `#live-root` | 活跃日志组实时尾部（`LiveTail` 实例） |
-| **LiveHeader** | `.run-header`（LiveView 内） | 日志名 + 行数/等待提示 |
-| **LiveBody** | `ol.live-body` | LiveView 的 PaneBody；追加式渲染，超 `LIVE_MAX_ROWS` 从头裁剪 |
-| **RunSeparator** | `li.run-separator` | 流内 run 边界标记，由 `workspace.run.begin/end` 元行驱动 |
-| **RunDetailView** | `#timeline-root` | 单 run 回放（`Timeline` 实例） |
-| **RunHeader** | `.run-header`（RunDetailView 内） | 脚本名 / run id / 状态 / 异常 |
-| **PlaybackToolbar** | `.timeline-toolbar` | Live·Play·Reset·Step·SpeedSelect·Scrubber·TimeLabel |
-| **PaneSet** | `.pane-set`（`.split` 为分栏态） | 日志行的落地容器；单列或按 session 多列 |
-| **Pane** / **PaneHeader** | `.pane` / `.pane-header` | 一列 = 一个 session；表头显示会话标签 |
-| **ScriptPane** | `.pane.pane-script` | 兜底列：脚本自身的 `user_log` 与 RunSeparator |
-| **PaneBody** / **TimelineBody** | `ol.timeline-body` | **内部滚动区**；每列各自滚动与 auto-scroll |
-| **LogRow** | `li.tl-row` | 一条记录：TsCell `.tl-ts` / EventCell `.tl-ev` / SessionCell `.tl-sid` / MsgCell `.tl-msg` |
+- **AppShell** (`body.app-shell`) — 视口锁定外壳：TopBar + Layout 两段
+  - **TopBar** (`header`) — 标题与全局日志控制，不参与滚动
+    - **BrandBlock** (`.header-left`) — 标题 + 一句话说明
+    - **LogSwitcher** (`#log-switcher`) — 当前日志组 + 切换/管理入口
+      - **LogCurrentButton** (`#log-current-btn`) — 显示当前日志名与 run 数，点开 LogDropdown
+      - **LogDropdown** (`#log-dropdown`) — 历史日志列表（★ pinned 靠前），含 discard
+      - **LogActions** (`#log-rename-btn` / `#log-pin-btn` / `#log-rotate-btn`) — rename / pin / rotate（New log）
+  - **Layout** (`.layout`) — 两列网格：Sidebar + MainPanel，吃满 TopBar 以下高度
+    - **Sidebar** (`aside.sidebar`) — 左侧导航，三分区，**自带内部滚动**
+      - **SessionList** (`#sess-list`) — 会话池现状（跨 run 存活的连接）+ 分栏勾选
+        - **SplitToggle** (`#split-toggle`) — Sessions 段头开关：主区单列 ⇄ 按 session 分栏
+        - **SessionCheck** (`.sb-check`) — 分栏模式下每条 SessionItem 的勾选标记
+      - **ScriptList** (`#scripts-list`) — 已发现脚本；条目右侧 RunAction
+        - **ScriptItem** (`li.sb-item`) — 单个脚本条目
+          - **RunAction** (`button.sb-action.action-run`) — ▶ enqueue，悬停显现
+      - **RunList** (`#runs-list`) — 当前查看日志组内的 run；含 StatusBadge
+        - **RunItem** (`li.sb-item`) — 单个 run 条目
+          - **RunItemAction** (`button.sb-action`) — 状态化操作
+            - `.action-stop` — 停止按钮
+            - `.action-rerun` — 重跑按钮
+            - `.action-stopping` — 停止中状态
+          - **StatusBadge** (`.badge.status-*`) — run 状态色块
+    - **MainPanel** (`main.main-panel`) — 主展示区，两态互斥
+      - **MainToolbar** (`#main-toolbar`) — 仅 Run detail 态出现
+        - **BackToLiveButton** (`#back-to-live`) — 切回常驻 LiveView
+        - **MainContextLabel** (`#main-context`) — 当前在看哪个 run
+      - **LiveView** (`#live-root`) — 活跃日志组实时尾部（`LiveTail` 实例）
+        - **LiveHeader** (`.run-header`) — 日志名 + 行数/等待提示；sync 锁定时显示 `synced @ HH:MM:SS`
+        - **PaneContent** (`.pane-content`) — PaneBody 与 ChronoRail 并排的一层
+        - **LiveBody** (`ol.live-body`) — LiveView 的 PaneBody；追加式渲染，超 `LIVE_MAX_ROWS` 从头裁剪
+        - **ChronoRail** (`.tl-chrono-rail`) — 每列右侧按事件密度归一化的时间轴（见下节）
+          - **Tick** (`.tl-tick`) — 一格 = 一个 anchor 事件；点击触发跨列 snap sync
+        - **SyncTargetRow** (`.tl-sync-target`) — snap sync 后本列命中的行，落在 viewport 40% 高度
+        - **RunSeparator** (`li.run-separator`) — 流内 run 边界标记，由 `workspace.run.begin/end` 元行驱动
+        - **CommandBar** (`.command-bar`) — 手动命令输入终端（固定在 LiveView 底部）
+          - **SessionSelect** (`#cmd-session-select`) — 下拉选择目标 session
+          - **CommandInput** (`#cmd-input`) — 命令输入框（Enter 执行，上/下浏览历史）
+          - **ExecuteButton** (`#cmd-send-btn`) — 执行按钮
+          - **HistoryButton** (`#cmd-history-btn`) — 历史下拉按钮
+      - **RunDetailView** (`#timeline-root`) — 单 run 回放（`Timeline` 实例）
+        - **RunHeader** (`.run-header`) — 脚本名 / run id / 状态 / 异常
+        - **PlaybackToolbar** (`.timeline-toolbar`) — Live·Play·Reset·Step·SpeedSelect·Scrubber·TimeLabel
+        - **PaneSet** (`.pane-set` / `.split`) — 日志行的落地容器；单列或按 session 多列
+          - **Pane** (`.pane`) — 一列 = 一个 session
+            - **PaneHeader** (`.pane-header`) — 表头显示会话标签
+            - **PaneBody** (`ol.timeline-body`) — **内部滚动区**；每列各自滚动与 auto-scroll
+              - **LogRow** (`li.tl-row`) — 一条记录
+                - **TsCell** (`.tl-ts`) — 时间戳
+                - **EventCell** (`.tl-ev`) — 事件类型
+                - **SessionCell** (`.tl-sid`) — 会话 ID
+                - **MsgCell** (`.tl-msg`) — 消息内容
+          - **ScriptPane** (`.pane.pane-script`) — 兜底列：脚本自身的 `user_log` 与 RunSeparator
 
 前端状态字段同样固定：`state.view`（`live` \| `run`）、`state.liveBuffer`（挂活跃日志）、`state.viewedLogId`（RunList 展示范围）、`state.currentRunId`（服务端在跑的 run，不抢主区）、`state.split`（`{enabled, sessionIds}`，持久化在 `localStorage["rpm.split"]`）。
 
@@ -1358,6 +1395,30 @@ Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.
 - **禁止**用 `calc(100vh - <常数>)` 顶掉 TopBar 高度——TopBar 高度随内容与换行变化，硬编码必然溢出；
 - 视口锁定规则**只挂在 `body.app-shell` 上**：`styles.css` 同时被静态 HTML 报告复用，报告页是普通的文档流滚动页面，不能被锁死；
 - LogRow 列宽随视口自适应（SessionCell 用 `clamp()` 收缩、窄窗口下整列隐藏）；`.tl-msg` 显式占位到消息列，避免无 `session_id` 的记录错位到 SessionCell。
+
+### ChronoRail：按事件密度归一化的时间轴 + 跨列同步
+
+LiveBody 每列右侧有一条窄轨 ChronoRail，解决"多个 session 各滚各的、想看同一时刻发生了什么只能靠肉眼对时间戳"的问题。
+
+**坐标系是事件密度而非真实时间**。tick 的 y 坐标 = 该 anchor 在**全局 anchor 序列**里的下标 / 总数（CDF 归一化），不是 `(ts - tMin) / (tMax - tMin)`。这样：
+
+- 长静默段（`sleep 300`）在 CDF 上几乎不推进，自动收缩成一条线，不占版面；
+- 突发段（一秒几百行）在 CDF 上陡增，自动被拉开，看得清；
+- 视觉密度天然贴合信息密度，与 LogRow gutter"只有 anchor 才填时间戳"是同一套取舍。
+
+**跨列对齐靠共享坐标系**。`LiveTail._anchorEvents` 是**所有列 anchor 的并集**（按 ts 有序，上限 `ANCHORS_MAX`，超出从头裁剪），所有列的 rail 都用这一份做 y 映射，所以同一个 ts 在每列 rail 上落在**同一高度**。每列 rail 只画属于自己的 tick 子集（`sessionId` 匹配，Script 兜底列收无 session 的），于是列间疏密差异如实反映各 session 的活跃度——这是要保留的信号，**不做**逐列归一化。
+
+**anchor 的判定与 gutter 时间戳同源**（`isAnchorEvent`）：`command_start` / `transfer_start` / `transfer_error` / `session_open` / `session_closed` / `session_error` / `command_error`，以及非 INFO 的 `command_end`。
+
+**snap sync**：点 rail 上任意一格 tick（或空白处，按 y 比例反解到最近 anchor）触发 `_syncToTs(ts)`——每列各自找 `data-ts` 最接近的行（`LogRow` / `RunSeparator` / 弱对齐 shadow marker 都带 `data-ts`），滚到各自 viewport 的 `SYNC_VIEWPORT_RATIO`（40%）高度并打 `.tl-sync-target` 高亮。40% 是"上方留够上下文、下方留够看接下来发生什么"的折中。
+
+**锁定与解除**：sync 后所有列 `userScrolled = true`，tail 冻结（否则新记录一到就把对齐位置顶走），LiveHeader 显示 `synced @ HH:MM:SS`。任意一列滚回底部、或 `scrollToEnd()` / 换日志组，锁定解除、恢复 tail。
+
+**实现约束**：
+
+- rail 是 `LiveTail` 专属（`PaneSet` 的 `rail: true` 选项）。Run detail 已有 playhead + Scrubber，不建第二根时间轴，其 pane DOM 不受影响；
+- 增量维护：数据侧只有"尾部追加 anchor"与"头部裁剪"两种 mutation；渲染侧按 y 像素**分桶**（一个像素桶只留严重度最高的那条），DOM 节点数被钉在 rail 高度量级、与 anchor 总数无关，因此全量重排也很便宜。重绘走 `requestAnimationFrame` 合并，窗口 resize 走防抖重排；
+- 重放兼容：分栏新增列时 `setPanes` 会重放 buffer，`_recordAnchor` 按 `(ts, sessionId)` 去重，anchor 不会翻倍。
 
 ### Web UI
 
@@ -1379,6 +1440,9 @@ Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.
   - `POST /api/runs/{rid}/rerun`：`Workspace.rerun(rid)`，返回新 `run_id`；
   - `DELETE /api/runs/{rid}`：`Workspace.cancel_run(rid)`，仅对 queued 有效；
   - `POST /api/runs/stop`：`Workspace.stop_current()`（不带 rid 的旧入口，保留）；
+  - `POST /api/commands`：执行手动命令，通过 WebSocket 流式推送输出；
+  - `GET /api/commands/history`：获取命令历史；
+  - `DELETE /api/commands/history`：清空命令历史；
   - `GET /api/logs`｜`/api/logs/current`｜`/api/logs/{lid}`｜`/api/logs/{lid}/runs`｜`/api/logs/{lid}/runs/{rid}/records`；
   - `PATCH /api/logs/{lid}`（rename）｜`POST /api/logs/rotate`｜`POST /api/logs/{lid}/pin`｜`DELETE /api/logs/{lid}`；
   - `WS /ws`：多路复用 sessions / runs / log 变更 / 活跃日志的记录增量；
@@ -1421,13 +1485,14 @@ Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.
 12. 会话关闭后仍可读取已收集的日志。
 13. `with rpm.script(dump_on_error=...)`：块内未处理异常时按配置自动落盘（含标准 `logging` 与所有登记 session 的日志）；正常退出不落盘；落盘失败不掩盖原异常。
 14. `rpm.discover(root)` 能返回目录内所有 `rpm_*.py` 的 `ScriptCard` 元数据；纯 AST 分析，不 import；语法错误文件不使整个函数崩溃。
-15. 设置 `REDPYMAKE_LIVE_SINK=file://...` 后，`ScriptRun` 在生命周期内把每条 `SessionLogRecord` 追加到目标 NDJSON；首尾各有 `script.begin` / `script.end` 元行；异常路径 `script.end.exception` 非空。
+15. 设置 `REDPYMAKE_LIVE_SINK=file://...` 后，`ScriptRun` 在生命周期内把每条 `SessionLogRecord` 追加到目标 NDJSON；首尾各有 `script.begin` / `script.end` 元行；异常路径 `script.end.exception` 非空；同时按 `session_id` 镜像一份到同目录 `sessions/<slug>.ndjson`（无 `session_id` 的行进 `__script__.ndjson`），主文件内容不因分文件而改变。
 16. `rpm.workspace(root)` 能串行运行多个脚本，脚本代码中的 `rpm.wsl()` / `rpm.ssh(...)` 等在 workspace 作用域内自动借出共享会话（无需修改脚本源码）；`__exit__` 关闭所有会话；模块每次 `▶` 自动 reload。
-17. `Workspace` 具备**日志组**：**一份日志 = 一份 `stream.ndjson`**，该日志下所有 run 的记录顺序追加进同一文件（不做 per-run 分片）；run 摘要从 `workspace.run.begin/end` 元行重建，孤立 begin 重建为 `interrupted`；用户可 rename / rotate / pin / discard；重开 workspace 时自动恢复上次活跃日志 + 其历史 runs（`serve` 的启动语义见第 20 条）；rotate 遇到 running run 时拒绝并给出明确错误。
+17. `Workspace` 具备**日志组**：**一份日志 = 一份 `stream.ndjson`**，该日志下所有 run 的记录顺序追加进同一文件（不做 per-run 分片），并旁路镜像出 `sessions/<slug>.ndjson` 供按会话查看；run 摘要从 `workspace.run.begin/end` 元行重建，孤立 begin 重建为 `interrupted`；用户可 rename / rotate / pin / discard；重开 workspace 时自动恢复上次活跃日志 + 其历史 runs（`serve` 的启动语义见第 20 条）；rotate 遇到 running run 时拒绝并给出明确错误。
 18. Web UI 主区分 **Live tail** 与 **Run detail** 两态：live buffer 挂钩**活跃日志**跨 run 持续累积，切去看历史 run 不打断 live，可随时切回并看到完整尾部；Sidebar Runs 每条按状态自动呈现 `⏹`（queued/running）或 `⟳`（终态）操作按钮；`stop_current` 是尽力而为的协作式取消（下一条命令边界生效，不强杀在跑的子进程）。
 19. Web UI 页面吃满视口、**无文档级滚动条**：`body.app-shell` 锁 `100vh`，滚动只出现在 Sidebar / LiveBody / TimelineBody 三个内部容器；样式表不含 `calc(100vh - <常数>)` 式的 TopBar 高度硬编码；视口锁定只作用于 `body.app-shell`，静态 HTML 报告页保持普通文档流；隐藏态的 RunDetailView 不占位（ID 选择器不得盖过 `.panel-view[hidden]`），LiveView 独占 MainPanel 全高。
 20. `redpymake serve` 每次启动另起一份活跃日志（上一份 `run_count == 0` 时复用），旧日志留在 `list_logs()` 与 LogDropdown 里可回看；`--resume-log` 续用上次；`rpm.workspace(root)` 默认行为不变。
 21. Web UI 支持按 session 分栏：SplitToggle 开启后 SessionList 的勾选项各占一列，脚本自身日志与 RunSeparator 进 ScriptPane；Live 与 Run detail 两态都可分栏，且回放时多列共享**同一个**播放头；勾选持久化到 `localStorage`。
+22. LiveBody 每列右侧有 ChronoRail：tick 的 y 按**全局 anchor 序列的排名 / 总数**（CDF）定位而非真实时间比例，长静默自动收缩、突发段自动展开；所有列共用同一份全局 anchor 表，同一个 ts 在各列落在同一高度；点任意 tick 触发跨列 snap sync，各列滚到最接近该 ts 的行并对齐到 viewport 40% 高度，其间 tail 冻结、LiveHeader 提示锁定点，滚回底部即恢复。Run detail 不建 rail（已有 playhead）。
 
 ---
 
@@ -1464,9 +1529,10 @@ Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.
 | Web 技术栈 | FastAPI + Jinja2 SSR + htmx + alpine.js + WebSocket；无前端构建链；资源内联入 wheel |
 | Workspace 日志组 | 一份 workspace 恒有一个活跃日志；用户可 rename / rotate（=清空）/ pin / discard；跨 `serve` 实例自动恢复；`redpymake run`（CLI 独立子进程）不走这套 |
 | 日志存储粒度 | **一份日志 = 一份 `stream.ndjson`**（该 log 下所有 run 顺序追加进同一文件）；**不做** per-run / per-script 分片；一份日志即一个自包含可 `report` 的 NDJSON |
-| 日志目录布局 | `<logs_root>/<log_id>/{meta.json, stream.ndjson}`；活跃日志由 `_active.json` 指定；无 `runs.index.jsonl`、无 `runs/` 子目录 |
+| 日志目录布局 | `<logs_root>/<log_id>/{meta.json, stream.ndjson, sessions/}`；活跃日志由 `_active.json` 指定；无 `runs.index.jsonl`、无 `runs/` 子目录 |
+| 按 session 分文件 | `sessions/<slug>.ndjson` 是 sink 的**旁路镜像**，只写不读；`stream.ndjson` 始终是权威合并流；无 `session_id` 的行进 `__script__.ndjson`；文件名对 `session_id` 做安全化 + 冲突时加 sha1 短后缀 |
 | Run 摘要来源 | 不单独持久化；从 stream 里的 `workspace.run.begin` / `workspace.run.end` 元行配对重建；孤立 begin → `status="interrupted"` |
-| run 边界元行归属 | CORE-10 sink 不改（继续写 `script.begin/end`）；`workspace.run.begin/end` 由 Workspace 在 sink 外侧追写，携带 `run_id` 等 workspace 专属元数据 |
+| run 边界元行归属 | CORE-10 sink 写 `script.begin/end`；`workspace.run.begin/end` 由 Workspace 在 sink 外侧追写，携带 `run_id` 等 workspace 专属元数据；两类元行都无 `session_id`，镜像时一并进 `sessions/__script__.ndjson` |
 | Rotate 冲突处理 | 有 run 在跑时 `rotate_log` 拒绝并抛 `RuntimeError`；UI 提示用户等或终止；后续版本考虑排队式 rotate |
 | Stop 语义 | 协作式尽力而为：设标志 + 借出会话在 `run()`/`wait()` 边界抛 `WorkspaceStoppedError`；**不强杀**在跑的子进程；run 终态覆盖为 `cancelled` |
 | Web UI 主区 | 两态：Live tail（挂钩活跃日志、跨 run 持续、可随时切回）与 Run detail（单 run 回放，含 playback 控件）；主区只展示不操作 |
@@ -1475,6 +1541,8 @@ Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.
 | Web UI 页面滚动 | 视口锁定：`body.app-shell` 占满 `100vh` 不滚动，滚动条只在 Sidebar / LiveBody / TimelineBody 内部；禁止 `calc(100vh - 常数)` |
 | serve 启动日志 | 每次 `serve` 另起一份活跃日志（上一份为空则复用），`--resume-log` 续用；库内 `rpm.workspace()` 默认仍续用上次 |
 | 多 session 查看 | 按 session 分栏，列定义走 PaneSet；Live 与 Run detail 都支持，回放共享单一播放时钟；脚本自身日志进 ScriptPane |
+| LiveBody 时间轴 | ChronoRail 按**事件密度 CDF**定位 tick（非真实时间比例），空档自动收缩、突发自动展开；全局 anchor 表跨列共享 → 同 ts 同 y；列间疏密差异保留为活跃度信号，不做逐列归一化 |
+| 跨列时间同步 | 点 ChronoRail 的 tick 做 snap sync：各列滚到最接近该 ts 的行、对齐 viewport 40%；同步期间冻结 tail，滚回底部恢复。**不做**持续拖动跟随（反馈环 + 稀疏列抖动） |
 
 ---
 
