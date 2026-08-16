@@ -377,6 +377,17 @@ body:not(.app-shell) #timeline-root {
   min-width: 120px;
   overflow: hidden;
 }
+/* body 与 ChronoRail 并排的一层。单列时它直接坐在 .pane-set 下，分栏时坐在
+   .pane 下（PaneHeader 之后）；没开 rail 的 PaneSet（Run detail）里它只包着
+   body 一个孩子，布局上是透明的。 */
+.pane-content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.pane-content > .timeline-body { min-width: 0; }
 
 /* Split.js 注入的分隔条 */
 .pane-set.split > .gutter {
@@ -477,13 +488,146 @@ body:not(.app-shell) #timeline-root {
 .run-separator.status-cancelled,
 .run-separator.status-interrupted { color: var(--warn); }
 
+/* -------------------- LiveBody 双列布局 -------------------- */
+/*
+ * LiveBody 每行都是 [gutter | msg] 两列固定：
+ * - gutter 是 62px 固定宽的"参照线"栏，锚点事件才填时间；空 gutter 仍占位，
+ *   保证消息起点在整列（乃至分栏时的多列间）严格竖直对齐；
+ * - Timeline (Run detail) 组件的 4-column grid 布局与之互不干扰——那边不加
+ *   .live-body 类，规则不落到它头上。
+ */
+.live-body .tl-row {
+  display: flex;
+  align-items: baseline;
+  padding: 2px 0;
+}
+.live-body .tl-gutter {
+  flex: 0 0 62px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 11px;
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.live-body .tl-row.ev-anchor .tl-gutter {
+  color: var(--accent);
+  opacity: 1;
+}
+.live-body .tl-msg {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+
 /* 手动 CommandBar 通道的行 —— 与脚本流交织，靠左侧竖线 + 淡色背景区分谁敲的。
-   record 从 pushLive(rec, null) 进来时 __rid 缺失，_nodeForRecord 会打上 ev-manual。 */
+   record 从 pushLive(rec, null) 进来时 __rid 缺失，_nodeForRecord 会打上 ev-manual。
+   左竖线套在 flex 行外侧，不侵占 gutter 宽度，跨行的消息起点仍然对齐。 */
 .tl-row.ev-manual {
   background: rgba(127, 219, 255, 0.06);
   border-left: 2px solid var(--accent);
   padding-left: 8px;
 }
+.live-body .tl-row.ev-manual { padding-left: 6px; }
+.live-body .tl-row.ev-manual .tl-gutter { flex-basis: 54px; }
+
+/* 分栏"弱对齐"：另一列的锚点会在本列投影一条 tl-shadow marker。视觉上是一条
+   贴着 gutter 时间起、向右延伸的浅虚线，让眼睛能沿虚线横穿多列找同一时刻。
+   仅出现在分栏视图；单列时 _broadcastAnchor 直接不广播。 */
+.live-body .tl-shadow {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  padding: 1px 0;
+  font-size: 10px;
+  opacity: 0.55;
+}
+.live-body .tl-shadow .tl-gutter {
+  flex: 0 0 62px;
+  color: var(--accent);
+  opacity: 0.85;
+}
+.live-body .tl-shadow-hint {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-style: italic;
+  white-space: nowrap;
+  margin-right: 6px;
+}
+.live-body .tl-shadow::after {
+  content: "";
+  flex: 1;
+  border-top: 1px dotted rgba(127, 219, 255, 0.22);
+}
+
+/* 长静默折叠：相邻 record 时间差 >= IDLE_GAP_THRESHOLD 时插一条，视觉上
+   借用 run-separator 的骨架但更弱、只有虚线，不与 workspace.run 分隔条混淆。 */
+.idle-gap {
+  list-style: none;
+  padding: 3px 0;
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0.6;
+}
+.idle-gap::before,
+.idle-gap::after {
+  content: "";
+  flex: 1;
+  height: 0;
+  border-top: 1px dashed rgba(136, 146, 162, 0.35);
+}
+.idle-gap-text { white-space: nowrap; }
+
+/* -------------------- ChronoRail（按事件密度归一化的时间轴） -------------------- */
+/*
+ * 每列 LiveBody 右侧一条窄轨，每个 anchor 事件画一格 tick。tick 的 y 不是
+ * "真实时间比例"而是"该 anchor 在全局 anchors 里的排名 / 总数"（CDF）——
+ * 长空档自动收缩、突发段自动展开，视觉密度贴合信息密度。
+ *
+ * 所有列共用同一份全局 anchors 做 y 映射，所以同一个 ts 在每列 rail 上落在
+ * 同一高度；点任意一格触发跨列 snap sync（见 LiveTail._syncToTs）。
+ */
+.tl-chrono-rail {
+  flex: 0 0 10px;
+  position: relative;
+  background: var(--panel-alt);
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+  overflow: hidden;
+}
+.tl-chrono-rail:hover { background: #232935; }
+.tl-tick {
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--info);
+  opacity: 0.5;
+}
+.tl-tick.lvl-warn { background: var(--warn); opacity: 0.85; }
+.tl-tick.lvl-err { background: var(--err); opacity: 0.95; }
+.tl-tick.lvl-debug { background: var(--debug); opacity: 0.35; }
+.tl-tick:hover {
+  left: 0;
+  right: 0;
+  height: 3px;
+  opacity: 1;
+}
+
+/* snap sync 命中的行：每列各一条，标出"这一列在那个时刻停在哪儿"。
+   竖线宽度与 ev-manual 一致，靠背景色区分，不挤动 gutter 对齐。 */
+.tl-sync-target {
+  background: rgba(127, 219, 255, 0.12);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.run-status.synced { color: var(--accent); }
 
 /* -------------------- 状态徽章 -------------------- */
 .badge {

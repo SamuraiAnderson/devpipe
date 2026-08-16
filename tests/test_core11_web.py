@@ -7,6 +7,8 @@
                                       → test_hidden_panel_view_does_not_take_space
     §CORE-11/web/split                → test_static_styles_define_split_panes
                                       → test_timeline_js_exposes_paneset
+    §CORE-11/web/live-rail            → test_livebody_has_chrono_rail_styles
+                                      → test_livetail_js_exposes_cdf_sync_api
     §CORE-11/web/api/scripts          → test_web_api_scripts_returns_cards
     §CORE-11/web/api/sessions         → test_web_api_sessions_returns_pool
     §CORE-11/web/api/runs             → test_web_api_runs_reflects_workspace
@@ -151,6 +153,36 @@ def test_timeline_js_exposes_paneset(web_app):
     # 两态都能换列；Timeline 换列不重建实例 → 播放头只有一个
     assert "Timeline.prototype.setPanes" in js
     assert "LiveTail.prototype.setPanes" in js
+
+
+def test_livebody_has_chrono_rail_styles(web_app):
+    """§CORE-11/web/live-rail：LiveBody 每列有 ChronoRail、tick 与 sync 命中行样式。"""
+    client, _ws = web_app
+    css = client.get("/static/styles.css").text
+    for selector in (".pane-content", ".tl-chrono-rail", ".tl-tick", ".tl-sync-target"):
+        assert selector in css, f"缺少 ChronoRail 样式 {selector}"
+    # tick 靠绝对定位摆 y；rail 必须是它的定位上下文，否则全挤到页面左上角
+    rail_block = css.split(".tl-chrono-rail {", 1)[1].split("}", 1)[0]
+    assert "position: relative" in rail_block
+
+
+def test_livetail_js_exposes_cdf_sync_api(web_app):
+    """§CORE-11/web/live-rail：LiveTail 暴露 CDF rail 与跨列 snap sync 的入口。"""
+    client, _ws = web_app
+    js = client.get("/static/timeline.js").text
+    for token in (
+        "_anchorEvents",           # 全局有序 anchor 表：rail y 与 sync 的唯一坐标系
+        "_recordAnchor",
+        "_redrawRails",
+        "_syncToTs",
+        "_nearestRowByTs",
+        "SYNC_VIEWPORT_RATIO",
+        "ANCHORS_MAX",
+        "tl-chrono-rail",
+    ):
+        assert token in js, f"缺少 ChronoRail 符号 {token}"
+    # rail 只给 LiveTail 开；Run detail 已经有 playhead，不建第二根时间轴
+    assert "rail: true" in js
 
 
 def test_css_logrow_uses_clamp_for_responsive_sessioncell(web_app):

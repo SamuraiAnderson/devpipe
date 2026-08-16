@@ -64,6 +64,38 @@
     return "lvl-info";
   }
 
+  // ChronoRail 一个像素桶里挤了多条 anchor 时，留严重度最高的那条上色
+  function _levelRank(level) {
+    if (level === "ERROR" || level === "CRITICAL") return 3;
+    if (level === "WARNING") return 2;
+    if (level === "DEBUG") return 0;
+    return 1;
+  }
+
+  // sorted-by-ts 数组里找 ts 的插入位（左边界）。ChronoRail 的 CDF 归一化与
+  // _recordAnchor 的有序插入都靠它。
+  function _bisectTs(arr, ts) {
+    var lo = 0, hi = arr.length;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (arr[mid].ts < ts) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  function _debounce(fn, wait) {
+    var token = null;
+    return function () {
+      var self = this, args = arguments;
+      if (token) clearTimeout(token);
+      token = setTimeout(function () {
+        token = null;
+        fn.apply(self, args);
+      }, wait);
+    };
+  }
+
   // ---------- PaneSet ----------
   //
   // 日志行的落地容器。单列时就是今天那个 ol.timeline-body；分栏时按
@@ -78,6 +110,9 @@
     this.container = container;
     this.maxRows = (options && options.maxRows) || 0;
     this.bodyClass = (options && options.bodyClass) || "";
+    // rail 是 LiveTail 专属：Run detail 已经有 playhead + scrubber，不需要第二根
+    // 时间轴。不开这个开关时 pane DOM 与从前逐字节一致。
+    this.withRail = !!(options && options.rail);
     this.panes = [];
     this.byId = {};
     this.fallback = null;
@@ -85,6 +120,9 @@
     this._savedWidths = null;   // { paneId: percent }，宿主没接桥时的本地兜底
     this.onLoadWidths = null;   // 取宽度偏好；见 bindPaneWidths
     this.onResize = null;       // 拖动结束时回调，宿主拿去持久化
+    this.onRailClick = null;    // rail 上点出一个 ts 时回调宿主；见 LiveTail._syncToTs
+    this.onRailResolveFraction = null;  // rail 空白处按 y 比例反解 ts
+    this.onPaneNearBottom = null;       // 某列滚回底部；宿主用来解除 sync 锁定
     this.setPanes([]);
   }
 
@@ -127,14 +165,55 @@
   }
 
   PaneSet.prototype._makeBody = function () {
+    var self = this;
     var cls = "timeline-body" + (this.bodyClass ? " " + this.bodyClass : "");
     var body = el("ol", { className: cls }, []);
-    var pane = { id: null, body: body, wrap: null, header: null, userScrolled: false };
+    // lastTs：该列上一条 record 的时间戳，LiveTail 用它判定静默空档；
+    // lastAnchorSec：本列上一次填 gutter 的秒粒度，用来做"同秒只显一次"去重。
+    // 两个字段都每列独立，分栏时互不干扰
+    var pane = {
+      id: null, body: body, wrap: null, header: null,
+      userScrolled: false, lastTs: undefined, lastAnchorSec: undefined,
+      rail: null, content: null,
+      railTicks: {},   // yPx -> tick DOM 节点；见 LiveTail._redrawRails
+    };
     body.addEventListener("scroll", function () {
       var near = (body.scrollTop + body.clientHeight) >= (body.scrollHeight - 8);
       pane.userScrolled = !near;
+      // 滚回底部 = "我要继续追 tail 了"，宿主据此解除 snap sync 锁定
+      if (near && typeof self.onPaneNearBottom === "function") self.onPaneNearBottom(pane);
     });
+
+    // 内容区：单列与分栏共用同一层结构，body 吃满、rail 定宽贴右
+    var kids = [body];
+    if (this.withRail) {
+      pane.rail = el("div", { className: "tl-chrono-rail" }, []);
+      pane.rail.addEventListener("click", function (e) {
+        if (typeof self.onRailClick !== "function") return;
+        var ts = self._tsFromRailEvent(pane, e);
+        if (ts !== null) self.onRailClick(ts, pane);
+      });
+      kids.push(pane.rail);
+    }
+    pane.content = el("div", { className: "pane-content" }, kids);
     return pane;
+  };
+
+  // 点在 tick 上就用那条 tick 的 ts；点在空白处按 y 的比例反解——rail 是 CDF
+  // 归一化的，所以 y 比例直接就是"第几个 anchor"，宿主给的 resolver 负责换成 ts。
+  PaneSet.prototype._tsFromRailEvent = function (pane, e) {
+    var tick = e.target && e.target.classList && e.target.classList.contains("tl-tick")
+      ? e.target
+      : null;
+    if (tick) {
+      var raw = parseFloat(tick.getAttribute("data-ts"));
+      return isNaN(raw) ? null : raw;
+    }
+    if (typeof this.onRailResolveFraction !== "function") return null;
+    var rect = pane.rail.getBoundingClientRect();
+    if (!rect.height) return null;
+    var frac = (e.clientY - rect.top) / rect.height;
+    return this.onRailResolveFraction(Math.max(0, Math.min(1, frac)));
   };
 
   // defs: [] / null → 单列；否则每个 {id, label} 一列，外加一个 Script 兜底列。
@@ -161,7 +240,7 @@
       if (!this.panes.length) {
         var only = this._makeBody();
         only.id = null;
-        this.container.appendChild(only.body);
+        this.container.appendChild(only.content);
         this.panes = [only];
         this.fallback = only;
       }
@@ -216,7 +295,7 @@
       pane.wrap = el("div", {
         className: "pane" + (def.id === SCRIPT_PANE_ID ? " pane-script" : ""),
       }, [pane.header]);
-      pane.wrap.appendChild(pane.body);
+      pane.wrap.appendChild(pane.content);
       self.byId[def.id] = pane;
       added.push(def.id);
     });
@@ -281,7 +360,15 @@
   };
 
   PaneSet.prototype.clear = function () {
-    this.panes.forEach(function (p) { p.body.innerHTML = ""; });
+    this.panes.forEach(function (p) {
+      p.body.innerHTML = "";
+      p.lastTs = undefined;
+      p.lastAnchorSec = undefined;
+      if (p.rail) {
+        p.rail.innerHTML = "";
+        p.railTicks = {};
+      }
+    });
   };
 
   // 只推没被用户滚离底部的列
@@ -664,6 +751,59 @@
 
   var LIVE_MAX_ROWS = 4000; // DOM 行数上限；超出从头部裁剪，避免长时间挂机吃内存
 
+  // ChronoRail：每列右侧一条按事件密度归一化的时间轴。tick 的 y 不是"真实时间
+  // 比例"而是"该 anchor 在全局 anchors 里的排名 / 总数"（CDF）——空档段自动收缩、
+  // 突发段自动展开。所有列共用同一份 _anchorEvents 做 y 映射，所以同一个 ts 在
+  // 每列 rail 上落在同一 y，跨列对齐是免费的。
+  var ANCHORS_MAX = 10000;         // 全局 anchor 上限；超出从头裁剪
+  var SYNC_VIEWPORT_RATIO = 0.4;   // snap sync 后目标行落在各列 viewport 的 40% 高度
+  var RAIL_RESIZE_DEBOUNCE = 120;  // 窗口 resize 后重排 tick 的防抖窗口（ms）
+
+  // 时间刻度贴着事件走：只有"高信号、低频"的事件才配时间戳浮标，稀疏段刻度
+  // 稀、密集段刻度密，视觉密度自然贴合信息密度。
+  var IDLE_GAP_THRESHOLD = 5.0;   // 秒；相邻 record 时间差 >= 这个值就插分隔条
+  var ANCHOR_EVENTS = {
+    "command_start": 1,
+    "transfer_start": 1,
+    "transfer_error": 1,
+    "session_open": 1,
+    "session_closed": 1,
+    "session_error": 1,
+    "command_error": 1,
+  };
+
+  // 成功的 command_end 压根不渲染（见 append），失败/超时的那些算锚点
+  function isAnchorEvent(r) {
+    if (!r || !r.event) return false;
+    if (ANCHOR_EVENTS[r.event]) return true;
+    return r.event === "command_end" && r.level !== "INFO";
+  }
+
+  function fmtWallShort(ts) {
+    var d = new Date(ts * 1000);
+    var pad = function (n) { return n < 10 ? "0" + n : String(n); };
+    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+
+  function fmtIdle(dt) {
+    if (dt < 60) return dt.toFixed(dt < 10 ? 1 : 0) + "s";
+    if (dt < 3600) return Math.floor(dt / 60) + "m" + Math.round(dt % 60) + "s";
+    var h = Math.floor(dt / 3600);
+    return h + "h" + Math.round((dt - h * 3600) / 60) + "m";
+  }
+
+  // 在 test shim 下 querySelector 可能没有；先看直接子节点，再回退 querySelector
+  function _findGutter(node) {
+    if (!node || !node.children) return null;
+    for (var i = 0; i < node.children.length; i++) {
+      var c = node.children[i];
+      if (c && c.className === "tl-gutter") return c;
+    }
+    return (typeof node.querySelector === "function")
+      ? node.querySelector(".tl-gutter")
+      : null;
+  }
+
   function LiveTail(root) {
     this.root = root;
     this.logName = "";
@@ -672,6 +812,11 @@
     this._paneFilter = null;     // 非空时只往这些列补行（分栏新增列的 buffer 重放）
     this._nodes = {};
     this.paneSet = null;
+    // ChronoRail 状态：_anchorEvents 是所有列 anchor 的并集（按 ts 有序），
+    // 全局共享，是 rail y 映射与跨列 sync 的唯一坐标系来源。
+    this._anchorEvents = [];
+    this._syncedTs = null;       // 非 null 表示处于 snap sync 锁定态（tail 已冻结）
+    this._railRaf = null;
     this._buildDom();
   }
 
@@ -717,11 +862,29 @@
     this.root.appendChild(paneWrap);
     this.root.appendChild(commandBar);
 
+    var self = this;
     this.paneSet = new PaneSet(paneWrap, {
       maxRows: LIVE_MAX_ROWS,
       bodyClass: "live-body",
+      rail: true,
     });
     bindPaneWidths(this.paneSet);
+    this.paneSet.onRailClick = function (ts) { self._syncToTs(ts); };
+    // rail 是 CDF 归一化的：y 比例就是"第几个 anchor"，直接查表即可
+    this.paneSet.onRailResolveFraction = function (frac) {
+      var n = self._anchorEvents.length;
+      if (!n) return null;
+      var i = Math.max(0, Math.min(n - 1, Math.floor(frac * n)));
+      return self._anchorEvents[i].ts;
+    };
+    this.paneSet.onPaneNearBottom = function () {
+      if (self._syncedTs === null) return;
+      self._clearSync();
+      self._updateHeader();
+    };
+    this._onWindowResize = _debounce(function () { self._redrawRails(); }, RAIL_RESIZE_DEBOUNCE);
+    window.addEventListener("resize", this._onWindowResize);
+
     this._nodes = {
       header: header,
       title: title,
@@ -740,6 +903,10 @@
   LiveTail.prototype.setPanes = function (defs, records) {
     var diff = this.paneSet.setPanes(defs);
     if (!diff.added.length) return;
+
+    // 新列的 rail 是空的，而重放走的 anchor 会被 _recordAnchor 去重挡掉、
+    // 不会自己触发重绘——这里显式补一次，把已有 anchor 摊到新列 rail 上
+    this._scheduleRailRedraw();
 
     var filter = {};
     diff.added.forEach(function (id) { filter[id] = true; });
@@ -767,6 +934,9 @@
   LiveTail.prototype.clear = function () {
     this.count = 0;
     this._runStarts = {};
+    // rail 的坐标系挂在这一份日志上，换组就得整根丢掉重建
+    this._anchorEvents = [];
+    this._syncedTs = null;
     this.paneSet.clear();
     this.paneSet.scrollToEnd();
     this._updateHeader();
@@ -794,7 +964,7 @@
 
     if (r.event === "workspace.run.begin") {
       if (r.run_id) this._runStarts[r.run_id] = r.started_at || r.timestamp;
-      this._appendNode(this._separatorNode(
+      this._appendRow(r, this._separatorNode(
         "▶ " + (r.script_name || r.run_id || "run") + " · " + (r.run_id || ""),
         "sep-begin"
       ), null);
@@ -809,50 +979,300 @@
     }
 
     this.count += 1;
-    this._appendNode(this._nodeForRecord(r), r.session_id);
+    this._appendRow(r, this._nodeForRecord(r), r.session_id);
     this._updateHeader();
   };
 
+  // 落地路径：列定位 → 重放过滤 → 静默检测 → gutter 填充 → append → 弱对齐广播。
+  //
+  // 过滤语义：
+  //   - `_paneFilter` 只影响"写入哪些列"，不影响状态推进。原因见 setPanes 里
+  //     的说明——重放时老列 DOM 不能翻倍，但老列的 pane.lastTs / lastAnchorSec
+  //     还是要跟着走，否则重放完了新列一进来就会因为老列 lastTs 陈旧而误判空档。
+  //   - 弱对齐广播尊重同一份 filter：老列自己已经有历史，无需重复投影 shadow。
+  LiveTail.prototype._appendRow = function (r, node, sessionId) {
+    // sessionId 为空（run 分隔条、脚本自身日志）→ 落 Script 兜底列
+    var pane = this.paneSet.paneFor(sessionId);
+    if (!pane) return;
+    var proceedTarget = !this._paneFilter || !!this._paneFilter[pane.id];
+
+    var ts = (r && typeof r.timestamp === "number") ? r.timestamp : null;
+    var anchor = ts !== null && isAnchorEvent(r);
+    // data-ts 是 snap sync 的寻址依据：_nearestRowByTs 只认带它的行
+    if (ts !== null) node.setAttribute("data-ts", ts);
+
+    if (proceedTarget) {
+      // 静默折叠：先判"上一条是啥时候"，别被本条更新 lastTs 提前污染
+      if (ts !== null && pane.lastTs !== undefined && (ts - pane.lastTs) >= IDLE_GAP_THRESHOLD) {
+        this.paneSet.append(sessionId, this._idleGapNode(ts - pane.lastTs));
+      }
+      // gutter：只锚点行填时间；同秒之内的多个锚点只显第一个
+      if (anchor) {
+        var sec = Math.floor(ts);
+        if (sec !== pane.lastAnchorSec) {
+          var gutter = _findGutter(node);
+          if (gutter) gutter.textContent = fmtWallShort(ts);
+        }
+      }
+      this.paneSet.append(sessionId, node);
+      this.paneSet.autoScroll();
+    }
+
+    // 状态永远推进（含被过滤的老列）：pane 是那一路 session 的时间地形，
+    // 与"这一次是否写 DOM"无关
+    if (ts !== null) pane.lastTs = ts;
+    if (anchor) pane.lastAnchorSec = Math.floor(ts);
+
+    // ChronoRail 的坐标系同样与 filter 无关：_anchorEvents 是全局并集，
+    // 重放老列时靠 _recordAnchor 内部去重挡住重复登记
+    if (anchor) this._recordAnchor(ts, sessionId || null, r.level);
+
+    // 弱对齐：任意列出现锚点，向其它列广播一条 shadow marker。
+    // 单列时 paneFor 只有一个 pane，自然不会有别的列可广播——跳过即可。
+    if (anchor && this.paneSet.isSplit()) {
+      this._broadcastAnchor(ts, pane, r);
+    }
+  };
+
+  // 把一个 anchor 登记进全局有序表。重放 buffer 时同一条 record 会二次经过
+  // _appendRow，靠 (ts, sessionId) 去重——同 ts 同 session 只算一次。
+  LiveTail.prototype._recordAnchor = function (ts, sessionId, level) {
+    var events = this._anchorEvents;
+    var idx = _bisectTs(events, ts);
+    for (var i = idx; i < events.length && events[i].ts === ts; i++) {
+      if (events[i].sessionId === sessionId) return;
+    }
+    events.splice(idx, 0, { ts: ts, sessionId: sessionId, level: level || "INFO" });
+    while (events.length > ANCHORS_MAX) events.shift();
+    this._scheduleRailRedraw();
+  };
+
+  LiveTail.prototype._scheduleRailRedraw = function () {
+    if (this._railRaf) return;
+    var self = this;
+    var raf = (typeof window !== "undefined" && window.requestAnimationFrame)
+      ? window.requestAnimationFrame.bind(window)
+      : function (fn) { return setTimeout(fn, 16); };
+    this._railRaf = raf(function () {
+      self._railRaf = null;
+      self._redrawRails();
+    });
+  };
+
+  // 每条 anchor 的 y = 它在全局 _anchorEvents 里的下标 / 总数（CDF 归一化）：
+  // 空档段自动收缩、突发段自动展开，且所有列共用同一映射 → 同 ts 同 y。
+  //
+  // tick 按 y 像素分桶：rail 只有几百像素高，超出这个数的刻度画上去也是互相
+  // 覆盖。分桶把 DOM 节点数钉死在 railHeight 量级（与 anchor 总数无关），
+  // 于是"每帧全量重排"也很便宜——同一个桶里保留严重度最高的那条。
+  LiveTail.prototype._redrawRails = function () {
+    var events = this._anchorEvents;
+    var n = events.length;
+    var panes = this.paneSet.panes;
+    var isSplit = this.paneSet.isSplit();
+
+    // 先给每列备好桶，同时建 sessionId → 列的派发表。没 rail、没高度（隐藏态）
+    // 或压根没 anchor 的列直接清空退出，不参与下面的扫描。
+    var targets = [];
+    var byId = {};
+    var scriptTarget = null;
+    var soloTarget = null;
+    for (var pi = 0; pi < panes.length; pi++) {
+      var pane = panes[pi];
+      if (!pane.rail) continue;
+      var railH = pane.rail.clientHeight;
+      if (!n || !railH) {
+        if (pane.rail.childElementCount) pane.rail.innerHTML = "";
+        pane.railTicks = {};
+        continue;
+      }
+      var t = { pane: pane, span: railH - 2, buckets: {} };
+      targets.push(t);
+      if (!isSplit) soloTarget = t;                        // 单列吃全部 anchor
+      else if (pane.id === SCRIPT_PANE_ID) scriptTarget = t;  // 无 session 的归兜底列
+      else byId[pane.id] = t;
+    }
+    if (!targets.length) return;
+
+    // 单趟扫全局 anchor：y 由全局下标定（这就是跨列共享坐标系），
+    // 再按归属派发进对应列的桶。归属列不在当前视图里的 anchor 直接丢弃。
+    for (var i = 0; i < n; i++) {
+      var e = events[i];
+      var target = soloTarget || (e.sessionId ? byId[e.sessionId] : scriptTarget);
+      if (!target) continue;
+      var y = Math.floor((i / n) * target.span);
+      var prev = target.buckets[y];
+      if (!prev || _levelRank(e.level) > _levelRank(prev.level)) {
+        target.buckets[y] = e;
+      }
+    }
+
+    for (var k = 0; k < targets.length; k++) {
+      this._reconcileTicks(targets[k].pane, targets[k].buckets);
+    }
+  };
+
+  // DOM 对账：同一个 y 桶上的节点原地复用，只增删差集。绝大多数帧里桶集合
+  // 几乎不变，所以实际 DOM 写入量远小于桶总数。
+  LiveTail.prototype._reconcileTicks = function (pane, buckets) {
+    var existing = pane.railTicks;
+    var key;
+    for (key in existing) {
+      if (!buckets[key]) {
+        existing[key].remove();
+        delete existing[key];
+      }
+    }
+    for (key in buckets) {
+      var e = buckets[key];
+      var cls = "tl-tick " + severityClass(e.level);
+      var node = existing[key];
+      if (!node) {
+        node = el("div", { className: cls }, []);
+        node.style.top = key + "px";
+        pane.rail.appendChild(node);
+        existing[key] = node;
+      } else if (node.className !== cls) {
+        node.className = cls;
+      }
+      node.setAttribute("data-ts", e.ts);
+      node.setAttribute("title", fmtWallShort(e.ts));
+    }
+  };
+
+  // 跨列 snap sync：所有列各自找最接近 ts 的行，滚到 viewport 同一相对高度。
+  // 之后 tail 冻结（userScrolled=true），直到用户滚回底部或 scrollToEnd/clear。
+  LiveTail.prototype._syncToTs = function (ts) {
+    if (typeof ts !== "number" || isNaN(ts)) return;
+    var self = this;
+    this._syncedTs = ts;
+    this.paneSet.panes.forEach(function (p) {
+      var prev = p.body.querySelector(".tl-sync-target");
+      if (prev) prev.classList.remove("tl-sync-target");
+      var target = self._nearestRowByTs(p.body, ts);
+      if (!target) return;
+      target.classList.add("tl-sync-target");
+      var offset = p.body.clientHeight * SYNC_VIEWPORT_RATIO;
+      p.body.scrollTop = Math.max(0, target.offsetTop - offset);
+      // 显式置在赋值之后：上一行的 scrollTop 会同步触发 scroll 监听改写这个标志
+      p.userScrolled = true;
+    });
+    this._updateHeader();
+  };
+
+  // 行是按 ts 递增 append 的，但 idle-gap 之类没有 data-ts 的节点混在中间，
+  // 二分不好写边界；4000 行的线性扫描本来就在一帧预算内，保持直白。
+  LiveTail.prototype._nearestRowByTs = function (body, ts) {
+    var best = null;
+    var bestDelta = Infinity;
+    var kids = body.children;
+    for (var i = 0; i < kids.length; i++) {
+      var raw = kids[i].getAttribute("data-ts");
+      if (raw === null) continue;
+      var t = parseFloat(raw);
+      if (isNaN(t)) continue;
+      var d = Math.abs(t - ts);
+      // 严格小于：并列时取更早那条，落点稳定不跳
+      if (d < bestDelta) {
+        bestDelta = d;
+        best = kids[i];
+      }
+    }
+    return best;
+  };
+
+  // 解除 sync 锁定：清高亮 + 清状态，但不动滚动位置（调用方自己决定去哪）
+  LiveTail.prototype._clearSync = function () {
+    this._syncedTs = null;
+    this.paneSet.panes.forEach(function (p) {
+      var prev = p.body.querySelector(".tl-sync-target");
+      if (prev) prev.classList.remove("tl-sync-target");
+    });
+  };
+
+  LiveTail.prototype._broadcastAnchor = function (ts, originPane, r) {
+    var self = this;
+    var label = r.session_id || "script";
+    var sec = Math.floor(ts);
+    this.paneSet.panes.forEach(function (p) {
+      if (p === originPane) return;
+      // filter 期间：老列已有自己的历史，不投；新列（在 filter 里）才补 shadow
+      if (self._paneFilter && !self._paneFilter[p.id]) {
+        // 老列不写 DOM，但状态一起推进，避免下一条 real 记录误触发 idle-gap
+        if (p.lastTs === undefined || ts > p.lastTs) p.lastTs = ts;
+        if (p.lastAnchorSec === undefined || sec !== p.lastAnchorSec) p.lastAnchorSec = sec;
+        return;
+      }
+      var filled = sec !== p.lastAnchorSec;
+      p.body.appendChild(self._shadowAnchorNode(ts, label, filled));
+      if (p.lastTs === undefined || ts > p.lastTs) p.lastTs = ts;
+      p.lastAnchorSec = sec;
+    });
+  };
+
+  LiveTail.prototype._idleGapNode = function (dt) {
+    return el("li", { className: "idle-gap" }, [
+      el("span", { className: "idle-gap-text" }, ["↕ " + fmtIdle(dt) + " idle"]),
+    ]);
+  };
+
   LiveTail.prototype._separatorNode = function (text, cls) {
+    // 保留原生的 [line]—— text ——[line] 布局，不套 gutter，让分隔条视觉上依旧独立
     return el("li", { className: "run-separator " + (cls || "") }, [
       el("span", { className: "run-separator-text" }, [text]),
     ]);
   };
 
-  // LiveBody 专用的简化版节点：隐藏时间戳、事件标签等装饰符，节省空间。
+  // LiveBody 专用的简化版节点：固定左侧 gutter 承载时间刻度，右侧 msg 是内容。
+  // gutter 的填/空由 _appendRow 决定（只锚点行填、同秒去重），保证"消息"起点在
+  // 所有行同列对齐——这才让"参照线"三个字有意义。
   // 手动 CommandBar 通道（__rid 缺失）打 ev-manual 视觉标，与脚本流区分。
   LiveTail.prototype._nodeForRecord = function (r) {
     var cls = "tl-row " + severityClass(r.level);
     if (!r.__rid) cls += " ev-manual";
-    var line = el("li", { className: cls }, []);
-    var msg = el("span", { className: "tl-msg" }, [r.message || ""]);
-    line.appendChild(msg);
-    return line;
+    if (isAnchorEvent(r)) cls += " ev-anchor";
+    return el("li", { className: cls }, [
+      el("span", { className: "tl-gutter" }, []),
+      el("span", { className: "tl-msg" }, [r.message || ""]),
+    ]);
   };
 
-  LiveTail.prototype._appendNode = function (node, sessionId) {
-    // 重放历史 buffer 时只补新增的列（见 setPanes），老列不能再收一遍
-    if (this._paneFilter) {
-      var target = this.paneSet.paneFor(sessionId);
-      if (!target || !this._paneFilter[target.id]) return;
-    }
-    // sessionId 为空（run 分隔条、脚本自身日志）→ 落 Script 兜底列
-    this.paneSet.append(sessionId, node);
-    this.paneSet.autoScroll();
+  LiveTail.prototype._shadowAnchorNode = function (ts, originLabel, filled) {
+    // 分栏"弱对齐"：另一列的锚点在本列投影一条虚线 marker，让眼睛能沿虚线
+    // 一眼横穿几列找同一时刻的事件。gutter 是否填时间由调用方按同秒去重决定。
+    // 带 data-ts：本列在该时刻没有真实 record 时，snap sync 就落到这条 shadow 上。
+    var gutterText = filled ? fmtWallShort(ts) : "";
+    return el("li", { className: "tl-shadow", "data-ts": ts }, [
+      el("span", { className: "tl-gutter" }, [gutterText]),
+      el("span", { className: "tl-shadow-hint" }, ["\u2190 " + originLabel]),
+    ]);
   };
 
-  // 隐藏状态下 clientHeight 为 0，自动跟随算不准；切回 Live 时显式对齐到底部
+  // 隐藏状态下 clientHeight 为 0，自动跟随算不准；切回 Live 时显式对齐到底部。
+  // 回到底部就意味着"我要继续追 tail 了"，snap sync 的锁定态一并解除。
   LiveTail.prototype.scrollToEnd = function () {
+    this._clearSync();
     this.paneSet.scrollToEnd();
+    // 隐藏态下 rail 高度也是 0，这次重算才能把 tick 摆到正确位置
+    this._redrawRails();
+    this._updateHeader();
   };
 
   LiveTail.prototype._updateHeader = function () {
     this._nodes.title.textContent = this.logName ? "Live · " + this.logName : "Live";
     var s = this._nodes.status;
     s.className = "run-status hint";
-    s.textContent = this.count
+    var base = this.count
       ? this.count + " record" + (this.count === 1 ? "" : "s")
       : "waiting for activity…";
+    // 锁定态要说清楚"为什么不动了"，否则用户会以为日志断流了
+    if (this._syncedTs !== null) {
+      s.className = "run-status hint synced";
+      s.textContent = base + " · synced @ " + fmtWallShort(this._syncedTs)
+        + " (scroll to bottom to resume)";
+      return;
+    }
+    s.textContent = base;
   };
 
   // ---------- CommandBar （Web UI 手动命令执行） ----------
