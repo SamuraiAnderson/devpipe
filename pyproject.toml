@@ -102,6 +102,9 @@ omit = [
     # uvicorn，把路由代码真正跑一遍（实测 ~44%），但默认套件不跑 e2e，不排除的话
     # 默认报告会被这千余行拉偏。
     "src/redpymake/_web/server.py",
+    # report / commands 同样只被 CLI 报告与 Web UI 路径打到；默认单测目前 0%。
+    "src/redpymake/_web/report.py",
+    "src/redpymake/_web/commands.py",
 ]
 
 [tool.coverage.report]
