@@ -36,10 +36,11 @@
 
 ### P0-4 CI 与发布准备
 
-- [ ] GitHub Actions：`pytest` matrix (Windows / macOS / Linux × Python 3.10/3.11/3.12)
+- [x] GitHub Actions：`.github/workflows/ci.yml`（Linux × 3.10/3.11/3.12；Windows / macOS × 3.12；ubuntu-3.12 跑覆盖率门槛）
 - [ ] `pre-commit`：`ruff` + `black` + `mypy --strict src/redpymake`
 - [ ] `pyproject.toml` 补 `[project.urls]` 完整字段与 `LICENSE` 文件
-- [ ] `pip wheel .` 构建校验；`twine check dist/*`；预留 PyPI 发布流水线
+- [x] CI `package` job：`python -m build` + `twine check dist/*`
+- [ ] 预留 PyPI 发布流水线
 
 ### P0-5 类型收敛
 
@@ -146,3 +147,4 @@
 - 2026-08-15：新增 CORE-09 脚本对象与日志分流：`rpm.script(name, dump_on_error, log_level, loggers)` + `ScriptRun` + `ScriptSnapshot`；`logging` 通过 handler 桥 + Session `subscribe` 转发合流到 `ScriptRun._merged`；`__exit__` 见异常时按 `dump_on_error` 值类型（单文件 / 目录包 / callable）自动落盘，不吞原异常
 - 2026-08-15：新增 CORE-10 脚本发现与实时日志：`rpm.discover(root)` + `ScriptCard`（纯 AST 分析）+ NDJSON live sink（`REDPYMAKE_LIVE_SINK=file://...`）；顶层 CLI `redpymake discover` / `run` / `report`
 - 2026-08-15：新增 CORE-11 Workspace + Web UI：`rpm.workspace(root)` + `Workspace` + `WorkspaceRun`；工厂函数读 ContextVar 自动借出共享会话；串行队列 + `importlib.reload` 逐次运行；`redpymake serve` FastAPI + Jinja2 + htmx；Web 依赖走 `redpymake[web]` extra
+- 2026-08-19：接入 GitHub Actions CI（默认单测 + 覆盖率门槛 + sdist/wheel 校验）；integration / e2e 仍默认排除

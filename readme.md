@@ -1,5 +1,7 @@
 # RedPyMake
 
+[![CI](https://github.com/SamuraiAnderson/devpipe/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuraiAnderson/devpipe/actions/workflows/ci.yml)
+
 统一的 `Session` 接口，跨 local / ssh / adb / serial / wsl 执行命令、传输文件、收集日志。
 Python 3.10+，核心零依赖。
 
@@ -10,6 +12,16 @@ pip install -e .            # 核心
 pip install -e ".[ssh]"     # paramiko
 pip install -e ".[serial]"  # pyserial
 pip install -e ".[web]"     # fastapi + uvicorn
+pip install -e ".[dev]"     # pytest 与可选平台依赖
+```
+
+push / PR 到 `main` 时 [GitHub Actions](https://github.com/SamuraiAnderson/devpipe/actions) 会跑默认单测（不含 integration / e2e）。本地同样：
+
+```bash
+pytest                      # 默认单测
+pytest --cov=redpymake      # 覆盖率门槛 80%
+pytest -m integration       # 真实设备；需 RPM_TEST_* 环境变量
+pytest -m e2e               # 浏览器；需 pip install -e ".[e2e]" 且 playwright install chromium
 ```
 
 ## 工厂
