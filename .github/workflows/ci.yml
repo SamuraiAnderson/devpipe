@@ -24,11 +24,11 @@ jobs:
         os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12"]
         include:
-          # 私有仓库额度有限：Windows / macOS 只跑当前主版本。
-          - os: windows-latest
-            python-version: "3.12"
+          # macOS 只跑当前主版本。Windows GHA runner 与本地 Win 3.12 结果不一致，暂不进必过矩阵。
           - os: macos-latest
             python-version: "3.12"
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
 

@@ -36,7 +36,8 @@
 
 ### P0-4 CI 与发布准备
 
-- [x] GitHub Actions：`.github/workflows/ci.yml`（Linux × 3.10/3.11/3.12；Windows / macOS × 3.12；ubuntu-3.12 跑覆盖率门槛）
+- [x] GitHub Actions：`.github/workflows/ci.yml`（Linux × 3.10/3.11/3.12；macOS × 3.12；ubuntu-3.12 跑覆盖率门槛）
+- [ ] GitHub Actions 补 Windows runner（本地 Win 3.12 已绿，GHA windows-latest 待排查）
 - [ ] `pre-commit`：`ruff` + `black` + `mypy --strict src/redpymake`
 - [ ] `pyproject.toml` 补 `[project.urls]` 完整字段与 `LICENSE` 文件
 - [x] CI `package` job：`python -m build` + `twine check dist/*`
