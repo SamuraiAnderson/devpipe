@@ -14,6 +14,8 @@
     §CORE-01/ssh/connect-immediately  → test_ssh_connect_failure_wraps_in_session_connection_error
     §CORE-01/adb/no-adb-binary        → test_adb_without_binary_raises_session_connection_error
     §CORE-01/serial/no-fs             → test_serial_resource_ops_raise_unsupported
+    §CORE-01/serial/run-str-no-crlf   → test_serial_run_str_does_not_append_newline
+    §CORE-01/serial/run-bytes         → test_serial_run_bytes_writes_raw
     §CORE-01/wsl/no-wsl-binary        → test_wsl_without_binary_raises_session_connection_error
 
 """
@@ -32,6 +34,7 @@ from redpymake.exceptions import (
     UnsupportedOperationError,
 )
 
+from ._helpers.serial_stub import open_stub_serial
 from ._helpers.ssh_mock import install_paramiko_stub
 
 
@@ -215,6 +218,32 @@ def test_serial_resource_ops_raise_unsupported(monkeypatch):
             p.exists()
     finally:
         sess.close()
+
+
+def test_serial_run_str_does_not_append_newline(monkeypatch):
+    """§CORE-01：串口 ``run(str)`` 默认不追加 ``\\r\\n``；显式 ``newline`` 才追加。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+        sess.run("reboot")
+        assert bytes(port.written) == b"reboot"
+    with open_stub_serial(monkeypatch) as (sess, port):
+        sess.run("reboot\r")
+        assert bytes(port.written) == b"reboot\r"
+    with open_stub_serial(monkeypatch, newline="\r") as (sess, port):
+        sess.run("reboot")
+        assert bytes(port.written) == b"reboot\r"
+
+
+def test_serial_run_bytes_writes_raw(monkeypatch):
+    """§CORE-01：串口 ``run(bytes)`` 原样写入，不拼 newline。"""
+    with open_stub_serial(monkeypatch, newline="\r") as (sess, port):
+        sess.run(b"\xaa\x55")
+        assert bytes(port.written) == b"\xaa\x55"
+    with pytest.raises(TypeError):
+        with open_stub_serial(monkeypatch) as (sess, _port):
+            sess.run(b"\x01", "extra")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        with open_stub_serial(monkeypatch) as (sess, _port):
+            sess.run(b"\x01", shell=True)
 
 
 def test_wsl_without_binary_raises_session_connection_error(monkeypatch):

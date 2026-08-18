@@ -513,7 +513,7 @@ class Workspace:
         *,
         baudrate: int = 115200,
         timeout: float = 1.0,
-        newline: str = "\r\n",
+        newline: str = "",
         encoding: str = "utf-8",
     ) -> _BorrowedSession:
         from ._serial import SerialSession

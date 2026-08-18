@@ -27,7 +27,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Mapping, Pattern, Sequence
 
 from ._command import CommandResult
-from ._logs import LogBuffer, LogCursor, LogMatch, SessionLogs
+from ._logs import LogBuffer, LogCursor, LogMatch, SessionLogs, normalize_wait_patterns
 from ._path import ResourcePath, ResourceStat, resolve_against
 from ._transfer import TransferResult
 from .exceptions import (
@@ -195,7 +195,7 @@ class Session(ABC):
 
     def run(
         self,
-        command: str,
+        command: str | bytes,
         *args: str,
         shell: bool = False,
         cwd: str | None = None,
@@ -209,12 +209,21 @@ class Session(ABC):
 
         self._check_alive()
 
-        if shell:
+        argv: tuple[str | bytes, ...]
+        if isinstance(command, bytes):
+            if self.root.kind != "serial":
+                raise TypeError("bytes command is only supported on serial sessions")
+            if args:
+                raise TypeError("bytes command cannot take extra positional args")
+            if shell:
+                raise TypeError("bytes command is incompatible with shell=True")
+            argv = (command,)
+        elif shell:
             if args:
                 raise TypeError(
                     "shell=True expects a single command string; got extra positional args"
                 )
-            argv: tuple[str, ...] = (command,)
+            argv = (command,)
         else:
             if not isinstance(command, str):
                 raise TypeError("command must be a string")
@@ -227,8 +236,9 @@ class Session(ABC):
 
         effective_cwd = cwd or self.default_cwd
         op_id = _new_operation_id("cmd")
-        # run 前保存日志游标，确保 .wait() 不漏
+        # run 前保存日志游标 / RX 偏移，确保 .wait() 不漏
         cursor_before = self._log_buffer.cursor()
+        rx_before = self._rx_cursor()
 
         if log_command:
             display = _format_command(argv, shell=shell)
@@ -303,6 +313,7 @@ class Session(ABC):
             duration=duration,
             session=self,
             _log_cursor_before=cursor_before,
+            _rx_cursor_before=rx_before,
         )
         if check and returncode != 0:
             raise CommandError(
@@ -321,20 +332,64 @@ class Session(ABC):
 
     def wait(
         self,
-        pattern: str | Pattern[str],
+        pattern: str | bytes | Pattern[str] | Pattern[bytes] | Sequence[Any],
         timeout: float = 30,
         *,
         channel: str | None = None,
         since: LogCursor | None = None,
         command_result: CommandResult | None = None,
+        multiline: bool = False,
+        rx_since: int | None = None,
     ) -> LogMatch:
         self._check_alive()
+        _pats, is_bytes = normalize_wait_patterns(pattern)
+        if is_bytes:
+            if channel is not None or multiline:
+                raise TypeError("channel and multiline do not apply to bytes wait")
+            if since is not None:
+                raise TypeError("since=LogCursor does not apply to bytes wait")
+            return self._wait_bytes(
+                _pats,
+                timeout=timeout,
+                command_result=command_result,
+                start_offset=rx_since,
+                original_pattern=pattern,
+            )
         return self._log_buffer.wait(
             pattern,
             timeout=timeout,
             channel=channel,
             since=since,
             command_result=command_result,
+            multiline=multiline,
+            session=self,
+        )
+
+    def _rx_cursor(self) -> int | None:
+        """串口 RX 单调偏移；非串口为 ``None``。视图转发给 root。"""
+        if self._parent is not None:
+            return self.root._rx_cursor()
+        return None
+
+    def _wait_bytes(
+        self,
+        patterns: Sequence[Any],
+        timeout: float,
+        *,
+        command_result: CommandResult | None,
+        start_offset: int | None,
+        original_pattern: Any,
+    ) -> LogMatch:
+        if self._parent is not None:
+            return self.root._wait_bytes(
+                patterns,
+                timeout,
+                command_result=command_result,
+                start_offset=start_offset,
+                original_pattern=original_pattern,
+            )
+        raise UnsupportedOperationError(
+            "bytes wait is only supported on serial sessions"
         )
 
     # ------------------------------------------------------------------
@@ -459,7 +514,7 @@ class Session(ABC):
     @abstractmethod
     def _execute_command(
         self,
-        argv: Sequence[str],
+        argv: Sequence[str | bytes],
         *,
         shell: bool,
         cwd: str | None,
@@ -558,13 +613,20 @@ class _SessionView(Session):
 # ------------------------------ 工具 ------------------------------
 
 
-def _format_command(argv: Sequence[str], *, shell: bool) -> str:
+def _format_command(argv: Sequence[str | bytes], *, shell: bool) -> str:
     if shell:
-        return argv[0]
-    try:
-        return " ".join(shlex.quote(a) for a in argv)
-    except Exception:  # pragma: no cover - shlex 极少失败
-        return " ".join(argv)
+        a0 = argv[0]
+        return a0 if isinstance(a0, str) else repr(a0)
+    parts: list[str] = []
+    for a in argv:
+        if isinstance(a, bytes):
+            parts.append(repr(a))
+        else:
+            try:
+                parts.append(shlex.quote(a))
+            except Exception:  # pragma: no cover - shlex 极少失败
+                parts.append(a)
+    return " ".join(parts)
 
 
 def _as_path(

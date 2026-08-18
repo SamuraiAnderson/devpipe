@@ -68,11 +68,14 @@ remote.pull(remote.path("/var/log/x.log"), here.path("logs/x.log"))
 import re
 
 with rpm.serial("COM3", baudrate=115200) as uart:
-    uart.run("reboot").wait("U-Boot", timeout=10)
-    uart.wait(re.compile(r"login:\s*$"), timeout=60)
+    uart.run("reboot\r").wait("U-Boot", timeout=10).wait(
+        re.compile(r"login:\s*$"), timeout=60
+    )
+    uart.wait(["READY", "FAILED"], timeout=5)
+    uart.run(b"\x01").wait(b"\x06", timeout=1)
 ```
 
-`run(...).wait(...)` 用 run 前保存的游标搜索，不会漏掉命令期间产生的匹配。
+`run(...).wait(...)` 用 run 前保存的游标搜索，不会漏掉命令期间产生的匹配。`.wait().wait()` 从上一命中之后继续。`wait(["A", "B"])` 为 OR（谁先出现谁赢）。
 
 ### 过时判断
 
@@ -134,7 +137,8 @@ redpymake serve examples/wsl_session         # 127.0.0.1:8765
 
 - `run()` 默认 `check=True`：非零退出立即抛 `CommandError`；`check=False` 才返回结果让调用者判断。
 - `at()` 返回**新的视图**并共享同一连接与日志，不修改原会话；只想覆盖一次用 `run(cwd=...)`。
-- `session.wait(pattern)` 默认从"下一条"开始扫，匹配不到调用之前的历史；覆盖命令执行期间的输出用 `run(...).wait(pattern)`。
+- `session.wait(pattern)` 默认从"下一条"开始扫，匹配不到调用之前的历史；覆盖命令执行期间的输出用 `run(...).wait(pattern)`。顺序再用 `.wait()` 链；OR 用 `wait(["A", "B"])`。
+- 串口 `run("reboot")` 默认**不**追加 `\r\n`；需要行结束符请写 `run("reboot\r")`。二进制用 `run(bytes)` / `wait(bytes)`。
 - 会话关闭后仍可读取已收集的日志，但会拒绝新的 `run` / `push` / `wait`。
 - `rpm.wsl()` 只校验 `wsl.exe` 存在，发行版没装会延迟到首次 `run()` 时以 `CommandError` 报出来。
 

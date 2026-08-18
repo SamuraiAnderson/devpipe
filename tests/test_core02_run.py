@@ -5,6 +5,7 @@
     §CORE-02/at()/immutable         → test_at_cwd_does_not_leak_to_original
     §CORE-02/run/positional         → test_run_positional_captures_stdout
     §CORE-02/run/positional/type    → test_run_positional_args_must_be_str
+    §CORE-02/run/bytes/local        → test_run_bytes_rejected_on_local
     §CORE-02/run/shell/single       → test_run_shell_true_executes_pipeline
     §CORE-02/run/shell/no-extra     → test_run_shell_true_forbids_extra_args
     §CORE-02/run/no-naive-join      → test_run_default_does_not_naive_join_args
@@ -48,6 +49,12 @@ def test_run_positional_args_must_be_str(local_session):
     """§CORE-02：``shell=False`` 时非字符串位置参数抛 ``TypeError``。"""
     with pytest.raises(TypeError):
         local_session.run("echo", 123)  # type: ignore[arg-type]
+
+
+def test_run_bytes_rejected_on_local(local_session):
+    """§CORE-02：非串口 ``run(bytes)`` 抛 ``TypeError``。"""
+    with pytest.raises(TypeError):
+        local_session.run(b"\x01\x02")  # type: ignore[arg-type]
 
 
 def test_run_shell_true_forbids_extra_args(local_session):

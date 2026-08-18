@@ -78,12 +78,14 @@ with rpm.ssh("192.168.1.10", user="root") as remote:
     remote.logs.save("logs/build.log")
 ```
 
-UART 日志等待：
+UART 日志等待（顺序链 + 可选 OR 列表）：
 
 ```python
 with rpm.serial("COM3", baudrate=115200) as uart:
-    uart.run("reboot").wait("U-Boot", timeout=10)
-    uart.wait(re.compile(r"login:\s*$"), timeout=60)
+    uart.run("reboot\r").wait("U-Boot", timeout=10).wait(
+        re.compile(r"login:\s*$"), timeout=60
+    )
+    m = uart.wait(["READY", "FAILED"], timeout=5)
 ```
 
 调用者不应：
@@ -198,6 +200,15 @@ rpm.wsl(distribution=None, user=None)
 - 平台不支持的能力抛出 `UnsupportedOperationError`，不得直接暴露 `NotImplementedError`。
 - `at()` 创建的视图共享同一连接、同一日志缓冲。
 
+### 串口说明
+
+`rpm.serial(port, baudrate=115200, newline="", encoding="utf-8")`：
+
+- **写出**：`run(str)` 按 `encoding` 编码后写入，再追加构造参数 `newline`（**默认空**，不再自动加 `\r\n`）。需要行结束符时写在命令里，例如 `uart.run("reboot\r")`，或显式 `newline="\r"`。
+- **`run(bytes)` 仅串口**：原样写入、不拼 `newline`；禁止额外位置参数与 `shell=True`。其他平台传 `bytes` 抛 `TypeError`。
+- **文本日志**：读侧仍按 `\n` 切行再解码，供 `wait("U-Boot")` 使用。
+- **原始 RX**：另有容量 1 MiB 的环形字节缓冲（不按行切），供 `wait(b"...")` / `wait(re.compile(rb"..."))` 使用。
+
 ### WSL 说明（"构造时立即连接"的显式例外）
 
 `rpm.wsl(...)` 面向 Windows 上的 Linux 用户态子系统。与 SSH/ADB 不同，它**只在构造时校验 `wsl.exe` 是否可执行**，不做 distro 级探测；`wsl.exe` 缺失时抛 `SessionConnectionError`，其余"发行版未安装 / 冷启动失败"等情形延迟到首次 `run()` 时以 `CommandError` 呈现。这样构造几乎零延迟，语义更贴近 `LocalSession`。
@@ -253,7 +264,7 @@ workspace.run("cat app.log | grep error", shell=True)
 ```python
 def run(
     self,
-    command: str,
+    command: str | bytes,
     *args: str,
     shell: bool = False,
     cwd: str | None = None,
@@ -271,6 +282,7 @@ def run(
 - 不提供独立 `sh()`。
 - `shell=False`：每个位置参数都是独立参数，不解析 `|`、`&&`、`>`。
 - `shell=True`：只允许一条完整命令字符串；同时传额外位置参数时抛出 `TypeError`。
+- `command` 为 `bytes` 时仅串口允许：原样写入、不追加 `newline`；带 `*args` 或 `shell=True` 抛 `TypeError`。其他会话抛 `TypeError`。
 - 底层不得使用简单的 `" ".join(args)`，必须做平台正确的参数传递或转义。
 - 输出默认统一为 `str`。
 - **默认 `check=True`**：非零退出码立即抛出 `CommandError`。
@@ -282,7 +294,7 @@ def run(
 ```python
 @dataclass(frozen=True)
 class CommandResult:
-    command: tuple[str, ...]
+    command: tuple[str | bytes, ...]
     returncode: int
     stdout: str
     stderr: str
@@ -296,10 +308,11 @@ class CommandResult:
 
     def wait(
         self,
-        pattern: str | re.Pattern[str],
+        pattern: WaitPattern,
         timeout: float = 30,
         *,
         channel: str | None = None,
+        multiline: bool = False,
     ) -> LogMatch:
         ...
 ```
@@ -612,6 +625,14 @@ with remote.logs.tag(step="build_app"):
 
 适合 UART 启动日志等数据流场景。
 
+类型：
+
+```python
+TextPattern = str | re.Pattern[str]
+BytesPattern = bytes | re.Pattern[bytes]
+WaitPattern = TextPattern | BytesPattern | Sequence[TextPattern] | Sequence[BytesPattern]
+```
+
 直接等待（默认只匹配调用之后产生的日志）：
 
 ```python
@@ -619,10 +640,10 @@ match = uart.wait("U-Boot", timeout=30)
 match = uart.wait(re.compile(r"login:\s*$"), timeout=60)
 ```
 
-执行命令后等待：
+执行命令后等待（从 **run 前** 游标搜索，不漏执行期间输出）：
 
 ```python
-match = uart.run("reboot").wait("login:", timeout=60)
+match = uart.run("reboot\r").wait("login:", timeout=60)
 ```
 
 `run(...).wait(...)` 是便利语法，本质等价于：
@@ -633,40 +654,54 @@ result = session.run(...)
 match = session.wait(pattern, since=cursor, timeout=...)
 ```
 
-时序要求：`run()` 必须在执行前保存日志游标；`.wait()` 先搜索已有日志，再订阅新日志，避免漏掉 `run()` 期间已产生的匹配。
+时序要求：`run()` 必须在执行前保存日志游标（及串口 RX 偏移）；`.wait()` 先搜索已有数据，再订阅新数据。
 
 签名：
 
 ```python
 def wait(
     self,
-    pattern: str | re.Pattern[str],
+    pattern: WaitPattern,
     timeout: float = 30,
     *,
     channel: str | None = None,
     since: LogCursor | None = None,
+    multiline: bool = False,
 ) -> LogMatch:
     ...
 ```
 
 匹配规则：
 
-- 普通字符串按字面量匹配。
-- `re.Pattern` 按正则匹配。
-- `channel` 可限制来源：`"stdout"` / `"stderr"` / `"serial"` / `"system"`。
-- 不指定 `channel` 时匹配当前会话的所有数据日志。
+- 普通字符串 / `bytes` 按字面量子串匹配。
+- `re.Pattern[str]` / `re.Pattern[bytes]` 按正则搜索。
+- **OR**：第一参数为 list/tuple 时，谁先命中谁赢。`match.pattern` 为该模式，`match.index` 为序列下标（单个模式时为 `0`）。不要用 `wait("A", "B")`（第二位置参数是 `timeout`）。
+- 实现时先判断 `str` / `bytes` / `re.Pattern`，再判断 Sequence。空序列抛 `ValueError`；文本与字节混用抛 `TypeError`。
+- `channel` 可限制文本日志来源：`"stdout"` / `"stderr"` / `"serial"` / `"system"`。不指定时匹配当前会话的所有数据日志。
+- `multiline=False`（默认）：对单条 `record.message` 匹配。
+- `multiline=True`：仅文本；把 `since` 之后的数据日志用 `\n` 拼接再搜。不自动加 `re.DOTALL` / `re.M`。`match.record` 为使 haystack 命中的最后一条；`match.text` 为 haystack。
+- **字节等待**（仅串口）：`wait(b"...")` / `wait(re.compile(rb"..."))` 搜索原始 RX 环形缓冲，**不按行切**（`0x0A` 只是普通字节）。`channel` / `multiline` / `since: LogCursor` 不适用；`CommandResult.wait(bytes)` 使用 run 前 RX 偏移。直接 `uart.wait(b"...")` 从调用当下的 RX 末端开始。非串口抛 `UnsupportedOperationError`。
+- 无 `fail_pattern`：把失败串放进 OR 列表，用 `match.index` 分支。
+
+顺序链 `LogMatch.wait`：从**本次命中之后**继续（文本：命中记录 `sequence+1`；字节：匹配子串结束偏移）。文本第一版不保证同一行后缀再匹配。
+
+```python
+uart.run("reboot\r").wait("U-Boot", timeout=10).wait("login:", timeout=60)
+uart.run(b"\x01").wait(b"\xaa\x55").wait(b"\x06")
+```
 
 返回：
 
 ```python
 match.pattern
-match.record
-match.text
+match.index
+match.record          # 字节等待时为 None
+match.text            # 文本为 str；字节命中为匹配到的 bytes 子串
 match.elapsed
-match.command_result   # 由 CommandResult.wait() 触发时有值
+match.command_result  # 由 CommandResult.wait() 触发时有值
 ```
 
-超时抛出 `LogWaitTimeoutError`，包含 `pattern`、`timeout`、`records`、`output`、`command_result`。
+超时抛出 `LogWaitTimeoutError`，包含 `pattern`、`timeout`、`records`、`output`、`command_result`；字节等待另带可选 `data`（扫描窗口）。
 
 其他约束：
 
@@ -686,9 +721,11 @@ UART 完整示例：
 
 ```python
 with rpm.serial("COM3", baudrate=115200) as uart:
-    uart.run("reboot").wait("U-Boot", timeout=10)
-    uart.wait(re.compile(r"login:\s*$"), timeout=60)
-    uart.run("root").wait("#", timeout=5)
+    uart.run("reboot\r").wait("U-Boot", timeout=10).wait(
+        re.compile(r"login:\s*$"), timeout=60
+    )
+    uart.run("root\r").wait("#", timeout=5)
+    ack = uart.run(b"\x01").wait([b"\x06", b"\x15"], timeout=1)
 ```
 
 ---
@@ -1372,6 +1409,8 @@ Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.
           - **CommandInput** (`#cmd-input`) — 命令输入框（Enter 执行，上/下浏览历史）
           - **ExecuteButton** (`#cmd-send-btn`) — 执行按钮
           - **HistoryButton** (`#cmd-history-btn`) — 历史下拉按钮
+
+**CommandBar 与串口行结束符**：CommandBar 是按行提交的终端，Enter 表示发出一行。`SerialSession.newline` 默认为空（脚本须自行写 `run("reboot\r")`），但输入框会对用户文本 `trim()`，无法靠手敲补上 CR。因此 `POST /api/commands`（`CommandExecutor`）在目标 `session.kind == "serial"` 且构造 `newline` 为空时，若命令尚未以 `\r` / `\n` 结尾，自动补 `\r` 再交给 `session.run()`。会话已设非空 `newline` 时不补，避免与 `run()` 追加的 newline 叠加。`local` / `ssh` / `adb` / `wsl` 不补。命令历史保存用户输入原文，不含自动补上的 `\r`。
       - **RunDetailView** (`#timeline-root`) — 单 run 回放（`Timeline` 实例）
         - **RunHeader** (`.run-header`) — 脚本名 / run id / 状态 / 异常
         - **PlaybackToolbar** (`.timeline-toolbar`) — Live·Play·Reset·Step·SpeedSelect·Scrubber·TimeLabel
@@ -1440,7 +1479,7 @@ LiveBody 每列右侧有一条窄轨 ChronoRail，解决"多个 session 各滚�
   - `POST /api/runs/{rid}/rerun`：`Workspace.rerun(rid)`，返回新 `run_id`；
   - `DELETE /api/runs/{rid}`：`Workspace.cancel_run(rid)`，仅对 queued 有效；
   - `POST /api/runs/stop`：`Workspace.stop_current()`（不带 rid 的旧入口，保留）；
-  - `POST /api/commands`：执行手动命令，通过 WebSocket 流式推送输出；
+  - `POST /api/commands`：执行手动命令，通过 WebSocket 流式推送输出；串口行结束符见上文「CommandBar 与串口行结束符」；
   - `GET /api/commands/history`：获取命令历史；
   - `DELETE /api/commands/history`：清空命令历史；
   - `GET /api/logs`｜`/api/logs/current`｜`/api/logs/{lid}`｜`/api/logs/{lid}/runs`｜`/api/logs/{lid}/runs/{rid}/records`；

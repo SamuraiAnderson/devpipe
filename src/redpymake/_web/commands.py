@@ -26,6 +26,23 @@ if TYPE_CHECKING:
 
 _diag_logger = __import__("logging").getLogger("redpymake")
 
+
+def _prepare_commandbar_line(session: "Session", command: str) -> str:
+    """把 CommandBar 的一行变成 ``session.run`` 的文本。
+
+    串口且构造 ``newline`` 为空时补 ``\\r``（Enter = 提交一行）。已带
+    ``\\r`` / ``\\n``、或会话已设非空 newline 的不补，避免与 ``run()`` 叠加。
+    """
+    root = session.root
+    if getattr(root, "kind", "") != "serial":
+        return command
+    configured = getattr(root, "_newline", "") or ""
+    if configured:
+        return command
+    if command.endswith(("\r", "\n")):
+        return command
+    return command + "\r"
+
 # 历史记录文件名
 _HISTORY_FILENAME = "history.json"
 # 每个 session 最大历史条数
@@ -104,6 +121,7 @@ class CommandExecutor:
     - 命令通过 API 端点发起，不依附于任何 ScriptRun
     - 输出通过 WebSocket 事件 `cmd.output` 流式推送
     - 历史记录独立保存到 history.json
+    - 串口且 `newline` 为空时自动补 `\\r`（见 ``_prepare_commandbar_line``）
     """
 
     def __init__(self, workspace: "Workspace") -> None:
@@ -160,9 +178,10 @@ class CommandExecutor:
                 # 记录开始
                 cursor_before = session.logs.buffer.cursor()
 
-                # 执行命令
+                # 串口 CommandBar：Enter = 提交一行；历史仍用用户原文。
+                wired = _prepare_commandbar_line(session, command)
                 result = session.run(
-                    command,
+                    wired,
                     shell=shell,
                     cwd=cwd,
                     timeout=timeout,

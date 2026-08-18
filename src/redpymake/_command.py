@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Pattern
+from typing import TYPE_CHECKING, Any
 
 from .exceptions import CommandError
+from ._logs import normalize_wait_patterns
 
 if TYPE_CHECKING:  # pragma: no cover
     from ._logs import LogCursor, LogMatch
@@ -24,15 +25,17 @@ class CommandResult:
         duration: 命令执行耗时（秒）。
         session: 发起命令的会话；用于 ``wait()``。
         _log_cursor_before: 会话内部保存的 run 前日志游标；``wait()`` 使用。
+        _rx_cursor_before: 串口 run 前的 RX 字节偏移；字节 ``wait()`` 使用。
     """
 
-    command: tuple[str, ...]
+    command: tuple[str | bytes, ...]
     returncode: int
     stdout: str
     stderr: str
     duration: float
     session: "Session"
     _log_cursor_before: "LogCursor | None" = field(default=None, repr=False)
+    _rx_cursor_before: int | None = field(default=None, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -51,22 +54,26 @@ class CommandResult:
 
     def wait(
         self,
-        pattern: str | Pattern[str],
+        pattern: Any,
         timeout: float = 30,
         *,
         channel: str | None = None,
+        multiline: bool = False,
     ) -> "LogMatch":
-        """在本次 ``run()`` 之后（含执行期间）的日志中等待模式匹配。
+        """在本次 ``run()`` 之后（含执行期间）的日志 / RX 中等待模式匹配。
 
-        通过在 ``run()`` 前保存的日志游标作为搜索起点，确保不会漏掉命令执行
-        期间已经产生的匹配。
+        通过在 ``run()`` 前保存的日志游标（或 RX 偏移）作为搜索起点，确保不会
+        漏掉命令执行期间已经产生的匹配。
         """
+        _pats, is_bytes = normalize_wait_patterns(pattern)
         return self.session.wait(
             pattern,
             timeout=timeout,
             channel=channel,
-            since=self._log_cursor_before,
+            since=None if is_bytes else self._log_cursor_before,
+            multiline=multiline,
             command_result=self,
+            rx_since=self._rx_cursor_before if is_bytes else None,
         )
 
 

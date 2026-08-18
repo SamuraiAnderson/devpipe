@@ -113,6 +113,7 @@ def test_log_wait_timeout_fields(local_session):
     assert isinstance(exc.records, tuple)
     assert isinstance(exc.output, str)
     assert exc.command_result is None
+    assert exc.data is None
 
 
 def test_transfer_error_fields(fake_remote, local_session, tmp_path):

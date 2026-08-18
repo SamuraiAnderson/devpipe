@@ -133,7 +133,7 @@ def serial(
     *,
     baudrate: int = 115200,
     timeout: float = 1.0,
-    newline: str = "\r\n",
+    newline: str = "",
     encoding: str = "utf-8",
 ) -> "Session":
     """构造串口会话（立即打开设备，失败抛 ``SessionConnectionError``）。"""

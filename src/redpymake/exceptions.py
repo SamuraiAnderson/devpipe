@@ -147,6 +147,7 @@ class LogWaitTimeoutError(RedPyMakeError):
         records: "Iterable[SessionLogRecord] | None" = None,
         output: str = "",
         command_result: Any = None,
+        data: bytes | None = None,
     ) -> None:
         super().__init__(message)
         self.pattern = pattern
@@ -154,6 +155,7 @@ class LogWaitTimeoutError(RedPyMakeError):
         self.records = tuple(records) if records is not None else ()
         self.output = output
         self.command_result = command_result
+        self.data = data
 
 
 class UnsupportedOperationError(RedPyMakeError):

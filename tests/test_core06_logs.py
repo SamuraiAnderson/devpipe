@@ -21,6 +21,17 @@
     §CORE-06/wait/times-out             → test_wait_times_out_with_error_fields
     §CORE-06/wait/closed-session       → test_wait_raises_when_session_closes_mid_wait
     §CORE-06/run-wait/no-race           → test_run_wait_no_race
+    §CORE-06/wait/or-list               → test_wait_or_list_returns_index
+    §CORE-06/wait/or-empty              → test_wait_empty_sequence_raises
+    §CORE-06/wait/or-mixed-types        → test_wait_mixed_text_and_bytes_raises
+    §CORE-06/wait/multiline             → test_wait_multiline_joins_records
+    §CORE-06/wait/chain                 → test_wait_chain_starts_after_match
+    §CORE-06/wait/bytes                 → test_wait_bytes_on_serial
+    §CORE-06/wait/bytes/regex           → test_wait_bytes_regex
+    §CORE-06/wait/bytes/newline         → test_wait_bytes_does_not_split_on_lf
+    §CORE-06/wait/bytes/run-no-race     → test_run_wait_bytes_no_race
+    §CORE-06/wait/bytes/chain           → test_wait_bytes_chain_starts_after_match
+    §CORE-06/wait/bytes/unsupported     → test_local_wait_bytes_unsupported
     §CORE-06/secret-hygiene/env-keys    → test_env_values_not_recorded_in_logs
     §CORE-06/at-view/shares-buffer      → test_at_view_shares_log_buffer
     §CORE-06/closed/still-readable      → test_logs_readable_after_close
@@ -41,9 +52,11 @@ from redpymake.exceptions import (
     CommandTimeoutError,
     LogWaitTimeoutError,
     SessionClosedError,
+    UnsupportedOperationError,
 )
 
 from ._helpers.log_probe import find_by_op, find_events
+from ._helpers.serial_stub import open_stub_serial
 
 
 # ---------------------------------------------------- 自动收集（真实 run）
@@ -303,6 +316,167 @@ def test_run_wait_no_race(local_session, python_probe):
     match = result.wait("BOOT", timeout=1)
     assert match.text == "BOOT"
     assert match.command_result is result
+    assert match.index == 0
+
+
+def test_wait_or_list_returns_index(local_session):
+    """§CORE-06：list/tuple 为 OR；先命中者胜，``index`` 为序列下标。"""
+    cursor = local_session.logs.cursor()
+    local_session.logs.buffer.append(
+        event="command_output", level="INFO", stream="stdout", message="FAILED"
+    )
+    m = local_session.wait(["READY", "FAILED"], timeout=1, since=cursor)
+    assert m.index == 1
+    assert m.pattern == "FAILED"
+    assert m.text == "FAILED"
+
+
+def test_wait_empty_sequence_raises(local_session):
+    """§CORE-06：空序列抛 ``ValueError``。"""
+    with pytest.raises(ValueError):
+        local_session.wait([], timeout=0.1)
+
+
+def test_wait_mixed_text_and_bytes_raises(local_session):
+    """§CORE-06：同一调用不得混用文本与字节模式。"""
+    with pytest.raises(TypeError):
+        local_session.wait(["READY", b"\x06"], timeout=0.1)
+
+
+def test_wait_multiline_joins_records(local_session):
+    """§CORE-06：``multiline=True`` 用换行拼接记录；默认不跨行。"""
+    cursor = local_session.logs.cursor()
+    local_session.logs.buffer.append(
+        event="command_output", level="INFO", stream="stdout", message="foo"
+    )
+    local_session.logs.buffer.append(
+        event="command_output", level="INFO", stream="stdout", message="bar"
+    )
+    with pytest.raises(LogWaitTimeoutError):
+        local_session.wait(re.compile(r"foo\nbar"), timeout=0.15, since=cursor)
+    m = local_session.wait(
+        re.compile(r"foo\nbar"), timeout=1, since=cursor, multiline=True
+    )
+    assert m.text == "foo\nbar"
+    assert m.record is not None
+    assert m.record.message == "bar"
+
+
+def test_wait_chain_starts_after_match(local_session):
+    """§CORE-06：``LogMatch.wait`` 从命中记录之后继续，不回扫更早的模式。"""
+    cursor = local_session.logs.cursor()
+    local_session.logs.buffer.append(
+        event="command_output", level="INFO", stream="stdout", message="B-early"
+    )
+    local_session.logs.buffer.append(
+        event="command_output", level="INFO", stream="stdout", message="A"
+    )
+    first = local_session.wait("A", timeout=1, since=cursor)
+    with pytest.raises(LogWaitTimeoutError):
+        first.wait("B-early", timeout=0.15)
+    local_session.logs.buffer.append(
+        event="command_output", level="INFO", stream="stdout", message="B-late"
+    )
+    second = first.wait("B-late", timeout=1)
+    assert second.text == "B-late"
+
+
+def test_wait_bytes_on_serial(monkeypatch):
+    """§CORE-06：串口 ``wait(bytes)`` 匹配原始 RX。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+
+        def _feed():
+            time.sleep(0.05)
+            port.feed(b"\xaa\x55")
+
+        threading.Thread(target=_feed, daemon=True).start()
+        m = sess.wait(b"\xaa\x55", timeout=1)
+        assert m.text == b"\xaa\x55"
+        assert m.record is None
+        assert m.index == 0
+
+
+def test_wait_bytes_regex(monkeypatch):
+    """§CORE-06：``re.Pattern[bytes]`` 在原始 RX 上搜索。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+
+        def _feed():
+            time.sleep(0.05)
+            port.feed(b"\xaa\x00\xff\x55")
+
+        threading.Thread(target=_feed, daemon=True).start()
+        m = sess.wait(re.compile(rb"\xaa.{2}\x55"), timeout=1)
+        assert m.text == b"\xaa\x00\xff\x55"
+
+
+def test_wait_bytes_does_not_split_on_lf(monkeypatch):
+    """§CORE-06：字节等待不按 ``\\n`` 分帧。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+
+        def _feed():
+            time.sleep(0.05)
+            port.feed(b"\x01\n\x02")
+
+        threading.Thread(target=_feed, daemon=True).start()
+        m = sess.wait(b"\x01\n\x02", timeout=1)
+        assert m.text == b"\x01\n\x02"
+
+
+def test_run_wait_bytes_no_race(monkeypatch):
+    """§CORE-06：``run(bytes).wait(bytes)`` 不漏写出后立即回显的字节。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+        port.echo = True
+        m = sess.run(b"\x01\x02").wait(b"\x01\x02", timeout=1)
+        assert m.text == b"\x01\x02"
+        assert m.command_result is not None
+
+
+def test_wait_bytes_chain_starts_after_match(monkeypatch):
+    """§CORE-06：字节链从上一匹配子串结束处继续。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+
+        def _feed():
+            time.sleep(0.05)
+            port.feed(b"AB")
+
+        threading.Thread(target=_feed, daemon=True).start()
+        m = sess.wait(b"A", timeout=1).wait(b"B", timeout=1)
+        assert m.text == b"B"
+
+
+def test_wait_bytes_or_list(monkeypatch):
+    """§CORE-06：字节 OR 列表返回命中下标。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+
+        def _feed():
+            time.sleep(0.05)
+            port.feed(b"\x15")
+
+        threading.Thread(target=_feed, daemon=True).start()
+        m = sess.wait([b"\x06", b"\x15"], timeout=1)
+        assert m.index == 1
+        assert m.pattern == b"\x15"
+
+
+def test_local_wait_bytes_unsupported(local_session):
+    """§CORE-06：非串口对字节模式抛 ``UnsupportedOperationError``。"""
+    with pytest.raises(UnsupportedOperationError):
+        local_session.wait(b"\x00", timeout=0.1)
+
+
+def test_wait_bytes_timeout_carries_data(monkeypatch):
+    """§CORE-07 / CORE-06：字节等待超时携带 ``data`` 扫描窗口。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+
+        def _feed():
+            time.sleep(0.02)
+            port.feed(b"xyz")
+
+        threading.Thread(target=_feed, daemon=True).start()
+        with pytest.raises(LogWaitTimeoutError) as ei:
+            sess.wait(b"\xff", timeout=0.2)
+        assert ei.value.data is not None
+        assert b"xyz" in ei.value.data
 
 
 # ----------------------------------------------------- 密码 / env 脱敏

@@ -41,6 +41,7 @@ from .exceptions import LogWaitTimeoutError, SessionClosedError
 
 if TYPE_CHECKING:  # pragma: no cover
     from ._command import CommandResult
+    from ._session import Session
 
 
 # 库不得调用 logging.basicConfig()；此 logger 供内部诊断使用，
@@ -89,11 +90,47 @@ class LogCursor:
 class LogMatch:
     """``wait()`` 成功返回的匹配结果。"""
 
-    pattern: str | Pattern[str]
-    record: SessionLogRecord
-    text: str
+    pattern: str | bytes | Pattern[str] | Pattern[bytes]
+    record: SessionLogRecord | None
+    text: str | bytes
     elapsed: float
+    index: int = 0
     command_result: "CommandResult | None" = None
+    session: "Session | None" = field(default=None, repr=False)
+    _rx_end: int | None = field(default=None, repr=False)
+
+    def wait(
+        self,
+        pattern: Any,
+        timeout: float = 30,
+        *,
+        channel: str | None = None,
+        multiline: bool = False,
+    ) -> "LogMatch":
+        """从本次命中之后继续等待（顺序 expect）。"""
+        if self.session is None:
+            raise RuntimeError("LogMatch.session is missing; cannot chain wait()")
+        _pats, is_bytes = normalize_wait_patterns(pattern)
+        if is_bytes:
+            return self.session.wait(
+                pattern,
+                timeout,
+                channel=channel,
+                multiline=multiline,
+                command_result=self.command_result,
+                rx_since=self._rx_end,
+            )
+        since: LogCursor | None = None
+        if self.record is not None:
+            since = LogCursor(self.record.session_id, self.record.sequence + 1)
+        return self.session.wait(
+            pattern,
+            timeout,
+            channel=channel,
+            since=since,
+            multiline=multiline,
+            command_result=self.command_result,
+        )
 
 
 Subscriber = Callable[[SessionLogRecord], None]
@@ -262,30 +299,31 @@ class LogBuffer:
 
     def wait(
         self,
-        pattern: str | Pattern[str],
+        pattern: Any,
         timeout: float,
         *,
         channel: str | None = None,
         since: LogCursor | None = None,
         command_result: "CommandResult | None" = None,
+        multiline: bool = False,
+        session: "Session | None" = None,
     ) -> LogMatch:
         """阻塞等待模式匹配某条日志记录。
 
         - 先扫描 ``since`` 之后的既有记录，再等待新写入的记录。
-        - 支持字符串（子串匹配）与 ``re.Pattern``（正则搜索）。
+        - 支持字符串（子串匹配）、``re.Pattern``，以及 list/tuple OR。
+        - ``multiline=True`` 时拼接数据日志再搜。
         - 超时抛 ``LogWaitTimeoutError``；会话关闭抛 ``SessionClosedError``。
         """
 
-        matcher = _compile_matcher(pattern)
+        patterns, is_bytes = normalize_wait_patterns(pattern)
+        if is_bytes:
+            raise TypeError("bytes patterns must be handled by Session.wait, not LogBuffer")
         deadline = time.monotonic() + max(timeout, 0.0)
         start = time.monotonic()
 
-        # 起始位置：若未指定则从下一条开始，避免匹配到 wait 调用之前的全部历史。
         start_seq = since.sequence if since is not None else self.next_sequence()
 
-        # channel 语义：显式指定则严格过滤；未指定时只匹配"数据日志"
-        # （stdout/stderr/serial），不匹配 system 框架事件，避免 wait 意外
-        # 匹配到 ``$ command_line`` 之类的记录。
         allowed_streams: set[str] | None
         if channel is not None:
             allowed_streams = {channel}
@@ -298,24 +336,39 @@ class LogBuffer:
 
             scan_from_idx = 0
             while True:
-                # 从缓冲中查找 sequence >= start_seq 且匹配的记录。
-                # deque 是按追加顺序的，从头到尾即可。
-                for idx in range(scan_from_idx, len(self._records)):
-                    rec = self._records[idx]
-                    if rec.sequence < start_seq:
-                        continue
-                    if allowed_streams is not None and rec.stream not in allowed_streams:
-                        continue
-                    if matcher(rec.message):
-                        elapsed = time.monotonic() - start
-                        return LogMatch(
-                            pattern=pattern,
-                            record=rec,
-                            text=rec.message,
-                            elapsed=elapsed,
-                            command_result=command_result,
-                        )
-                scan_from_idx = len(self._records)
+                if multiline:
+                    hit = self._match_multiline(
+                        patterns,
+                        start_seq=start_seq,
+                        allowed_streams=allowed_streams,
+                    )
+                else:
+                    hit = None
+                    for idx in range(scan_from_idx, len(self._records)):
+                        rec = self._records[idx]
+                        if rec.sequence < start_seq:
+                            continue
+                        if allowed_streams is not None and rec.stream not in allowed_streams:
+                            continue
+                        found = _match_text_patterns(patterns, rec.message)
+                        if found is not None:
+                            pat, index, matched = found
+                            hit = (pat, index, matched, rec)
+                            break
+                    scan_from_idx = len(self._records)
+
+                if hit is not None:
+                    pat, index, matched, rec = hit
+                    elapsed = time.monotonic() - start
+                    return LogMatch(
+                        pattern=pat,
+                        record=rec,
+                        text=matched,
+                        elapsed=elapsed,
+                        index=index,
+                        command_result=command_result,
+                        session=session,
+                    )
 
                 if self._closed:
                     raise SessionClosedError(
@@ -326,7 +379,6 @@ class LogBuffer:
                     break
                 self._cond.wait(timeout=remaining)
 
-        # 超时：收集 since 之后的记录与文本供异常携带
         records = self.records(since=since, channel=channel)
         output = "\n".join(r.message for r in records if r.event == "command_output")
         raise LogWaitTimeoutError(
@@ -338,14 +390,154 @@ class LogBuffer:
             command_result=command_result,
         )
 
+    def _match_multiline(
+        self,
+        patterns: Sequence[Any],
+        *,
+        start_seq: int,
+        allowed_streams: set[str] | None,
+    ) -> tuple[Any, int, str, SessionLogRecord] | None:
+        haystack, last = _haystack_and_last(
+            self._records,
+            start_seq=start_seq,
+            allowed_streams=allowed_streams,
+        )
+        if last is None:
+            return None
+        found = _earliest_text_match(patterns, haystack)
+        if found is None:
+            return None
+        pat, index, _matched, _pos = found
+        return pat, index, haystack, last
 
-def _compile_matcher(pattern: str | Pattern[str]) -> Callable[[str], bool]:
-    if isinstance(pattern, str):
-        needle = pattern
-        return lambda text: needle in text
+
+def _haystack_and_last(
+    records: Iterable[SessionLogRecord],
+    *,
+    start_seq: int,
+    allowed_streams: set[str] | None,
+) -> tuple[str, SessionLogRecord | None]:
+    parts: list[str] = []
+    last: SessionLogRecord | None = None
+    for rec in records:
+        if rec.sequence < start_seq:
+            continue
+        if allowed_streams is not None and rec.stream not in allowed_streams:
+            continue
+        parts.append(rec.message)
+        last = rec
+    return "\n".join(parts), last
+
+
+def _pattern_is_bytes(pattern: Any) -> bool:
+    if isinstance(pattern, bytes):
+        return True
     if isinstance(pattern, re.Pattern):
-        return lambda text: pattern.search(text) is not None
-    raise TypeError(f"pattern must be str or re.Pattern, got {type(pattern).__name__}")
+        return isinstance(pattern.pattern, (bytes, bytearray))
+    return False
+
+
+def _pattern_is_text(pattern: Any) -> bool:
+    if isinstance(pattern, str):
+        return True
+    if isinstance(pattern, re.Pattern):
+        return isinstance(pattern.pattern, str)
+    return False
+
+
+def normalize_wait_patterns(pattern: Any) -> tuple[list[Any], bool]:
+    """把 wait 第一参数归一为模式列表，并标明是否为字节模式。"""
+    if _pattern_is_text(pattern) or _pattern_is_bytes(pattern):
+        pats = [pattern]
+    elif isinstance(pattern, Sequence):
+        pats = list(pattern)
+        if not pats:
+            raise ValueError("wait() pattern sequence must not be empty")
+    else:
+        raise TypeError(
+            "pattern must be str, bytes, re.Pattern, or a sequence of those, "
+            f"got {type(pattern).__name__}"
+        )
+
+    kinds: list[str] = []
+    for p in pats:
+        if _pattern_is_bytes(p):
+            kinds.append("bytes")
+        elif _pattern_is_text(p):
+            kinds.append("text")
+        else:
+            raise TypeError(
+                f"wait() pattern entries must be str, bytes, or re.Pattern; "
+                f"got {type(p).__name__}"
+            )
+    if len(set(kinds)) > 1:
+        raise TypeError("wait() cannot mix text and bytes patterns")
+    return pats, kinds[0] == "bytes"
+
+
+def _match_text_patterns(
+    patterns: Sequence[Any], text: str
+) -> tuple[Any, int, str] | None:
+    """逐条记录：列表顺序，先匹配者胜。"""
+    for i, pat in enumerate(patterns):
+        if isinstance(pat, str):
+            if pat in text:
+                return pat, i, text
+        else:
+            if pat.search(text) is not None:
+                return pat, i, text
+    return None
+
+
+def _earliest_text_match(
+    patterns: Sequence[Any], haystack: str
+) -> tuple[Any, int, str, int] | None:
+    """拼接 haystack：谁先出现谁赢，并列时列表下标更小者胜。"""
+    best: tuple[int, int, Any, str] | None = None
+    for i, pat in enumerate(patterns):
+        if isinstance(pat, str):
+            pos = haystack.find(pat)
+            if pos < 0:
+                continue
+            matched = pat
+        else:
+            m = pat.search(haystack)
+            if m is None:
+                continue
+            pos = m.start()
+            matched = m.group(0)
+        if best is None or pos < best[0] or (pos == best[0] and i < best[1]):
+            best = (pos, i, pat, matched)
+    if best is None:
+        return None
+    pos, i, pat, matched = best
+    return pat, i, matched, pos
+
+
+def _earliest_bytes_match(
+    patterns: Sequence[Any], haystack: bytes
+) -> tuple[Any, int, bytes, int] | None:
+    """原始字节 haystack：谁先出现谁赢。"""
+    best: tuple[int, int, Any, bytes] | None = None
+    for i, pat in enumerate(patterns):
+        if isinstance(pat, (bytes, bytearray)):
+            needle = bytes(pat)
+            pos = haystack.find(needle)
+            if pos < 0:
+                continue
+            matched: bytes = needle
+        else:
+            m = pat.search(haystack)
+            if m is None:
+                continue
+            pos = m.start()
+            matched = m.group(0)
+        if best is None or pos < best[0] or (pos == best[0] and i < best[1]):
+            best = (pos, i, pat, matched)
+    if best is None:
+        return None
+    pos, i, pat, matched = best
+    return pat, i, matched, pos
 
 
 # ------------------------------ tag ambient ------------------------------
