@@ -145,6 +145,8 @@ class ScriptRun:
         "_dump_on_error",
         "_log_level",
         "_loggers",
+        "_console",
+        "_console_handler",
         "_handler",
         "_handler_targets",
         "_cv_token",
@@ -167,11 +169,14 @@ class ScriptRun:
         dump_on_error: "str | os.PathLike[str] | bool | Callable[[ScriptSnapshot], None] | None" = None,
         log_level: str | int = "INFO",
         loggers: Sequence[str] | None = None,
+        console: bool | None = None,
     ) -> None:
         self._name = name or "script"
         self._dump_on_error = dump_on_error
         self._log_level = _normalize_level(log_level)
         self._loggers: tuple[str, ...] | None = tuple(loggers) if loggers is not None else None
+        self._console = console
+        self._console_handler: logging.Handler | None = None
 
         self._handler: _ScriptLoggingHandler | None = None
         self._handler_targets: list[logging.Logger] = []
@@ -279,7 +284,37 @@ class ScriptRun:
             lg.addHandler(self._handler)
         self._handler_targets = targets
 
+        should_console = (
+            self._console
+            if self._console is not None
+            else (os.environ.get("REDPYMAKE_CLI") == "1")
+        )
+        if should_console:
+            root_logger = logging.getLogger()
+            has_stream = any(
+                isinstance(h, logging.StreamHandler) and not isinstance(h, _ScriptLoggingHandler)
+                for h in root_logger.handlers
+            )
+            if not has_stream:
+                handler = logging.StreamHandler()
+                handler.setLevel(self._log_level)
+                handler.setFormatter(
+                    logging.Formatter(
+                        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%H:%M:%S"
+                    )
+                )
+                root_logger.addHandler(handler)
+                self._console_handler = handler
+                if root_logger.level > self._log_level or root_logger.level == logging.NOTSET:
+                    root_logger.setLevel(self._log_level)
+
     def _uninstall_handler(self) -> None:
+        if self._console_handler is not None:
+            try:
+                logging.getLogger().removeHandler(self._console_handler)
+            except Exception:  # pragma: no cover
+                pass
+            self._console_handler = None
         if self._handler is None:
             return
         for lg in self._handler_targets:
@@ -601,6 +636,7 @@ def script(
     dump_on_error: "str | os.PathLike[str] | bool | Callable[[ScriptSnapshot], None] | None" = None,
     log_level: str | int = "INFO",
     loggers: Sequence[str] | None = None,
+    console: bool | None = None,
 ) -> ScriptRun:
     """构造一次脚本运行（``ScriptRun``）。见 § CORE-09。"""
     return ScriptRun(
@@ -608,6 +644,7 @@ def script(
         dump_on_error=dump_on_error,
         log_level=log_level,
         loggers=loggers,
+        console=console,
     )
 
 

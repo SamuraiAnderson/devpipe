@@ -4,6 +4,7 @@
     §CORE-10/cli/discover-json    → test_cli_discover_json_outputs_cards
     §CORE-10/cli/discover-tree    → test_cli_discover_tree_lists_names
     §CORE-10/cli/run-sink-env     → test_cli_run_sets_sink_env_and_writes_ndjson
+    §CORE-10/cli/run-auto-logging → test_cli_run_auto_configures_logging_to_stderr
     §CORE-10/cli/run-exit-code    → test_cli_run_propagates_exit_code
     §CORE-10/cli/run-warns-missing→ test_cli_run_warns_when_script_has_no_block
     §CORE-10/cli/report-self-contained → test_cli_report_generates_self_contained_html
@@ -99,6 +100,29 @@ if __name__ == "__main__":
     assert "script.begin" in text
     assert "OK-LINE" in text
     assert "script.end" in text
+
+
+def test_cli_run_auto_configures_logging_to_stderr(tmp_path: Path):
+    """§CORE-10/cli/run-auto-logging：CLI run 自动装配 basicConfig，将 logging 输出打印至控制台。"""
+    script = tmp_path / "rpm_log_probe.py"
+    script.write_text(
+        """import logging
+import redpymake as rpm
+
+def main() -> None:
+    with rpm.script("log_probe"):
+        logging.info("CLI-AUTO-LOG-OUTPUT")
+
+if __name__ == "__main__":
+    main()
+""",
+        encoding="utf-8",
+    )
+    sink = tmp_path / "log_live.ndjson"
+    res = _run_cli("run", str(script), "--sink", str(sink))
+    assert res.returncode == 0, res.stderr
+    combined_output = res.stderr + res.stdout
+    assert "CLI-AUTO-LOG-OUTPUT" in combined_output
 
 
 def test_cli_run_propagates_exit_code(tmp_path: Path):

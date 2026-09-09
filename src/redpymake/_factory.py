@@ -132,7 +132,6 @@ def serial(
     port: str,
     *,
     baudrate: int = 115200,
-    timeout: float = 1.0,
     newline: str = "",
     encoding: str = "utf-8",
 ) -> "Session":
@@ -142,7 +141,6 @@ def serial(
         return ws.serial(
             port,
             baudrate=baudrate,
-            timeout=timeout,
             newline=newline,
             encoding=encoding,
         )
@@ -151,7 +149,6 @@ def serial(
     return SerialSession(
         port,
         baudrate=baudrate,
-        timeout=timeout,
         newline=newline,
         encoding=encoding,
     )

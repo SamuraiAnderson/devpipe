@@ -48,6 +48,16 @@ class StubSerialPort:
             self._pending.extend(data)
             self._cv.notify_all()
 
+    @property
+    def in_waiting(self) -> int:
+        with self._cv:
+            return len(self._pending)
+
+    def cancel_read(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
     def close(self) -> None:
         with self._cv:
             self._closed = True

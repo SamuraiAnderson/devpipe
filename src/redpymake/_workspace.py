@@ -512,7 +512,6 @@ class Workspace:
         port: str,
         *,
         baudrate: int = 115200,
-        timeout: float = 1.0,
         newline: str = "",
         encoding: str = "utf-8",
     ) -> _BorrowedSession:
@@ -524,7 +523,6 @@ class Workspace:
             lambda: SerialSession(
                 port,
                 baudrate=baudrate,
-                timeout=timeout,
                 newline=newline,
                 encoding=encoding,
             ),

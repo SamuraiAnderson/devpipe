@@ -200,6 +200,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # 起子进程
     env = os.environ.copy()
     env["REDPYMAKE_LIVE_SINK"] = f"file://{sink_path.as_posix()}"
+    env["REDPYMAKE_CLI"] = "1"
     print(f"[redpymake] sink: {sink_path}", file=sys.stderr)
     proc = subprocess.run([sys.executable, str(script)], env=env)
     return int(proc.returncode)

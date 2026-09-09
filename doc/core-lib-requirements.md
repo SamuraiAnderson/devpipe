@@ -206,8 +206,8 @@ rpm.wsl(distribution=None, user=None)
 
 - **写出**：`run(str)` 按 `encoding` 编码后写入，再追加构造参数 `newline`（**默认空**，不再自动加 `\r\n`）。需要行结束符时写在命令里，例如 `uart.run("reboot\r")`，或显式 `newline="\r"`。
 - **`run(bytes)` 仅串口**：原样写入、不拼 `newline`；禁止额外位置参数与 `shell=True`。其他平台传 `bytes` 抛 `TypeError`。
-- **文本日志**：读侧仍按 `\n` 切行再解码，供 `wait("U-Boot")` 使用。
-- **原始 RX**：另有容量 1 MiB 的环形字节缓冲（不按行切），供 `wait(b"...")` / `wait(re.compile(rb"..."))` 使用。
+- **文本日志与空闲冲刷**：读侧按 `\n` 切行再解码入日志；当串口持续空闲（如无换行符的提示符 `login: `）时，经空闲窗口自动冲刷进日志缓冲，支持 `wait("login: ")` 匹配无终止符提示符。
+- **原始 RX 与流式消费游标**：容量 1 MiB 的环形字节缓冲（不按行切）。会话内部维护流式消费游标，初始从会话起点（0）开始，独立 `wait()` 不漏开机初期到达的日志与原始字节，并在匹配后单调推进。
 
 ### WSL 说明（"构造时立即连接"的显式例外）
 
@@ -852,8 +852,8 @@ run.detach(sess) -> None
 塞入 `run._merged`。这条不进任何 `Session` 的 `LogBuffer`（保持"session 侧只装 session 事件"的语义）。
 
 约束：
-- 库仍不 `logging.basicConfig()`（CORE-06 约束不变）；Script 只挂 Handler，不改任何 logger 的 `level`。
-- 用户仍需自己在脚本侧配 `StreamHandler` 才能在终端看到 logging 输出。CORE-09 只负责"事后落盘"，不主动接管 CLI。
+- 库默认仍不调用 `logging.basicConfig()`（CORE-06 约束不变）；Script 只挂 Handler，不改任何 logger 的 `level`。
+- **CLI 模式与控制台流输出**：当通过 `redpymake run` 命令行启动脚本时（或环境变量 `REDPYMAKE_CLI=1`），若 root logger 尚未配置 handler，`rpm.script(...)` 默认自动调用 `logging.basicConfig()` 配置终端输出（级别跟随 `log_level`，默认输出可读格式），使用户在终端能直接看到 logging 输出；亦可通过 `with rpm.script(..., console=True)` 显式开启。
 
 ### 快照
 
@@ -1039,7 +1039,7 @@ redpymake serve [ROOT] [--host H --port P] [--no-open] [--resume-log]   # 见 CO
 ```
 
 - `discover` 默认输出人类可读树；`--json` 走结构化输出，供机器消费；
-- `run` 用 `subprocess.run([sys.executable, path])` 起子进程，环境变量 `REDPYMAKE_LIVE_SINK=file://<path>` 由 CLI 注入；透传脚本 exit code 作为自身 exit code；
+- `run` 用 `subprocess.run([sys.executable, path])` 起子进程，环境变量 `REDPYMAKE_LIVE_SINK=file://<path>` 与 `REDPYMAKE_CLI=1` 由 CLI 注入；透传脚本 exit code 作为自身 exit code；
 - `report` 是纯离线操作：读 NDJSON，输出**自包含**的 HTML（无外链、无网络请求），供 CI artifact / 邮件附件分享。
 
 ### 明确不做的能力
@@ -1368,7 +1368,7 @@ Live tail 里不同 run 之间画分隔条（`─── hello#3 · succeeded (2.
 
 ### Web UI DOM 部件命名（交流约定）
 
-页面部件有稳定名字，讨论 / issue / commit message 一律用这套词，避免"左边那个列表"式的指代。名字与 DOM 锚点一一对应，树形结构如下：
+页面部件有稳定名字，讨论 / issue / commit message 一律用这套词，避免"左边那个列表"式的指代。名字与 DOM 锚点一一对应：每个命名部件在 DOM 上提供 `aria-label` 等于部件名（如 `LiveView`、`LiveBody`、`SessionCell`），e2e 用这个名称定位。`id` / `class` 仍供前端脚本与样式使用，**不是**测试锚点。树形结构如下：
 
 - **AppShell** (`body.app-shell`) — 视口锁定外壳：TopBar + Layout 两段
   - **TopBar** (`header`) — 标题与全局日志控制，不参与滚动
@@ -1502,6 +1502,8 @@ Web UI 的行为分两层验证，边界按"要不要真实渲染"划：
 **默认不跑**：e2e 需要浏览器二进制（`playwright install chromium`），走 `redpymake[e2e]` extra，用例标 `@pytest.mark.e2e`，默认 `addopts` 排除。显式 `pytest -m e2e` 启用。这与 `integration` 是同一套取舍：验收标准 §5/7 的"默认单测无需网络、真实设备或浏览器"必须成立。
 
 **断言取向：验后果，不验写法**。e2e 断言的是浏览器算出来的结果（`getBoundingClientRect`、`getComputedStyle`、`scrollHeight`），不是样式表里有没有某个字符串。凡是 e2e 能验的布局约束，`styles.css` / `timeline.js` 的文本断言就该让位——后者只在"这条规则被删掉就回归"且 e2e 成本过高时保留。
+
+**定位取向：按名称，不按样式**。e2e 一律用部件的可访问名称定位（Playwright `get_by_label(name, exact=True)`，对应 DOM 上的 `aria-label`），名称与上一节「Web UI DOM 部件命名」对齐。禁止用 class / id 选择器（`#live-root`、`.sb-item`、`.badge.status-succeeded`）当测试锚点——那些是实现细节，改 class 不该让用例红。动态动作按钮的名称跟用户能看见的语义走（例如 RunAction 的 `Run hello`、PlaybackToolbar 的 `Live`），仍用 `aria-label` 暴露，不用 `title` / CSS。记录内容（如 `E2E-HELLO`）可以 `filter(has_text=...)` 收窄，那是断言日志文本，不是在用样式挂钩。
 
 **测试钩子契约**：`window.__rpmStore` 是**稳定的可观测入口**，e2e 可以 `getState()` 读前端状态（`view` / `viewedRunId` / `split` 等，字段见上文"前端状态字段"），也可以 `dispatch(action)` 直接驱动状态迁移。它属于对外契约的一部分：改名或改形状必须同步改 e2e。`window.__rpmTraceActions` 保持为调试开关，不进契约。
 

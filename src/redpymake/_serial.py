@@ -15,9 +15,14 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Pattern, Sequence
 
-from ._logs import LogMatch, _earliest_bytes_match
+from ._logs import (
+    LogCursor,
+    LogMatch,
+    _earliest_bytes_match,
+    normalize_wait_patterns,
+)
 from ._path import ResourceStat
 from ._session import Session
 from ._command import CommandResult
@@ -75,6 +80,43 @@ class _RxRing:
         return actual, bytes(self._buf[skip:])
 
 
+class _StreamCursor:
+    """SerialSession 内部的消费进度跟踪器（文本序号 + 字节偏移），线程安全。"""
+
+    def __init__(self, session_id: str) -> None:
+        self._session_id = session_id
+        self._lock = threading.Lock()
+        self._rx_offset: int = 0
+        self._log_seq: int = 0
+
+    @property
+    def rx_offset(self) -> int:
+        with self._lock:
+            return self._rx_offset
+
+    @property
+    def log_cursor(self) -> LogCursor:
+        with self._lock:
+            return LogCursor(self._session_id, self._log_seq)
+
+    def advance_rx(self, end_offset: int) -> None:
+        with self._lock:
+            if end_offset > self._rx_offset:
+                self._rx_offset = end_offset
+
+    def advance_log(self, next_seq: int) -> None:
+        with self._lock:
+            if next_seq > self._log_seq:
+                self._log_seq = next_seq
+
+    def advance_to_command(self, rx_offset: int | None, log_seq: int) -> None:
+        with self._lock:
+            if rx_offset is not None and rx_offset > self._rx_offset:
+                self._rx_offset = rx_offset
+            if log_seq > self._log_seq:
+                self._log_seq = log_seq
+
+
 def _require_pyserial():
     try:
         import serial  # type: ignore
@@ -97,7 +139,6 @@ class SerialSession(Session):
         port: str,
         *,
         baudrate: int = 115200,
-        timeout: float = 1.0,
         newline: str = "",
         encoding: str = "utf-8",
     ) -> None:
@@ -106,7 +147,7 @@ class SerialSession(Session):
         super().__init__(session_kind="serial", session_label=label, default_cwd=None)
         self.path_style = "posix"
         try:
-            self._port = pyserial.Serial(port=port, baudrate=baudrate, timeout=timeout)
+            self._port = pyserial.Serial(port=port, baudrate=baudrate, timeout=0.05)
         except Exception as exc:
             raise SessionConnectionError(
                 f"failed to open serial port {port}: {exc}",
@@ -117,6 +158,7 @@ class SerialSession(Session):
         self._encoding = encoding
         self._stop = threading.Event()
         self._rx = _RxRing()
+        self._cursor = _StreamCursor(self.session_id)
         self._reader = threading.Thread(
             target=self._reader_loop, name=f"serial-reader-{port}", daemon=True
         )
@@ -135,11 +177,24 @@ class SerialSession(Session):
         buf = b""
         while not self._stop.is_set():
             try:
-                data = self._port.read(256)
+                data = self._port.read(1)
+                if not data:
+                    if buf:
+                        text = buf.decode(self._encoding, errors="replace").rstrip("\r")
+                        if text:
+                            self._log_buffer.append(
+                                event="command_output",
+                                level="INFO",
+                                stream="serial",
+                                message=text,
+                            )
+                        buf = b""
+                    continue
+                in_waiting = getattr(self._port, "in_waiting", 0)
+                if in_waiting:
+                    data += self._port.read(in_waiting)
             except Exception:
                 break
-            if not data:
-                continue
             self._rx.append(data)
             buf += data
             while b"\n" in buf:
@@ -213,6 +268,58 @@ class SerialSession(Session):
             data=haystack,
         )
 
+    def wait(
+        self,
+        pattern: str | bytes | Pattern[str] | Pattern[bytes] | Sequence[Any],
+        timeout: float = 30,
+        *,
+        channel: str | None = None,
+        since: LogCursor | None = None,
+        command_result: CommandResult | None = None,
+        multiline: bool = False,
+        rx_since: int | None = None,
+    ) -> LogMatch:
+        self._check_alive()
+        root = getattr(self, "root", self)
+        cursor: _StreamCursor | None = getattr(root, "_cursor", None)
+        _pats, is_bytes = normalize_wait_patterns(pattern)
+        if is_bytes:
+            start_off = (
+                rx_since
+                if rx_since is not None
+                else (cursor.rx_offset if cursor is not None else None)
+            )
+            match = super().wait(
+                pattern,
+                timeout=timeout,
+                channel=channel,
+                since=since,
+                command_result=command_result,
+                multiline=multiline,
+                rx_since=start_off,
+            )
+            if cursor is not None and match._rx_end is not None:
+                cursor.advance_rx(match._rx_end)
+            return match
+        else:
+            effective_since = (
+                since
+                if since is not None
+                else (cursor.log_cursor if cursor is not None else None)
+            )
+            match = super().wait(
+                pattern,
+                timeout=timeout,
+                channel=channel,
+                since=effective_since,
+                command_result=command_result,
+                multiline=multiline,
+                rx_since=rx_since,
+            )
+            if cursor is not None and match.record is not None:
+                cursor.advance_log(match.record.sequence + 1)
+            return match
+
     def _execute_command(
         self,
         argv: Sequence[str | bytes],
@@ -240,6 +347,8 @@ class SerialSession(Session):
             line = argv[0] if shell else " ".join(argv)  # type: ignore[arg-type]
             payload = line.encode(encoding) + self._newline.encode(encoding)
         cursor_before = self._log_buffer.cursor()
+        rx_before = self._rx_cursor()
+        self._cursor.advance_to_command(rx_before, cursor_before.sequence)
         try:
             self._port.write(payload)
             self._port.flush()
@@ -275,6 +384,11 @@ class SerialSession(Session):
     def _close_impl(self) -> None:
         self._stop.set()
         self._rx.close()
+        try:
+            if hasattr(self._port, "cancel_read"):
+                self._port.cancel_read()
+        except Exception:
+            pass
         try:
             self._port.close()
         except Exception:

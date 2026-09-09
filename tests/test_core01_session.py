@@ -16,6 +16,10 @@
     §CORE-01/serial/no-fs             → test_serial_resource_ops_raise_unsupported
     §CORE-01/serial/run-str-no-crlf   → test_serial_run_str_does_not_append_newline
     §CORE-01/serial/run-bytes         → test_serial_run_bytes_writes_raw
+    §CORE-01/serial/no-timeout        → test_serial_signature_has_no_timeout
+    §CORE-01/serial/streaming         → test_serial_streaming_rx_immediate
+    §CORE-01/serial/idle-flush        → test_serial_prompt_idle_flush
+    §CORE-01/serial/stream-cursor     → test_serial_stream_cursor_catches_pre_wait_history_and_advances
     §CORE-01/wsl/no-wsl-binary        → test_wsl_without_binary_raises_session_connection_error
 
 """
@@ -244,6 +248,62 @@ def test_serial_run_bytes_writes_raw(monkeypatch):
     with pytest.raises(TypeError):
         with open_stub_serial(monkeypatch) as (sess, _port):
             sess.run(b"\x01", shell=True)
+
+
+def test_serial_signature_has_no_timeout():
+    """§CORE-01/serial/no-timeout：SerialSession 与 rpm.serial 接口不设 timeout 初始化参数，保证流式传输。"""
+    import inspect
+
+    sig_factory = inspect.signature(rpm.serial)
+    assert "timeout" not in sig_factory.parameters
+    sig_cls = inspect.signature(rpm.SerialSession)
+    assert "timeout" not in sig_cls.parameters
+
+
+def test_serial_streaming_rx_immediate(monkeypatch):
+    """§CORE-01/serial/streaming：底层流式接收短字节片段，无需等待分块或超时。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+        # 即使只喂入 1 个字节，也能立刻匹配，不要求凑满 block 或等待固定底层超时
+        port.feed(b"A")
+        m1 = sess.wait(b"A", timeout=1.0)
+        assert m1.text == b"A"
+
+        # 连续追加流式数据
+        port.feed(b"B")
+        port.feed(b"C\n")
+        m2 = sess.wait("BC", timeout=1.0)
+        assert "BC" in m2.text
+
+
+def test_serial_prompt_idle_flush(monkeypatch):
+    """§CORE-01/serial/idle-flush：无 \\n 的提示符（如 login: ）在短空闲后自动冲刷入文本日志，支持 wait 匹配。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+        port.feed(b"login: ")
+        # 无换行符，空闲超时后应能被普通文本 wait 匹配
+        m = sess.wait("login: ", timeout=1.0)
+        assert m.text == "login: "
+
+
+def test_serial_stream_cursor_catches_pre_wait_history_and_advances(monkeypatch):
+    """§CORE-01/serial/stream-cursor：流式消费游标自 0 开始，捕获调用 wait 前到达的历史并在匹配后推进。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+        # 1. 文本历史感知与推进
+        port.feed(b"U-Boot 2024.01\r\n")
+        port.feed(b"autoboot in 3s\r\n")
+        # 即使在 wait 之前就已经到达，也能命中，避免时序竞态
+        m1 = sess.wait("U-Boot", timeout=1.0)
+        assert "U-Boot" in m1.text
+        # 下一次独立 wait 自动从上一次命中之后继续，不会重复命中 U-Boot
+        m2 = sess.wait("autoboot", timeout=1.0)
+        assert "autoboot" in m2.text
+        assert m2.record.sequence > m1.record.sequence
+
+        # 2. 字节历史感知与推进
+        port.feed(b"\xaa\x55\x01\x02")
+        bm1 = sess.wait(b"\xaa\x55", timeout=1.0)
+        assert bm1.text == b"\xaa\x55"
+        bm2 = sess.wait(b"\x01\x02", timeout=1.0)
+        assert bm2.text == b"\x01\x02"
 
 
 def test_wsl_without_binary_raises_session_connection_error(monkeypatch):

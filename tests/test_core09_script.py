@@ -21,6 +21,8 @@
     §CORE-09/lifecycle/contextvar-reset  → test_script_contextvar_reset_after_exit
     §CORE-09/lifecycle/nested-isolated   → test_script_nested_scopes_isolated
     §CORE-09/snapshot/sorted             → test_script_snapshot_sorted_by_timestamp
+    §CORE-09/cli-auto-basicconfig        → test_script_cli_mode_auto_basic_config
+    §CORE-09/console-flag                → test_script_console_flag_configures_stream_handler
 """
 
 from __future__ import annotations
@@ -331,3 +333,32 @@ def test_script_snapshot_sorted_by_timestamp(caplog):
             logger.info(f"line-{i}")
     recs = run.snapshot().records
     assert list(recs) == sorted(recs, key=lambda r: (r.timestamp, r.session_id, r.sequence))
+
+
+def test_script_cli_mode_auto_basic_config(monkeypatch):
+    """§CORE-09/cli-auto-basicconfig：CLI 模式（REDPYMAKE_CLI=1）下自动装配控制台日志输出。"""
+    monkeypatch.setenv("REDPYMAKE_CLI", "1")
+    root_logger = logging.getLogger()
+    # 记录进入前的 handler 数量
+    before_handlers = list(root_logger.handlers)
+    with rpm.script(name="cli_probe"):
+        has_console = any(
+            isinstance(h, logging.StreamHandler) and not type(h).__name__.startswith("_Script")
+            for h in root_logger.handlers
+        )
+        assert has_console is True
+    # 退出时若由 ScriptRun 动态装配的控制台 handler 应被妥善回收
+    assert len(root_logger.handlers) == len(before_handlers)
+
+
+def test_script_console_flag_configures_stream_handler():
+    """§CORE-09/console-flag：显式 console=True 无论是否 CLI 都激活控制台输出。"""
+    root_logger = logging.getLogger()
+    before_handlers = list(root_logger.handlers)
+    with rpm.script(name="console_probe", console=True):
+        has_console = any(
+            isinstance(h, logging.StreamHandler) and not type(h).__name__.startswith("_Script")
+            for h in root_logger.handlers
+        )
+        assert has_console is True
+    assert len(root_logger.handlers) == len(before_handlers)
