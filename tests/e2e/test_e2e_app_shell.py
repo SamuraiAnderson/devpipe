@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from .conftest import by_name
+
 if TYPE_CHECKING:
     import redpymake as rpm
     from playwright.sync_api import Page
@@ -50,13 +52,13 @@ def test_hidden_run_detail_takes_no_space(app_page: tuple["Page", "rpm.Workspace
     挤成半高。这里直接量两者的 bounding box，而不是去猜样式表怎么写。
     """
     page, _ws = app_page
-    detail = page.locator("#timeline-root")
+    detail = by_name(page, "RunDetailView")
     assert detail.get_attribute("hidden") is not None, "初始态应停在 Live 视图"
     # 隐藏元素在 Playwright 里没有 box；有 box 就说明它在占位
     assert detail.bounding_box() is None
 
-    live_box = page.locator("#live-root").bounding_box()
-    panel_box = page.locator("main.main-panel").bounding_box()
+    live_box = by_name(page, "LiveView").bounding_box()
+    panel_box = by_name(page, "MainPanel").bounding_box()
     assert live_box is not None and panel_box is not None
     assert live_box["height"] >= panel_box["height"] - 2, (
         f"LiveView 高 {live_box['height']}px 未吃满 MainPanel 的 "
@@ -73,13 +75,12 @@ def test_scrolling_happens_inside_containers(
     存在，由 ``test_e2e_run_flow.py`` 的回放用例覆盖。
     """
     page, _ws = page_with_log_rows
-    for selector in (".sidebar", "#live-root ol.live-body"):
-        overflow = page.eval_on_selector(selector, "el => getComputedStyle(el).overflowY")
-        assert overflow in ("auto", "scroll"), f"{selector} 不是滚动容器（overflowY={overflow}）"
+    for name in ("Sidebar", "LiveBody"):
+        overflow = by_name(page, name).evaluate("el => getComputedStyle(el).overflowY")
+        assert overflow in ("auto", "scroll"), f"{name} 不是滚动容器（overflowY={overflow}）"
 
     # LiveBody 真的能滚，且滚它不会带动文档
-    scrolled = page.eval_on_selector(
-        "#live-root ol.live-body",
+    scrolled = by_name(page, "LiveBody").evaluate(
         """el => {
             el.scrollTop = el.scrollHeight;
             return { top: el.scrollTop, docTop: document.documentElement.scrollTop };

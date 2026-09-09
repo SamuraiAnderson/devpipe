@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from .conftest import RUN_TIMEOUT_MS
+from .conftest import RUN_TIMEOUT_MS, by_name
 
 if TYPE_CHECKING:
     import redpymake as rpm
@@ -33,20 +33,20 @@ def test_clicking_run_action_streams_output_to_live(
     """§CORE-11/web/e2e/run-action：点 ScriptItem 的 ▶ 后，输出经 WS 落到 LiveBody。"""
     page, ws = app_page
 
-    page.get_by_title("Run hello").click()
+    by_name(page, "Run hello").click()
 
     # 脚本 stdout 经 WS 推到 LiveBody；这条一过就说明 enqueue + WS + 渲染都通了
-    page.locator(
-        "#live-root ol.live-body li.tl-row", has_text="E2E-HELLO"
+    by_name(by_name(page, "LiveView"), "LogRow").filter(
+        has_text="E2E-HELLO"
     ).first.wait_for(timeout=RUN_TIMEOUT_MS)
 
     # workspace.run.begin/end 元行驱动的流内 run 边界
-    page.locator("#live-root li.run-separator").first.wait_for(timeout=RUN_TIMEOUT_MS)
+    by_name(page, "RunSeparator").first.wait_for(timeout=RUN_TIMEOUT_MS)
 
     # Sidebar 的 StatusBadge 走到终态
-    page.locator(
-        "#runs-list li.sb-item .badge.status-succeeded"
-    ).first.wait_for(timeout=RUN_TIMEOUT_MS)
+    by_name(page, "StatusBadge").filter(has_text="succeeded").first.wait_for(
+        timeout=RUN_TIMEOUT_MS
+    )
 
     # 服务端侧同样是成功终态——UI 显示的不是自己编的
     runs = list(ws.runs)
@@ -63,27 +63,27 @@ def test_run_detail_and_back_to_live_round_trip(
     ``test_e2e_app_shell.py`` 的覆盖范围里。
     """
     page, _ws = page_with_log_rows
-    page.locator(
-        "#runs-list li.sb-item .badge.status-succeeded"
-    ).first.wait_for(timeout=RUN_TIMEOUT_MS)
+    by_name(page, "StatusBadge").filter(has_text="succeeded").first.wait_for(
+        timeout=RUN_TIMEOUT_MS
+    )
 
-    # 只有 RunItem 的 .sb-label 带 onclick；点 li 本身是无副作用的（防误触）
-    page.locator("#runs-list li.sb-item .sb-label").first.click()
+    # 只有 RunItem 带 onclick；点整行其它区域是无副作用的（防误触）
+    by_name(page, "RunItem").first.click()
 
-    page.locator("#timeline-root .pane-set").wait_for()
+    by_name(by_name(page, "RunDetailView"), "PaneSet").wait_for()
     assert page.evaluate("() => window.__rpmStore.getState().view") == "run"
-    assert page.locator("#main-toolbar").is_visible(), "回放态才出现 MainToolbar"
-    assert page.locator("#live-root").get_attribute("hidden") is not None
+    assert by_name(page, "MainToolbar").is_visible(), "回放态才出现 MainToolbar"
+    assert by_name(page, "LiveView").get_attribute("hidden") is not None
     # 回放专属控件：Live·Play·Reset·Step·Speed·Scrubber
-    assert page.locator("#timeline-root .timeline-toolbar").is_visible()
+    assert by_name(page, "PlaybackToolbar").is_visible()
 
-    overflow = page.eval_on_selector(
-        "#timeline-root ol.timeline-body", "el => getComputedStyle(el).overflowY"
+    overflow = by_name(page, "TimelineBody").evaluate(
+        "el => getComputedStyle(el).overflowY"
     )
     assert overflow in ("auto", "scroll"), f"TimelineBody 不是滚动容器（overflowY={overflow}）"
 
-    page.locator("#back-to-live").click()
-    page.locator("#live-root ol.live-body").wait_for()
+    by_name(page, "BackToLiveButton").click()
+    by_name(page, "LiveBody").wait_for()
     assert page.evaluate("() => window.__rpmStore.getState().view") == "live"
-    assert page.locator("#live-root").get_attribute("hidden") is None
-    assert page.locator("#timeline-root").get_attribute("hidden") is not None
+    assert by_name(page, "LiveView").get_attribute("hidden") is None
+    assert by_name(page, "RunDetailView").get_attribute("hidden") is not None

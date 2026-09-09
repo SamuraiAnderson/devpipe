@@ -19,7 +19,7 @@ import pytest
 import redpymake as rpm
 
 if TYPE_CHECKING:  # 运行时不导入：未装 playwright 的机器也要能收集本目录
-    from playwright.sync_api import Page
+    from playwright.sync_api import Locator, Page
 
 # 缺 e2e extra 时跳过整个目录（skip 而不是 error）
 pytest.importorskip(
@@ -34,6 +34,16 @@ UI_TIMEOUT_MS = 15_000
 # 跑一个脚本要起子进程、连本地会话、回推 WS，比纯 UI 操作慢一个量级
 RUN_TIMEOUT_MS = 40_000
 SERVER_READY_TIMEOUT = 20.0
+
+
+def by_name(target: "Page | Locator", name: str) -> "Locator":
+    """按 CORE-11 部件名定位（``aria-label``，精确匹配）。
+
+    ``target`` 可以是 ``Page`` 或已经收窄过的 ``Locator``，用来在 LiveView /
+    RunDetailView 里继续按名字找子部件。e2e 不得改用 class / id 选择器。
+    """
+    return target.get_by_label(name, exact=True)
+
 
 _HELLO_SCRIPT = """import redpymake as rpm
 
@@ -128,8 +138,8 @@ def page_with_log_rows(app_page: tuple["Page", rpm.Workspace]) -> tuple["Page", 
     以免把被测行为藏进 fixture。
     """
     page, ws = app_page
-    page.get_by_title("Run hello").click()
-    page.locator("#live-root ol.live-body li.tl-row").first.wait_for(timeout=RUN_TIMEOUT_MS)
+    by_name(page, "Run hello").click()
+    by_name(by_name(page, "LiveView"), "LogRow").first.wait_for(timeout=RUN_TIMEOUT_MS)
     return page, ws
 
 

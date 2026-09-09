@@ -371,24 +371,24 @@ _INDEX_HTML = r"""<!DOCTYPE html>
   </div>
 </header>
 <div class="layout">
-  <aside class="sidebar">
+  <aside class="sidebar" aria-label="Sidebar">
     <h3 class="sb-head">
       <span>Sessions</span>
       <button class="sb-head-btn" id="split-toggle" title="按 session 分栏查看主区日志">&#9707; Split</button>
     </h3>
-    <ul id="sess-list"><li class="hint">(none)</li></ul>
+    <ul id="sess-list" aria-label="SessionList"><li class="hint">(none)</li></ul>
     <h3>Scripts</h3>
-    <ul id="scripts-list" class="sb-list"><li class="hint">(loading)</li></ul>
+    <ul id="scripts-list" class="sb-list" aria-label="ScriptList"><li class="hint">(loading)</li></ul>
     <h3>Runs</h3>
-    <ul id="runs-list" class="sb-list"><li class="hint">(none)</li></ul>
+    <ul id="runs-list" class="sb-list" aria-label="RunList"><li class="hint">(none)</li></ul>
   </aside>
-  <main class="main-panel">
-    <div class="main-toolbar" id="main-toolbar" hidden>
-      <button class="back-to-live-btn" id="back-to-live" title="回到实时日志流">&#8677; Back to Live</button>
+  <main class="main-panel" aria-label="MainPanel">
+    <div class="main-toolbar" id="main-toolbar" hidden aria-label="MainToolbar">
+      <button class="back-to-live-btn" id="back-to-live" aria-label="BackToLiveButton" title="回到实时日志流">&#8677; Back to Live</button>
       <span class="hint" id="main-context"></span>
     </div>
-    <div id="live-root" class="panel-view"></div>
-    <div id="timeline-root" class="panel-view" hidden></div>
+    <div id="live-root" class="panel-view" role="region" aria-label="LiveView"></div>
+    <div id="timeline-root" class="panel-view" hidden role="region" aria-label="RunDetailView"></div>
   </main>
 </div>
 <script src="/static/vendor/split.min.js"></script>
@@ -900,9 +900,11 @@ _INDEX_HTML = r"""<!DOCTYPE html>
         var li = el("li", { className: "sb-item", title: tip }, [
           el("span", { className: "sb-label" }, [label + warn]),
         ]);
+        var runLabel = c.error ? "script has a parse error" : "Run " + label;
         var btn = el("button", {
           className: "sb-action action-run",
-          title: c.error ? "script has a parse error" : "Run " + label,
+          title: runLabel,
+          "aria-label": runLabel,
           onclick: function (e) { e.stopPropagation(); startRun(c.path); },
         }, ["\u25B6"]);
         if (c.error) btn.setAttribute("disabled", "disabled");
@@ -1005,9 +1007,14 @@ _INDEX_HTML = r"""<!DOCTYPE html>
       var li = el("li", { className: cls, title: r.script_path || r.id }, [
         el("span", {
           className: "sb-label",
+          role: "button",
+          "aria-label": "RunItem",
           onclick: function () { showRunDetail(r.id); },
         }, [statusIcon(r.status) + " " + r.id]),
-        el("span", { className: "badge status-" + r.status }, [r.status]),
+        el("span", {
+          className: "badge status-" + r.status,
+          "aria-label": "StatusBadge",
+        }, [r.status]),
       ]);
       li.appendChild(runActionButton(r));
       list.appendChild(li);

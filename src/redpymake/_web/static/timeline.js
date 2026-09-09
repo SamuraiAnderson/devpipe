@@ -111,7 +111,7 @@
     this.maxRows = (options && options.maxRows) || 0;
     this.bodyClass = (options && options.bodyClass) || "";
     // rail 是 LiveTail 专属：Run detail 已经有 playhead + scrubber，不需要第二根
-    // 时间轴。不开这个开关时 pane DOM 与从前逐字节一致。
+    // 时间轴。e2e 靠 aria-label 区分 LiveBody / TimelineBody，不靠 class。
     this.withRail = !!(options && options.rail);
     this.panes = [];
     this.byId = {};
@@ -167,7 +167,8 @@
   PaneSet.prototype._makeBody = function () {
     var self = this;
     var cls = "timeline-body" + (this.bodyClass ? " " + this.bodyClass : "");
-    var body = el("ol", { className: cls }, []);
+    var ariaName = this.bodyClass === "live-body" ? "LiveBody" : "TimelineBody";
+    var body = el("ol", { className: cls, "aria-label": ariaName }, []);
     // lastTs：该列上一条 record 的时间戳，LiveTail 用它判定静默空档；
     // lastAnchorSec：本列上一次填 gutter 的秒粒度，用来做"同秒只显一次"去重。
     // 两个字段都每列独立，分栏时互不干扰
@@ -412,8 +413,12 @@
     header.appendChild(title);
     header.appendChild(status);
 
-    var toolbar = el("div", { className: "timeline-toolbar" }, []);
-    var btnLive = el("button", { className: "tb-btn active", onclick: function () { self.setLive(); } }, ["Live"]);
+    var toolbar = el("div", { className: "timeline-toolbar", "aria-label": "PlaybackToolbar" }, []);
+    var btnLive = el("button", {
+      className: "tb-btn active",
+      "aria-label": "Live",
+      onclick: function () { self.setLive(); },
+    }, ["Live"]);
     var btnPlay = el("button", { className: "tb-btn", onclick: function () { self.togglePlay(); } }, ["▶"]);
     var btnReset = el("button", { className: "tb-btn", onclick: function () { self.reset(); } }, ["⏮"]);
     var btnStep = el("button", { className: "tb-btn", onclick: function () { self.step(); } }, ["⏭"]);
@@ -444,7 +449,7 @@
     toolbar.appendChild(scrubber);
     toolbar.appendChild(timeLabel);
 
-    var paneWrap = el("div", { className: "pane-set" }, []);
+    var paneWrap = el("div", { className: "pane-set", "aria-label": "PaneSet" }, []);
 
     this.root.innerHTML = "";
     this.root.appendChild(header);
@@ -706,11 +711,11 @@
   };
 
   Timeline.prototype._nodeForRecord = function (r) {
-    var line = el("li", { className: "tl-row " + severityClass(r.level) }, []);
-    var t = el("span", { className: "tl-ts" }, [fmtWall(r.timestamp)]);
-    var ev = el("span", { className: "tl-ev" }, ["[" + (r.event || "?") + "]"]);
-    var sid = r.session_id ? el("span", { className: "tl-sid" }, [r.session_id]) : null;
-    var msg = el("span", { className: "tl-msg" }, [r.message || ""]);
+    var line = el("li", { className: "tl-row " + severityClass(r.level), "aria-label": "LogRow" }, []);
+    var t = el("span", { className: "tl-ts", "aria-label": "TsCell" }, [fmtWall(r.timestamp)]);
+    var ev = el("span", { className: "tl-ev", "aria-label": "EventCell" }, ["[" + (r.event || "?") + "]"]);
+    var sid = r.session_id ? el("span", { className: "tl-sid", "aria-label": "SessionCell" }, [r.session_id]) : null;
+    var msg = el("span", { className: "tl-msg", "aria-label": "MsgCell" }, [r.message || ""]);
     line.appendChild(t);
     line.appendChild(ev);
     if (sid) line.appendChild(sid);
@@ -827,7 +832,7 @@
     header.appendChild(title);
     header.appendChild(status);
 
-    var paneWrap = el("div", { className: "pane-set" }, []);
+    var paneWrap = el("div", { className: "pane-set", "aria-label": "PaneSet" }, []);
 
     // 命令输入栏
     var commandBar = el("div", { className: "command-bar" }, [
@@ -1218,7 +1223,7 @@
 
   LiveTail.prototype._separatorNode = function (text, cls) {
     // 保留原生的 [line]—— text ——[line] 布局，不套 gutter，让分隔条视觉上依旧独立
-    return el("li", { className: "run-separator " + (cls || "") }, [
+    return el("li", { className: "run-separator " + (cls || ""), "aria-label": "RunSeparator" }, [
       el("span", { className: "run-separator-text" }, [text]),
     ]);
   };
@@ -1231,9 +1236,9 @@
     var cls = "tl-row " + severityClass(r.level);
     if (!r.__rid) cls += " ev-manual";
     if (isAnchorEvent(r)) cls += " ev-anchor";
-    return el("li", { className: cls }, [
+    return el("li", { className: cls, "aria-label": "LogRow" }, [
       el("span", { className: "tl-gutter" }, []),
-      el("span", { className: "tl-msg" }, [r.message || ""]),
+      el("span", { className: "tl-msg", "aria-label": "MsgCell" }, [r.message || ""]),
     ]);
   };
 

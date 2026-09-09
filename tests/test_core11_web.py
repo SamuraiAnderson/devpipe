@@ -3,6 +3,8 @@
 规格映射：
     §CORE-11/web/routes/index         → test_web_index_returns_html
     §CORE-11/web/dom-names            → test_web_index_exposes_named_dom_anchors
+                                      → test_web_index_exposes_accessible_names
+    §CORE-11/web/e2e                  → test_e2e_suite_locates_by_accessible_name
     §CORE-11/web/split                → test_static_styles_define_split_panes
                                       → test_timeline_js_exposes_paneset
     §CORE-11/web/live-rail            → test_livebody_has_chrono_rail_styles
@@ -104,6 +106,44 @@ def test_web_index_exposes_named_dom_anchors(web_app):
         'id="split-toggle"',    # SplitToggle
     ):
         assert anchor in body, f"缺少命名部件锚点 {anchor}"
+
+
+def test_web_index_exposes_accessible_names(web_app):
+    """§CORE-11/web/dom-names：静态壳用 ``aria-label`` 暴露 CORE-11 部件名，供 e2e 按名称定位。
+
+    ``id`` 仍是前端脚本内部的取节点方式；测试锚点是可访问名称，二者并存。
+    动态挂载的 LiveBody / LogRow / StatusBadge 等由 ``tests/e2e/`` 在浏览器里验。
+    """
+    client, _ws = web_app
+    body = client.get("/").text
+    for label in (
+        'aria-label="Sidebar"',
+        'aria-label="SessionList"',
+        'aria-label="ScriptList"',
+        'aria-label="RunList"',
+        'aria-label="MainPanel"',
+        'aria-label="MainToolbar"',
+        'aria-label="BackToLiveButton"',
+        'aria-label="LiveView"',
+        'aria-label="RunDetailView"',
+    ):
+        assert label in body, f"缺少可访问名称 {label}"
+
+
+def test_e2e_suite_locates_by_accessible_name():
+    """§CORE-11/web/e2e：e2e 用 ``by_name``（aria-label），不得用 class / id 选择器当锚点。"""
+    root = Path(__file__).parent / "e2e"
+    files = sorted(root.glob("test_*.py")) + [root / "conftest.py"]
+    assert files, "tests/e2e/ 至少要有一个用例文件"
+    for f in files:
+        content = f.read_text(encoding="utf-8")
+        assert "by_name(" in content, f"{f.name} 必须用 by_name 按部件名定位"
+        assert "page.locator(" not in content, (
+            f"{f.name} 不得使用 page.locator(...) 的 class/id 选择器；改走 by_name"
+        )
+        assert "get_by_title(" not in content, (
+            f"{f.name} 不得再用 title 定位；动作按钮同样走 aria-label"
+        )
 
 
 def test_static_styles_are_served(web_app):

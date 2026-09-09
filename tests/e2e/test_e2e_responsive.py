@@ -1,9 +1,9 @@
 """LogRow 列宽的响应式行为（doc/core-lib-requirements.md § CORE-11 AppShell 布局约束）。
 
 作用域是 **Run detail 的 LogRow**：四列 grid 与 ``@media (max-width: 960px)`` 只落在
-``.tl-row`` 上，而 ``.live-body .tl-row`` 已经被覆盖成 [gutter | msg] 两列 flex，没有
-SessionCell。之前的字符串断言（``".tl-sid { display: none; }" in css``）看不出这个
-区别——它在 LiveBody 上是空转的。
+回放行上，而 LiveBody 的 LogRow 是 [gutter | msg] 两列 flex，没有 SessionCell。
+之前的字符串断言（样式表里有没有 ``display: none``）看不出这个区别——它在
+LiveBody 上是空转的。
 
 规格映射：
     §CORE-11/web/e2e/session-cell-clamp   → test_session_cell_width_tracks_viewport
@@ -16,16 +16,13 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from .conftest import RUN_TIMEOUT_MS
+from .conftest import RUN_TIMEOUT_MS, by_name
 
 if TYPE_CHECKING:
     import redpymake as rpm
     from playwright.sync_api import Page
 
 pytestmark = [pytest.mark.e2e, pytest.mark.timeout(180)]
-
-# 带 SessionCell 的 LogRow：没有 session_id 的记录只渲染三个 span
-_ROW = "#timeline-root li.tl-row:has(.tl-sid)"
 
 
 def test_session_cell_hides_on_narrow_viewport(
@@ -75,22 +72,30 @@ def _open_run_detail(page: "Page") -> None:
     已结束的 run 载入后默认从头自动播放，行是逐条出现的；点 Live 直接跳到全量，
     省掉"等播放走完"的不确定等待。
     """
-    page.locator(
-        "#runs-list li.sb-item .badge.status-succeeded"
-    ).first.wait_for(timeout=RUN_TIMEOUT_MS)
-    page.locator("#runs-list li.sb-item .sb-label").first.click()
-    page.locator("#timeline-root .timeline-toolbar button:has-text('Live')").click()
-    page.locator(_ROW).first.wait_for()
+    by_name(page, "StatusBadge").filter(has_text="succeeded").first.wait_for(
+        timeout=RUN_TIMEOUT_MS
+    )
+    by_name(page, "RunItem").first.click()
+    by_name(page, "Live").click()
+    _detail_row_with_session(page).wait_for()
+
+
+def _detail_row_with_session(page: "Page"):
+    """RunDetailView 里带 SessionCell 的 LogRow（LiveBody 行没有这一列）。"""
+    return (
+        by_name(by_name(page, "RunDetailView"), "LogRow")
+        .filter(has=by_name(page, "SessionCell"))
+        .first
+    )
 
 
 def _row_layout(page: "Page") -> dict[str, Any]:
     """量一行 LogRow 的真实列布局。"""
-    return page.eval_on_selector(
-        _ROW,
+    return _detail_row_with_session(page).evaluate(
         """el => {
             const cols = getComputedStyle(el).gridTemplateColumns.split(/\\s+/).filter(Boolean);
-            const sid = el.querySelector('.tl-sid');
-            const msg = el.querySelector('.tl-msg');
+            const sid = el.querySelector('[aria-label="SessionCell"]');
+            const msg = el.querySelector('[aria-label="MsgCell"]');
             return {
                 columnCount: cols.length,
                 sidWidth: parseFloat(cols[2] || '0'),
