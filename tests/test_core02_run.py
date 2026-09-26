@@ -18,6 +18,7 @@
     §CORE-02/run/log_command=False  → test_log_command_false_skips_command_start
     §CORE-02/run/log_command=True   → test_log_command_true_records_command_start
     §CORE-02/result/fields          → test_command_result_fields_and_ok
+    §CORE-02/result/rc              → test_command_result_rc_aliases_returncode
     §CORE-02/result/raise_for_status → test_raise_for_status_matches_check_true
     §CORE-02/result/duration        → test_command_result_duration_positive
 """
@@ -225,6 +226,16 @@ def test_command_result_fields_and_ok(local_session, python_probe):
     assert isinstance(res.duration, float)
     assert res.session is local_session
     assert res.ok is True
+    assert res.rc == res.returncode
+
+
+def test_command_result_rc_aliases_returncode(local_session, python_probe):
+    """§CORE-02/result/rc：``rc`` 是 ``returncode`` 的别名。"""
+    ok = local_session.run(*python_probe("print('ok')"))
+    assert ok.rc == 0
+    bad = local_session.run(*python_probe("import sys; sys.exit(4)"), check=False)
+    assert bad.rc == 4
+    assert bad.rc == bad.returncode
 
 
 def test_raise_for_status_matches_check_true(local_session, python_probe):

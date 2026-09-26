@@ -41,6 +41,11 @@ class CommandResult:
     def ok(self) -> bool:
         return self.returncode == 0
 
+    @property
+    def rc(self) -> int:
+        """``returncode`` 的别名。"""
+        return self.returncode
+
     def raise_for_status(self) -> None:
         if self.returncode != 0:
             raise CommandError(
