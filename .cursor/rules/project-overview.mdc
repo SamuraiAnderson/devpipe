@@ -25,11 +25,11 @@ alwaysApply: true
 
 ## 约定
 
-- Python ≥ 3.10；核心库不依赖 Streamlit / NumPy / SciPy / pydub。
 - 命名：类 `PascalCase`；函数/变量 `snake_case`；实现细节前缀 `_`。
 - 结构化类型用 `dataclass`（`frozen=True` 优先）。
-- 中文注释与 docstring；与用户交流使用中文。
 - 不得抛出 Paramiko / RuntimeError 之类第三方或通用异常；一律包装为 `RedPyMakeError` 子类。
+- 失败属于接口：立刻 `raise ... from exc`。禁止 `except Exception` 之后 `return None`、`pass`、自动重试，或把失败记成空值再继续。
+- 捕获后若没有在同一个函数里重新抛出，就是掩盖失败。
 - 库自身不调用 `logging.basicConfig()`；日志通过 `SessionLogs` 收集。
 
 ## 导入约定
