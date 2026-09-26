@@ -125,7 +125,7 @@ redpymake serve examples/wsl_session         # 127.0.0.1:8765
 | 层次 | 主要接口 | 说明 |
 | --- | --- | --- |
 | 一级：核心执行 | `session.at`, `session.run`, `session.path` | 会话、工作目录、命令、路径 |
-| 二级 A：文件传输 | `session.push`, `session.pull`, `session.copy` | 方向明确的便利接口，底层统一为 copy |
+| 二级 A：文件传输 | `session.push`, `session.pull`, `rpm.copy` | `push` / `pull` 有方向；`copy` 是顶级函数 |
 | 二级 B：日志与等待 | `session.logs`, `session.wait`, `run(...).wait` | 自动收集、订阅、tag、等待 |
 | 二级 C：过时判断 | `rpm.stale(target, depends_on=...)` | 增量优化辅助 |
 | 二级 D：脚本对象 | `rpm.script(...)` | 多会话日志合流、异常自动落盘 |

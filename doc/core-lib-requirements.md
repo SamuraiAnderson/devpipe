@@ -114,7 +114,7 @@ session.path(...)
 ```python
 session.push(...)
 session.pull(...)
-session.copy(...)
+rpm.copy(...)
 ```
 
 职责仅限于文件与路径资源传输。
@@ -206,8 +206,16 @@ rpm.wsl(distribution=None, user=None)
 
 - **写出**：`run(str)` 按 `encoding` 编码后写入，再追加构造参数 `newline`（**默认空**，不再自动加 `\r\n`）。需要行结束符时写在命令里，例如 `uart.run("reboot\r")`，或显式 `newline="\r"`。
 - **`run(bytes)` 仅串口**：原样写入、不拼 `newline`；禁止额外位置参数与 `shell=True`。其他平台传 `bytes` 抛 `TypeError`。
-- **文本日志与空闲冲刷**：读侧按 `\n` 切行再解码入日志；当串口持续空闲（如无换行符的提示符 `login: `）时，经空闲窗口自动冲刷进日志缓冲，支持 `wait("login: ")` 匹配无终止符提示符。
+- **文本日志与空闲冲刷**：读侧按 `\n` 或单独的 `\r` 切行再解码入日志（`\r\n` 仍是一行）；当串口持续空闲（如无换行符的提示符 `login: `）时，经空闲窗口自动冲刷进日志缓冲，支持 `wait("login: ")` 匹配无终止符提示符。
 - **原始 RX 与流式消费游标**：容量 1 MiB 的环形字节缓冲（不按行切）。会话内部维护流式消费游标，初始从会话起点（0）开始，独立 `wait()` 不漏开机初期到达的日志与原始字节，并在匹配后单调推进。
+- **文本日志里的 `\r`**：除 `\n` 外，单独的 `\r`（TFTP / 进度条用回车覆写当前行）也另起一条记录，避免 `\r` 开头的进度粘在上一条里。`\r\n` 仍算一行。空的纯 `\r` 片段不产生空记录。原始字节 `wait(b"...")` 不按行切。
+- **日志里哪一段是某条命令的回复，由调用方判断。** 串口上常有无关日志持续流入，库看不到提示符含义，也不能把「提示符之前的文本」定义成命令结果。调用方用 `run()` 写出、用 `wait(pattern)` 等待自己认得出的那一行。行结束符写在命令里，或通过构造参数 `newline` 追加。可抄的等待写法在 `examples/serial_session/shell_wait.py`，其中的模式不是库行为。
+
+```python
+cursor = uart.logs.cursor()
+uart.run("uname -a\n")
+uart.wait(prompt, since=cursor, timeout=10)  # prompt 按这块设备自己写
+```
 
 ### WSL 说明（"构造时立即连接"的显式例外）
 
@@ -216,7 +224,7 @@ rpm.wsl(distribution=None, user=None)
 - 路径风格：`posix`。
 - 传输：`push` / `pull` 通过 `/mnt/<drive>/…` 中转到 `wsl -e cp`；`copy` 同理。
 - 参数：`distribution` → `wsl -d`；`user` → `wsl -u`；`wsl_path` 可覆盖 `wsl.exe` 路径（主要用于测试注入）。
-- 由于不探测 `$HOME`，`~` 前缀不做展开，需要时请给绝对路径或用 `default_cwd="/home/xxx"`。
+- `~` / `~/...` 展开为该会话的家目录；`~user` 不展开。`rpm.wsl()` 本身不启动发行版。第一次在路径里用到 `~` 才会去查家目录，发行版没在跑时冷启动发生在这一步；查失败就抛错，路径不会变成 `/~/...`。不用 `~` 的脚本不会因此启动发行版。`rpm.ssh()` 连上之后会取得家目录，这一步失败则连接失败。
 
 ---
 
@@ -304,6 +312,10 @@ class CommandResult:
     @property
     def ok(self) -> bool: ...
 
+    @property
+    def rc(self) -> int:
+        """``returncode`` 的别名。"""
+
     def raise_for_status(self) -> None: ...
 
     def wait(
@@ -346,7 +358,7 @@ target = remote.path("/opt/app")
   - `mkdir()`
   - `name`
   - `parent`
-- 统一处理 Windows、POSIX 与 `~`。
+- 统一处理 Windows 与 POSIX。`~` / `~/...` 展开为会话家目录。没有家目录或写成 `~user` 时抛 `UnsupportedOperationError`。
 - 不使用不可见的长期缓存；如使用缓存，必须提供明确的 `refresh()`。
 
 ---
@@ -358,16 +370,16 @@ target = remote.path("/opt/app")
 ```python
 session.push(source, target)
 session.pull(source, target)
-session.copy(source, target)
+rpm.copy(source, target)
 ```
 
 语义：
 
-| 方法 | 方向 |
+| 接口 | 方向 |
 |------|------|
 | `push()` | 从其他环境传入**当前会话** |
 | `pull()` | 从**当前会话**传到其他环境 |
-| `copy()` | 统一复制：当前会话内部，或跨会话 |
+| `rpm.copy()` | 统一复制：同一会话内部，或跨会话。不挂在会话上 |
 
 ```python
 local_file = local.path("build/app")
@@ -375,28 +387,34 @@ remote_file = remote.path("/opt/app")
 
 remote.push(local_file, remote_file)
 remote.pull(remote_file, local.path("backup/app"))
-remote.copy(remote.path("/opt/app"), remote.path("/tmp/app"))
+rpm.copy(remote.path("/opt/app"), remote.path("/tmp/app"))
+rpm.copy("build/app", "backup/app")  # 裸字符串是本机路径
 ```
 
 ### 要求
 
-- `push()` / `pull()` 是有明确方向的便利接口，底层统一走 `copy()`。
+- `push()` / `pull()` 是有明确方向的便利接口，底层与 `rpm.copy()` 走同一套传输。
 - 调用者不判断会话具体类型。
 - 远端到远端如需本地中转，由库自动完成并清理临时文件。
-- 调用 `copy()` 的会话必须是源或目标会话之一，不能作为无关的第三方协调者。
+- `rpm.copy()` 没有调用方会话，因此不要求「调用方必须是源或目标之一」。两端路径自己标明所属会话。
+- 裸字符串 / `os.PathLike`：
+  - `rpm.copy()` 的裸字符串绑到进程级默认 local 会话，按该会话的工作目录解析，不跟随另一个 `rpm.local(default_cwd=...)` 或 `at()`。要用某个会话的目录，传 `sess.path(...)`。
+  - `push()` 的源、`pull()` 的目标若是裸字符串，表示本机路径。调用会话是本地会话时，裸字符串绑到调用会话；否则绑到进程级默认 local 会话。`push()` 的目标、`pull()` 的源绑到调用会话。
+- 开始、结束和失败记在源会话与目标会话的日志里。两端是同一会话时只记一次。
+- 任一端会话已关闭则抛 `SessionClosedError`。
 - 支持 `overwrite`、超时等选项。
 - 返回 `TransferResult`，至少包含：源、目标、是否实际传输、字节数、耗时。
 
 跨远端示例：
 
 ```python
-linux.copy(
+rpm.copy(
     android.path("/data/app"),
     linux.path("/opt/app"),
 )
 ```
 
-与增量结合（`rpm.stale` 只做判断，执行仍由会话完成）：
+与增量结合（`rpm.stale` 只做判断，执行仍由会话或 `rpm.copy` 完成）：
 
 ```python
 if rpm.stale(remote_file, depends_on=local_file):
@@ -633,12 +651,15 @@ BytesPattern = bytes | re.Pattern[bytes]
 WaitPattern = TextPattern | BytesPattern | Sequence[TextPattern] | Sequence[BytesPattern]
 ```
 
-直接等待（默认只匹配调用之后产生的日志）：
+直接等待。没有调用过 `run()` 时，默认只匹配调用之后产生的日志。调用过 `run()` 之后，不带 `since` 的 `wait()` 从那次 `run()` 开始前的位置继续，与 `run().wait()` 相同，命中后起点移到匹配记录的下一行：
 
 ```python
 match = uart.wait("U-Boot", timeout=30)
-match = uart.wait(re.compile(r"login:\s*$"), timeout=60)
+uart.run("reboot\r")
+uart.wait("login:", timeout=60)  # 看得到这次 reboot 的输出
 ```
+
+串口在第一次 `run()` 之前从会话起点读，避免漏掉开机时已经到达的日志。
 
 执行命令后等待（从 **run 前** 游标搜索，不漏执行期间输出）：
 
@@ -1594,7 +1615,7 @@ Web UI 的行为分两层验证，边界按"要不要真实渲染"划：
 | Run 摘要来源 | 不单独持久化；从 stream 里的 `workspace.run.begin` / `workspace.run.end` 元行配对重建；孤立 begin → `status="interrupted"` |
 | run 边界元行归属 | CORE-10 sink 写 `script.begin/end`；`workspace.run.begin/end` 由 Workspace 在 sink 外侧追写，携带 `run_id` 等 workspace 专属元数据；两类元行都无 `session_id`，镜像时一并进 `sessions/__script__.ndjson` |
 | Rotate 冲突处理 | 有 run 在跑时 `rotate_log` 拒绝并抛 `RuntimeError`；UI 提示用户等或终止；后续版本考虑排队式 rotate |
-| Stop 语义 | 协作式尽力而为：设标志 + 借出会话在 `run()`/`wait()` 边界抛 `WorkspaceStoppedError`；**不强杀**在跑的子进程；run 终态覆盖为 `cancelled` |
+| Stop 语义 | 协作式尽力而为：设标志 + 借出会话在 `run()`/`wait()`/`push()`/`pull()` 边界抛 `WorkspaceStoppedError`，顶级 `rpm.copy()` 进入时同样检查；**不强杀**在跑的子进程；run 终态覆盖为 `cancelled` |
 | Web UI 主区 | 两态：Live tail（挂钩活跃日志、跨 run 持续、可随时切回）与 Run detail（单 run 回放，含 playback 控件）；主区只展示不操作 |
 | Web UI 运行控制 | 全部收敛到 Sidebar 行内：Scripts 条目 `▶`、Runs 条目按状态 `⏹`/`⟳`；不做 Script 详情卡；Rerun 不弹确认；活跃 run 不自动抢占主区 |
 | Web UI 部件命名 | 固定一套 DOM 部件名（AppShell / TopBar / Sidebar / MainPanel / LiveView / RunDetailView…），文档与讨论统一使用 |

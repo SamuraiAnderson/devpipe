@@ -9,6 +9,7 @@
 | --- | --- | --- | --- |
 | 1 | [`quickstart/`](quickstart/README.md) | 20 行连上一台机器跑命令，没有任何样板 | 改三个常量；或换 `rpm.local()` 直接跑 |
 | 2 | [`wsl_session/`](wsl_session/README.md) | 文件传输、增量构建、日志等待、脚本对象、跨端长流水线 | Windows + 已安装 WSL |
+| 3 | [`serial_session/`](serial_session/README.md) | 串口上自己写提示符并 `wait`；库不解释回复 | 一块串口设备，`pip install -e ".[serial]"` |
 
 先跑 `quickstart/`，确认库能用；再按需去 `wsl_session/` 挑感兴趣的专题看。
 `wsl_session/` 里的代码换个工厂（`rpm.ssh` / `rpm.adb`）就能用在别的环境上。
