@@ -13,6 +13,8 @@
     §CORE-03/pathlib-like/name-parent → test_path_name_and_parent
     §CORE-03/absolute-path-ignores-cwd → test_absolute_path_ignores_cwd
     §CORE-03/tilde-expansion          → test_tilde_expansion_uses_home_dir
+    §CORE-03/tilde-no-home            → test_tilde_without_home_dir_raises
+    §CORE-03/tilde-user               → test_tilde_user_is_not_expanded
     §CORE-03/no-hidden-cache/refresh  → test_refresh_is_available_and_returns_none
     §CORE-03/os-fspath                → test_resource_path_is_os_pathlike
 """
@@ -25,7 +27,11 @@ from pathlib import Path
 import pytest
 
 import redpymake as rpm
-from redpymake.exceptions import ResourceError, ResourceNotFoundError
+from redpymake.exceptions import (
+    ResourceError,
+    ResourceNotFoundError,
+    UnsupportedOperationError,
+)
 
 
 # --------------------------------------------------------------------- 绑定
@@ -139,6 +145,21 @@ def test_tilde_expansion_uses_home_dir(tmp_workspace: rpm.LocalSession):
     home = str(Path.home())
     # 展开后应以家目录为前缀（Windows 上 normpath 会保留大小写）
     assert Path(p.path).parent.resolve() == Path(home).resolve()
+
+
+def test_tilde_without_home_dir_raises(tmp_workspace: rpm.LocalSession):
+    """§CORE-03：没有 ``home_dir`` 时，``~`` 开头路径抛错，而不是当成字面路径。"""
+    tmp_workspace.home_dir = None
+    with pytest.raises(UnsupportedOperationError):
+        tmp_workspace.at("~/work")
+    with pytest.raises(UnsupportedOperationError):
+        tmp_workspace.path("~")
+
+
+def test_tilde_user_is_not_expanded(tmp_workspace: rpm.LocalSession):
+    """§CORE-03：``~user`` 不展开，抛 ``UnsupportedOperationError``。"""
+    with pytest.raises(UnsupportedOperationError):
+        tmp_workspace.path("~nobody/x")
 
 
 # ------------------------------------------------------------ refresh / os

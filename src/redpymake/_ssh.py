@@ -6,8 +6,8 @@
 
 - 构造时立即连接；失败抛 ``SessionConnectionError``（不暴露 paramiko 原生异常）。
 - 命令执行通过 ``SSHClient.exec_command`` + 逐行流式采集。
-- 文件传输通过 SFTP；不支持 ``~`` 展开由 SFTP 侧处理，因此 ``home_dir`` 在连接
-  成功后通过 ``pwd`` 命令探测。
+- 文件传输通过 SFTP；SFTP 不展开 ``~``。连接成功后探测 ``$HOME``，
+  失败则关闭连接并抛出，不把会话留在「家目录未知」的状态。
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from ._logs import LogBuffer
 from ._path import ResourceStat
 from ._session import Session
 from .exceptions import (
+    CommandError,
     CommandTimeoutError,
     ResourceNotFoundError,
     SessionConnectionError,
@@ -101,13 +102,15 @@ class SshSession(Session):
             message=f"ssh session established: {label}",
         )
 
-        # 探测 home_dir，便于 ~ 展开
+        # 连接已经建立。家目录探测失败则关掉连接并抛出，不留一个不能展开 ~ 的会话。
         try:
-            _, out = self._exec_capture("printf %s \"$HOME\"", timeout=5.0)
-            if out.strip():
-                self.home_dir = out.strip()
+            self._home_dir = self._probe_home_dir()
         except Exception:
-            self.home_dir = None
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            raise
 
         self._sftp_lock = threading.Lock()
         self._sftp = None  # 延迟打开
@@ -251,6 +254,27 @@ class SshSession(Session):
         rc = chan.recv_exit_status()
         chan.close()
         return rc, out.decode("utf-8", errors="replace")
+
+    def _probe_home_dir(self) -> str:
+        cmd = 'printf %s "$HOME"'
+        try:
+            rc, out = self._exec_capture(cmd, timeout=5.0)
+        except Exception as exc:
+            raise SessionConnectionError(
+                f"failed to read $HOME: {exc}",
+                session=self,
+                cause=exc,
+            ) from exc
+        text = out.strip()
+        if rc != 0 or not text:
+            raise CommandError(
+                f"failed to read $HOME (exit {rc})",
+                session=self,
+                command=(cmd,),
+                returncode=rc,
+                stdout=out,
+            )
+        return text
 
     # ------------------------------ 资源 ------------------------------
 

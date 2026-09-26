@@ -15,6 +15,7 @@
     §CORE-06/tag/nested                 → test_tag_nested_inner_wins
     §CORE-06/tag/thread-safe            → test_tag_isolated_between_threads
     §CORE-06/wait/matches-new-only      → test_wait_default_matches_new_records_only
+    §CORE-06/wait/after-run             → test_wait_after_run_uses_run_cursor
     §CORE-06/wait/with-cursor           → test_wait_with_explicit_cursor_finds_past
     §CORE-06/wait/regex                 → test_wait_regex_pattern
     §CORE-06/wait/channel-filter        → test_wait_channel_filter
@@ -247,12 +248,25 @@ def test_tag_isolated_between_threads(local_session):
 
 
 def test_wait_default_matches_new_records_only(local_session):
-    """§CORE-06：``wait()`` 默认（``since=None``）不匹配调用之前的历史。"""
+    """§CORE-06：没有 ``run()`` 时，``wait()`` 默认不匹配调用之前的历史。"""
     local_session.logs.buffer.append(
         event="command_output", level="INFO", stream="stdout", message="OLD"
     )
     with pytest.raises(LogWaitTimeoutError):
         local_session.wait("OLD", timeout=0.15)
+
+
+def test_wait_after_run_uses_run_cursor(local_session, python_probe):
+    """§CORE-06：``run()`` 之后的 ``wait()`` 从该命令开始前搜索，并在命中后向前推进。"""
+    local_session.run(*python_probe(
+        "print('BOOT'); print('NEXT')"
+    ))
+    first = local_session.wait("BOOT", timeout=1)
+    assert "BOOT" in first.text
+    second = local_session.wait("NEXT", timeout=1)
+    assert "NEXT" in second.text
+    assert second.record is not None and first.record is not None
+    assert second.record.sequence > first.record.sequence
 
 
 def test_wait_with_explicit_cursor_finds_past(local_session):

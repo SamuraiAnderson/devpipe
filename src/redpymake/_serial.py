@@ -5,7 +5,8 @@
 串口没有严格的"命令/退出码"概念；``run()`` 将文本按 encoding 编码写出
 （构造参数 ``newline`` 默认空，不再自动加 ``\\r\\n``），``run(bytes)`` 原样写入。
 ``returncode`` 记为 ``0``；短窗口内读到的文本作为 ``stdout`` 便利值。
-真正常用的是 ``wait()``：文本走日志行，字节走原始 RX 环形缓冲。
+日志持续流入时，库分不出哪些行是某条命令的回复。调用方用 ``wait(pattern)``
+等待自己认得出的内容。
 
 不支持 ``push`` / ``pull`` / ``copy`` / ``_resource_*`` —— 全部抛
 ``UnsupportedOperationError``。
@@ -34,6 +35,41 @@ from .exceptions import (
 )
 
 _RX_CAPACITY = 1024 * 1024
+
+
+def _consume_serial_text(buf: bytes, *, encoding: str) -> tuple[list[str], bytes]:
+    """取出已经完整的文本行，留下尚未结束的尾巴。
+
+    ``\\n`` 与单独的 ``\\r`` 都换行；``\\r\\n`` 只算一次。单独 ``\\r`` 切出的空片段
+    （行首回车、进度条覆写）不产生空记录；``\\n`` 切出的空行保留。
+    """
+    lines: list[str] = []
+    while True:
+        newline_at = buf.find(b"\n")
+        cr_at = buf.find(b"\r")
+        if newline_at < 0 and cr_at < 0:
+            break
+        if cr_at < 0 or (newline_at >= 0 and newline_at < cr_at):
+            piece, buf = buf[:newline_at], buf[newline_at + 1 :]
+            lines.append(piece.decode(encoding, errors="replace").rstrip("\r"))
+            continue
+        piece, buf = buf[:cr_at], buf[cr_at + 1 :]
+        if buf.startswith(b"\n"):
+            buf = buf[1:]
+            lines.append(piece.decode(encoding, errors="replace"))
+        elif piece:
+            lines.append(piece.decode(encoding, errors="replace"))
+    return lines, buf
+
+
+def _flush_incomplete(buf: bytes, *, encoding: str) -> str | None:
+    """空闲冲刷：无终止符的尾巴（提示符、半行进度）。行首 ``\\r`` 剥掉。"""
+    if buf.startswith(b"\r"):
+        buf = buf[1:]
+    if not buf:
+        return None
+    text = buf.decode(encoding, errors="replace").rstrip("\r")
+    return text or None
 
 
 class _RxRing:
@@ -145,6 +181,8 @@ class SerialSession(Session):
         pyserial = _require_pyserial()
         label = f"serial:{port}@{baudrate}"
         super().__init__(session_kind="serial", session_label=label, default_cwd=None)
+        # 第一次 wait 从会话起点读，避免漏掉 run 之前到达的开机日志。
+        self._wait_origin_seq = 0
         self.path_style = "posix"
         try:
             self._port = pyserial.Serial(port=port, baudrate=baudrate, timeout=0.05)
@@ -173,6 +211,14 @@ class SerialSession(Session):
     def _rx_cursor(self) -> int | None:
         return self._rx.cursor()
 
+    def _emit_serial_line(self, text: str) -> None:
+        self._log_buffer.append(
+            event="command_output",
+            level="INFO",
+            stream="serial",
+            message=text,
+        )
+
     def _reader_loop(self) -> None:
         buf = b""
         while not self._stop.is_set():
@@ -180,14 +226,12 @@ class SerialSession(Session):
                 data = self._port.read(1)
                 if not data:
                     if buf:
-                        text = buf.decode(self._encoding, errors="replace").rstrip("\r")
-                        if text:
-                            self._log_buffer.append(
-                                event="command_output",
-                                level="INFO",
-                                stream="serial",
-                                message=text,
-                            )
+                        lines, rest = _consume_serial_text(buf, encoding=self._encoding)
+                        for text in lines:
+                            self._emit_serial_line(text)
+                        flushed = _flush_incomplete(rest, encoding=self._encoding)
+                        if flushed:
+                            self._emit_serial_line(flushed)
                         buf = b""
                     continue
                 in_waiting = getattr(self._port, "in_waiting", 0)
@@ -197,27 +241,19 @@ class SerialSession(Session):
                 break
             self._rx.append(data)
             buf += data
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                text = line.decode(self._encoding, errors="replace").rstrip("\r")
-                self._log_buffer.append(
-                    event="command_output",
-                    level="INFO",
-                    stream="serial",
-                    message=text,
-                )
+            lines, buf = _consume_serial_text(buf, encoding=self._encoding)
+            for text in lines:
+                self._emit_serial_line(text)
         if buf:
-            text = buf.decode(self._encoding, errors="replace").rstrip("\r")
-            if text:
-                try:
-                    self._log_buffer.append(
-                        event="command_output",
-                        level="INFO",
-                        stream="serial",
-                        message=text,
-                    )
-                except Exception:
-                    pass
+            try:
+                lines, rest = _consume_serial_text(buf, encoding=self._encoding)
+                for text in lines:
+                    self._emit_serial_line(text)
+                flushed = _flush_incomplete(rest, encoding=self._encoding)
+                if flushed:
+                    self._emit_serial_line(flushed)
+            except Exception:
+                pass
 
     def _wait_bytes(
         self,
@@ -302,22 +338,15 @@ class SerialSession(Session):
                 cursor.advance_rx(match._rx_end)
             return match
         else:
-            effective_since = (
-                since
-                if since is not None
-                else (cursor.log_cursor if cursor is not None else None)
-            )
             match = super().wait(
                 pattern,
                 timeout=timeout,
                 channel=channel,
-                since=effective_since,
+                since=since,
                 command_result=command_result,
                 multiline=multiline,
                 rx_since=rx_since,
             )
-            if cursor is not None and match.record is not None:
-                cursor.advance_log(match.record.sequence + 1)
             return match
 
     def _execute_command(
@@ -349,6 +378,7 @@ class SerialSession(Session):
         cursor_before = self._log_buffer.cursor()
         rx_before = self._rx_cursor()
         self._cursor.advance_to_command(rx_before, cursor_before.sequence)
+        self._note_wait_origin(cursor_before.sequence)
         try:
             self._port.write(payload)
             self._port.flush()

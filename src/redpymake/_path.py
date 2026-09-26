@@ -160,7 +160,9 @@ def resolve_against(
 ) -> str:
     """按会话的路径风格结合工作目录解析 ``raw`` 为绝对/规范路径。
 
-    - ``~`` 前缀由会话侧提供 ``home_dir`` 属性时展开；否则原样保留。
+    - ``~`` / ``~/...`` 展开为会话家目录。家目录尚未探测时向会话要一次并缓存
+      （``Session._home_dir is LAZY_HOME``）。没有家目录时抛
+      ``UnsupportedOperationError``。``~user`` 不展开，同样抛错。
     - 绝对路径不再拼接 ``cwd``。
     - 结果调用 ``normpath`` 消除 ``.``/``..``。
     """
@@ -168,14 +170,24 @@ def resolve_against(
     flavor = _flavor(session)
 
     if raw_str.startswith("~"):
-        home = getattr(session, "home_dir", None)
-        if home:
-            tail = raw_str[1:]
-            if tail.startswith("/") or tail.startswith(os.sep) or tail == "":
-                raw_str = flavor.join(home, tail.lstrip("/\\")) if tail else home
-            else:
-                # 保留 ~user 之类不做扩展；由平台自行处理
-                pass
+        if raw_str != "~" and not raw_str.startswith("~/") and not raw_str.startswith("~\\"):
+            from .exceptions import UnsupportedOperationError
+
+            raise UnsupportedOperationError(
+                f"{type(session).__name__} does not expand {raw_str!r}: "
+                "only '~' and '~/...' are expanded"
+            )
+        home = session._ensure_home_dir()
+        if not home:
+            from .exceptions import UnsupportedOperationError
+
+            raise UnsupportedOperationError(
+                f"{type(session).__name__} does not expand {raw_str!r}: "
+                "home directory is unavailable. "
+                "Pass an absolute path, or set default_cwd= when constructing the session."
+            )
+        tail = raw_str[1:]
+        raw_str = flavor.join(home, tail.lstrip("/\\")) if tail else home
 
     if flavor.isabs(raw_str):
         return flavor.normpath(raw_str)

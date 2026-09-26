@@ -8,7 +8,11 @@
     §CORE-04/copy/direction/independent    → test_copy_between_local_and_fake_remote
     §CORE-04/push/target-must-be-caller    → test_push_target_must_belong_to_caller
     §CORE-04/pull/source-must-be-caller    → test_pull_source_must_belong_to_caller
-    §CORE-04/copy/caller-must-participate  → test_copy_caller_must_be_source_or_target
+    §CORE-04/copy/no-caller                → test_copy_between_remotes_needs_no_caller
+    §CORE-04/copy/bare-string              → test_copy_bare_strings_use_default_local
+    §CORE-04/copy/path-cwd                 → test_copy_resource_path_uses_session_cwd
+    §CORE-04/copy/logs-both-ends           → test_copy_logs_on_both_sessions
+    §CORE-04/copy/closed                   → test_copy_closed_session_raises
     §CORE-04/remote-to-remote/via-local    → test_remote_to_remote_via_local_tmp
     §CORE-04/result/fields                 → test_transfer_result_fields
 """
@@ -20,7 +24,7 @@ from pathlib import Path
 import pytest
 
 import redpymake as rpm
-from redpymake.exceptions import TransferError
+from redpymake.exceptions import SessionClosedError, TransferError
 
 from ._helpers.fake_remote import FakeRemoteSession
 
@@ -37,12 +41,14 @@ def test_copy_within_local(local_session, tmp_path: Path):
     src = tmp_path / "src.bin"
     dst = tmp_path / "dst.bin"
     _write(src, "abc")
-    r = local_session.copy(
+    r = rpm.copy(
         local_session.path(str(src)), local_session.path(str(dst))
     )
     assert r.transferred is True
     assert r.bytes_transferred == 3
     assert dst.read_text() == "abc"
+    ends = [rec for rec in local_session.logs.records() if rec.event == "transfer_end"]
+    assert len(ends) == 1
 
 
 def test_copy_no_overwrite_keeps_target(local_session, tmp_path: Path):
@@ -51,7 +57,7 @@ def test_copy_no_overwrite_keeps_target(local_session, tmp_path: Path):
     dst = tmp_path / "d.txt"
     _write(src, "new")
     _write(dst, "old")
-    r = local_session.copy(
+    r = rpm.copy(
         local_session.path(str(src)),
         local_session.path(str(dst)),
         overwrite=False,
@@ -94,11 +100,10 @@ def test_pull_from_fake_remote_to_local(
 def test_copy_between_local_and_fake_remote(
     fake_remote: FakeRemoteSession, local_session, tmp_path: Path
 ):
-    """§CORE-04：``copy()`` 跨会话复制；caller 可以是源或目标。"""
+    """§CORE-04：``rpm.copy()`` 跨会话复制，不需要从某一端发起。"""
     src = tmp_path / "cx.bin"
     _write(src, "CX")
-    # caller 是 target 会话
-    r = fake_remote.copy(
+    r = rpm.copy(
         local_session.path(str(src)),
         fake_remote.path("/tmp/cx.bin"),
     )
@@ -136,18 +141,15 @@ def test_pull_source_must_belong_to_caller(
         )
 
 
-def test_copy_caller_must_be_source_or_target(
-    fake_remote_factory, local_session, tmp_path: Path
-):
-    """§CORE-04：``copy()`` 的调用会话必须是源或目标之一，不能作无关第三方。"""
+def test_copy_between_remotes_needs_no_caller(fake_remote_factory, local_session):
+    """§CORE-04：两个远端之间的 ``rpm.copy()`` 不需要第三方调用会话。"""
     a = fake_remote_factory("a")
     b = fake_remote_factory("b")
     a.put_file("/x", b"data")
-    with pytest.raises(TransferError):
-        local_session.copy(a.path("/x"), b.path("/y"))
-
-
-# ---------------------------------------------------- 远端到远端本地中转
+    r = rpm.copy(a.path("/x"), b.path("/y"))
+    assert r.transferred is True
+    assert b.read_file("/y") == b"data"
+    assert not hasattr(local_session, "copy")
 
 
 def test_remote_to_remote_via_local_tmp(fake_remote_factory):
@@ -155,8 +157,7 @@ def test_remote_to_remote_via_local_tmp(fake_remote_factory):
     a = fake_remote_factory("a")
     b = fake_remote_factory("b")
     a.put_file("/src", b"RELAY-BYTES")
-    # caller 是 source 会话
-    r = a.copy(a.path("/src"), b.path("/dst"))
+    r = rpm.copy(a.path("/src"), b.path("/dst"))
     assert r.transferred is True
     assert b.read_file("/dst") == b"RELAY-BYTES"
 
@@ -169,7 +170,7 @@ def test_transfer_result_fields(local_session, tmp_path: Path):
     src = tmp_path / "s.txt"
     dst = tmp_path / "d.txt"
     _write(src, "1234567890")
-    r = local_session.copy(
+    r = rpm.copy(
         local_session.path(str(src)), local_session.path(str(dst))
     )
     assert isinstance(r.source, rpm.ResourcePath)
@@ -177,3 +178,63 @@ def test_transfer_result_fields(local_session, tmp_path: Path):
     assert r.transferred is True
     assert r.bytes_transferred == 10
     assert r.duration >= 0.0
+
+
+def test_copy_bare_strings_use_default_local(tmp_path: Path):
+    """§CORE-04：``rpm.copy()`` 的裸字符串是本机路径，不跟随另一个 local 会话的工作目录。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("abc", encoding="utf-8")
+    sess = rpm.local(default_cwd=str(workspace))
+    try:
+        with pytest.raises(TransferError):
+            rpm.copy("rpm-copy-bare-not-in-cwd.txt", "rpm-copy-bare-dest.txt")
+        src = tmp_path / "abs-src.txt"
+        dst = tmp_path / "abs-dst.txt"
+        src.write_text("abs", encoding="utf-8")
+        result = rpm.copy(str(src), str(dst))
+        assert dst.read_text(encoding="utf-8") == "abs"
+        assert result.source.session.kind == "local"
+        assert result.source.session.root is not sess.root
+    finally:
+        sess.close()
+
+
+def test_copy_resource_path_uses_session_cwd(tmp_path: Path):
+    """§CORE-04：``sess.path()`` 仍按该会话的工作目录解析。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("abc", encoding="utf-8")
+    sess = rpm.local(default_cwd=str(workspace))
+    try:
+        result = rpm.copy(sess.path("a.txt"), sess.path("b.txt"))
+        assert (workspace / "b.txt").read_text(encoding="utf-8") == "abc"
+        assert result.source.session.root is sess.root
+        assert result.target.session.root is sess.root
+    finally:
+        sess.close()
+
+
+def test_copy_logs_on_both_sessions(fake_remote_factory):
+    """§CORE-04：跨会话 ``rpm.copy()`` 在源和目标上都记传输日志。"""
+    a = fake_remote_factory("a")
+    b = fake_remote_factory("b")
+    a.put_file("/src", b"LOG")
+    mark_a = a.logs.cursor()
+    mark_b = b.logs.cursor()
+    rpm.copy(a.path("/src"), b.path("/dst"))
+    assert any(r.event == "transfer_end" for r in a.logs.records(since=mark_a))
+    assert any(r.event == "transfer_end" for r in b.logs.records(since=mark_b))
+
+
+def test_copy_closed_session_raises(tmp_path: Path):
+    """§CORE-04：任一端会话已关闭时 ``rpm.copy()`` 抛 ``SessionClosedError``。"""
+    src = tmp_path / "s.txt"
+    dst = tmp_path / "d.txt"
+    _write(src, "x")
+    sess = rpm.local()
+    src_path = sess.path(str(src))
+    dst_path = sess.path(str(dst))
+    sess.close()
+    with pytest.raises(SessionClosedError):
+        rpm.copy(src_path, dst_path)

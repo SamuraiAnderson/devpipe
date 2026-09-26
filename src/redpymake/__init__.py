@@ -28,7 +28,7 @@ from ._logs import (
 )
 from ._path import ResourcePath, ResourceStat
 from ._script import ScriptRun, ScriptSnapshot, script
-from ._session import Session
+from ._session import Session, copy
 from ._stale import PathSpec, StalePredicate, stale
 from ._transfer import TransferResult
 from ._workspace import Workspace, WorkspaceLog, WorkspaceRun, workspace
@@ -109,6 +109,7 @@ __all__ = [
     "LogMatch",
     # 过时判断
     "stale",
+    "copy",
     "StalePredicate",
     "PathSpec",
     # 异常

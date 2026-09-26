@@ -30,6 +30,7 @@ from typing import Mapping, Sequence
 from ._path import ResourceStat
 from ._session import Session
 from .exceptions import (
+    CommandError,
     CommandTimeoutError,
     ResourceNotFoundError,
     SessionConnectionError,
@@ -65,8 +66,7 @@ class WslSession(Session):
             default_cwd=default_cwd or "/",
         )
         self.path_style = "posix"
-        # 不做 $HOME 探测，避免为一次可选的 ~ 展开付出冷启动代价。
-        self.home_dir = None
+        # _home_dir 保持 LAZY_HOME。第一次展开 ~ 才执行 wsl.exe，避免构造时冷启动。
         self._wsl = wsl_exe
         self._distribution = distribution
         self._user = user
@@ -114,6 +114,36 @@ class WslSession(Session):
         """在 WSL 内跑一段 shell 命令，返回 ``(rc, stdout)``；不写日志。"""
         rc, out, _err = self._run_wsl(["--", "sh", "-c", cmd], timeout=timeout)
         return rc, out
+
+    def _probe_home_dir(self) -> str:
+        """第一次展开 ``~`` 时调用。发行版未运行则会在这里冷启动。失败直接抛出。"""
+        cmd = 'printf %s "$HOME"'
+        try:
+            rc, out, err = self._run_wsl(["--", "sh", "-c", cmd], timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            raise CommandTimeoutError(
+                "timed out reading $HOME",
+                session=self,
+                command=(cmd,),
+                timeout=30,
+            ) from exc
+        except OSError as exc:
+            raise SessionConnectionError(
+                f"failed to read $HOME: {exc}",
+                session=self,
+                cause=exc,
+            ) from exc
+        text = out.strip()
+        if rc != 0 or not text:
+            raise CommandError(
+                f"failed to read $HOME (exit {rc})",
+                session=self,
+                command=(cmd,),
+                returncode=rc,
+                stdout=out,
+                stderr=err,
+            )
+        return text
 
     # ------------------------------ 命令 ------------------------------
 

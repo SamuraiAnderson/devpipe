@@ -28,7 +28,7 @@ EXPECTED_PUBLIC = {
     "Workspace", "WorkspaceLog", "WorkspaceRun",
     "CommandResult", "TransferResult", "ResourcePath", "ResourceStat",
     "SessionLogs", "SessionLogRecord", "LogBuffer", "LogCursor", "LogMatch",
-    "stale", "StalePredicate", "PathSpec",
+    "stale", "StalePredicate", "PathSpec", "copy",
     "RedPyMakeError", "SessionError", "SessionConnectionError",
     "SessionClosedError", "CommandError", "CommandTimeoutError",
     "TransferError", "ResourceError", "ResourceNotFoundError",

@@ -41,7 +41,7 @@ def test_acceptance_1_readme_first_10min(local_session, python_probe, tmp_path):
     src.write_text("hi")
     r = local_session.run(*python_probe("print(2+3)"))
     assert "5" in r.stdout
-    tr = local_session.copy(
+    tr = rpm.copy(
         local_session.path(str(src)), local_session.path(str(dst))
     )
     assert tr.transferred is True
@@ -79,7 +79,7 @@ def test_acceptance_3_no_isinstance_branching(
     src = tmp_path / "a"
     src.write_text("common")
     # 同一 API，两种 caller 都走通
-    r1 = local_session.copy(
+    r1 = rpm.copy(
         local_session.path(str(src)),
         local_session.path(str(tmp_path / "b")),
     )

@@ -46,6 +46,20 @@ def _new_operation_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
+class LazyHome:
+    """``Session._home_dir`` 的内部哨兵：家目录尚未探测。
+
+    与 ``None``（探测过，但没有可用家目录）区分。读 ``home_dir`` 不会触发探测；
+    展开 ``~`` / ``~/...`` 时才加载。
+    """
+
+    def __repr__(self) -> str:
+        return "<LazyHome>"
+
+
+LAZY_HOME = LazyHome()
+
+
 class Session(ABC):
     """所有平台会话的抽象基类。
 
@@ -56,8 +70,8 @@ class Session(ABC):
     path_style: str = "posix"
     #: 会话默认工作目录；未指定 ``at()`` 且 ``run(cwd=None)`` 时使用。
     default_cwd: str | None = None
-    #: 若可解析 ``~``，由子类设置。
-    home_dir: str | None = None
+    #: 家目录缓存。``LAZY_HOME`` 表示尚未探测。
+    _home_dir: "str | None | LazyHome" = LAZY_HOME
 
     def __init__(
         self,
@@ -83,6 +97,9 @@ class Session(ABC):
         self._logs = SessionLogs(self._log_buffer)
         self._closed = False
         self._close_lock = threading.Lock()
+        # None：wait() 从调用当下的缓冲末尾开始。run() 会把它拨到该命令开始前。
+        # 串口在子类里设为 0，以便第一次 wait 看到开机日志。
+        self._wait_origin_seq: int | None = None
         if default_cwd is not None:
             self.default_cwd = default_cwd
 
@@ -126,6 +143,30 @@ class Session(ABC):
     @property
     def logs(self) -> SessionLogs:
         return self._logs
+
+    @property
+    def home_dir(self) -> str | None:
+        """已探测到的家目录。尚未探测时为 ``None``，且不会因此去探测。"""
+        value = self.root._home_dir
+        if value is LAZY_HOME:
+            return None
+        return value
+
+    @home_dir.setter
+    def home_dir(self, value: str | None) -> None:
+        self.root._home_dir = value
+
+    def _ensure_home_dir(self) -> str | None:
+        """展开 ``~`` 时调用。``LAZY_HOME`` 才探测；结果缓存在 root 上。"""
+        root = self.root
+        if root._home_dir is LAZY_HOME:
+            probed = root._probe_home_dir()
+            root._home_dir = probed or None
+        return root._home_dir
+
+    def _probe_home_dir(self) -> str | None:
+        """子类覆写。默认没有可探测的家目录。"""
+        return None
 
     @property
     def closed(self) -> bool:
@@ -236,9 +277,10 @@ class Session(ABC):
 
         effective_cwd = cwd or self.default_cwd
         op_id = _new_operation_id("cmd")
-        # run 前保存日志游标 / RX 偏移，确保 .wait() 不漏
+        # run 前保存日志游标 / RX 偏移，确保后续 wait() 不漏这次命令的输出
         cursor_before = self._log_buffer.cursor()
         rx_before = self._rx_cursor()
+        self._note_wait_origin(cursor_before.sequence)
 
         if log_command:
             display = _format_command(argv, shell=shell)
@@ -355,15 +397,35 @@ class Session(ABC):
                 start_offset=rx_since,
                 original_pattern=pattern,
             )
-        return self._log_buffer.wait(
+        effective_since = since if since is not None else self._default_wait_since()
+        match = self._log_buffer.wait(
             pattern,
             timeout=timeout,
             channel=channel,
-            since=since,
+            since=effective_since,
             command_result=command_result,
             multiline=multiline,
             session=self,
         )
+        if match.record is not None:
+            self._advance_wait_origin(match.record.sequence + 1)
+        return match
+
+    def _note_wait_origin(self, sequence: int) -> None:
+        """把后续 ``wait()`` 的默认起点单调拨到 ``sequence``。"""
+        root = self.root
+        current = root._wait_origin_seq
+        if current is None or sequence > current:
+            root._wait_origin_seq = sequence
+
+    def _default_wait_since(self) -> LogCursor | None:
+        root = self.root
+        if root._wait_origin_seq is None:
+            return None
+        return LogCursor(self._log_buffer.session_id, root._wait_origin_seq)
+
+    def _advance_wait_origin(self, sequence: int) -> None:
+        self._note_wait_origin(sequence)
 
     def _rx_cursor(self) -> int | None:
         """串口 RX 单调偏移；非串口为 ``None``。视图转发给 root。"""
@@ -406,7 +468,7 @@ class Session(ABC):
     ) -> TransferResult:
         """从其他环境传入当前会话。
 
-        - 若两端会话相同：等价于 ``copy(source, target)``。
+        - 若两端会话相同：与 ``rpm.copy(source, target)`` 走同一套传输。
         - 若 ``source`` 是本地/远端路径，``target`` 必须属于当前会话；否则报错。
         """
         self._check_alive()
@@ -418,7 +480,7 @@ class Session(ABC):
                 source=source,
                 target=target,
             )
-        return _perform_transfer(self, src, tgt, overwrite=overwrite, timeout=timeout, kind="push")
+        return _perform_transfer(src, tgt, overwrite=overwrite, timeout=timeout, kind="push")
 
     def pull(
         self,
@@ -438,27 +500,7 @@ class Session(ABC):
                 source=source,
                 target=target,
             )
-        return _perform_transfer(self, src, tgt, overwrite=overwrite, timeout=timeout, kind="pull")
-
-    def copy(
-        self,
-        source: "ResourcePath | str | os.PathLike[str]",
-        target: "ResourcePath | str | os.PathLike[str]",
-        *,
-        overwrite: bool = True,
-        timeout: float | None = None,
-    ) -> TransferResult:
-        """统一复制。要求调用会话是源或目标之一。"""
-        self._check_alive()
-        src = _as_path(self, source, allow_local=True)
-        tgt = _as_path(self, target, allow_local=True)
-        if src.session.root is not self.root and tgt.session.root is not self.root:
-            raise TransferError(
-                "copy() session must be either the source or the target",
-                source=source,
-                target=target,
-            )
-        return _perform_transfer(self, src, tgt, overwrite=overwrite, timeout=timeout, kind="copy")
+        return _perform_transfer(src, tgt, overwrite=overwrite, timeout=timeout, kind="pull")
 
     # ------------------------------------------------------------------
     # 传输 hook（供子类覆写）
@@ -559,9 +601,8 @@ class _SessionView(Session):
             parent=parent,
             default_cwd=new_cwd,
         )
-        # 强制 path_style 与 home_dir 沿用 root
+        # 强制 path_style 沿用 root。home_dir 懒加载，读的时候走 root，不在这里拷贝。
         self.path_style = root.path_style
-        self.home_dir = root.home_dir
 
     # 所有 IO 委托给 root，实现共用连接
 
@@ -638,19 +679,57 @@ def _as_path(
     """将 ``str``/``PathLike``/``ResourcePath`` 归一为 ``ResourcePath``。
 
     ``allow_local``：当 ``spec`` 是纯字符串时，是否允许将其解释为本地路径。
-    True：绑到默认 local 会话；False：绑到调用会话。
+    True：非本地调用方绑到进程级默认 local 会话；本地调用方绑到自己。
+    False：绑到调用会话。
     """
     if isinstance(spec, ResourcePath):
         return spec
-    if allow_local:
+    if allow_local and not getattr(session.root, "_is_local", False):
         from ._factory import _default_local
 
         return _default_local().path(spec)
     return session.path(spec)
 
 
+def _endpoint_roots(src: ResourcePath, tgt: ResourcePath) -> list[Session]:
+    """源、目标的 root 会话。同一会话只出现一次。"""
+    roots: list[Session] = []
+    for sess in (src.session, tgt.session):
+        root = sess.root
+        if all(root is not seen for seen in roots):
+            roots.append(root)
+    return roots
+
+
+def _log_transfer(roots: list[Session], **kwargs: Any) -> None:
+    for root in roots:
+        root._log_buffer.append(**kwargs)
+
+
+def copy(
+    source: "ResourcePath | str | os.PathLike[str]",
+    target: "ResourcePath | str | os.PathLike[str]",
+    *,
+    overwrite: bool = True,
+    timeout: float | None = None,
+) -> TransferResult:
+    """在源路径和目标路径之间复制。
+
+    裸字符串与 ``os.PathLike`` 绑到进程级默认 local 会话，不跟随其它
+    ``rpm.local(default_cwd=...)`` 的工作目录。日志写在源会话和目标会话上；
+    两端相同则只记一次。
+    """
+    from ._factory import _active_workspace_or_none, _default_local
+
+    ws = _active_workspace_or_none()
+    if ws is not None:
+        ws._check_stop_requested("copy")
+    src = source if isinstance(source, ResourcePath) else _default_local().path(source)
+    tgt = target if isinstance(target, ResourcePath) else _default_local().path(target)
+    return _perform_transfer(src, tgt, overwrite=overwrite, timeout=timeout, kind="copy")
+
+
 def _perform_transfer(
-    caller: Session,
     src: ResourcePath,
     tgt: ResourcePath,
     *,
@@ -658,20 +737,25 @@ def _perform_transfer(
     timeout: float | None,
     kind: str,
 ) -> TransferResult:
+    roots = _endpoint_roots(src, tgt)
+    for root in roots:
+        root._check_alive()
     op_id = _new_operation_id("xfer")
-    caller._log_buffer.append(
+    start_fields = {
+        "kind": kind,
+        "source": str(src),
+        "source_session": src.session.session_id,
+        "target": str(tgt),
+        "target_session": tgt.session.session_id,
+    }
+    _log_transfer(
+        roots,
         event="transfer_start",
         level="INFO",
         stream="system",
         message=f"{kind}: {src} -> {tgt}",
         operation_id=op_id,
-        fields={
-            "kind": kind,
-            "source": str(src),
-            "source_session": src.session.session_id,
-            "target": str(tgt),
-            "target_session": tgt.session.session_id,
-        },
+        fields=start_fields,
     )
     start = time.monotonic()
     try:
@@ -680,7 +764,8 @@ def _perform_transfer(
         )
     except Exception as exc:
         elapsed = time.monotonic() - start
-        caller._log_buffer.append(
+        _log_transfer(
+            roots,
             event="transfer_error",
             level="ERROR",
             stream="system",
@@ -695,7 +780,8 @@ def _perform_transfer(
         ) from exc
 
     duration = time.monotonic() - start
-    caller._log_buffer.append(
+    _log_transfer(
+        roots,
         event="transfer_end",
         level="INFO",
         stream="system",

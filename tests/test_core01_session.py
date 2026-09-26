@@ -20,7 +20,11 @@
     §CORE-01/serial/streaming         → test_serial_streaming_rx_immediate
     §CORE-01/serial/idle-flush        → test_serial_prompt_idle_flush
     §CORE-01/serial/stream-cursor     → test_serial_stream_cursor_catches_pre_wait_history_and_advances
+    §CORE-01/serial/cr-split          → test_serial_cr_splits_progress_lines
     §CORE-01/wsl/no-wsl-binary        → test_wsl_without_binary_raises_session_connection_error
+    §CORE-01/wsl/tilde-lazy           → test_wsl_tilde_stays_lazy_until_used
+    §CORE-01/wsl/tilde-expand         → test_wsl_tilde_expands_from_lazy_home
+    §CORE-01/wsl/tilde-probe-fails    → test_wsl_tilde_probe_failure_propagates
 
 """
 
@@ -33,6 +37,7 @@ import pytest
 
 import redpymake as rpm
 from redpymake.exceptions import (
+    CommandError,
     SessionClosedError,
     SessionConnectionError,
     UnsupportedOperationError,
@@ -306,6 +311,32 @@ def test_serial_stream_cursor_catches_pre_wait_history_and_advances(monkeypatch)
         assert bm2.text == b"\x01\x02"
 
 
+def test_serial_cr_splits_progress_lines(monkeypatch):
+    """§CORE-01/serial/cr-split：进度条的 ``\\r`` 另起一条日志；``\\r\\n`` 仍是一行。"""
+    with open_stub_serial(monkeypatch) as (sess, port):
+        port.feed(b"get file\r  10%\r  20%\r\n/home # ")
+        sess.wait("/home #", timeout=1)
+        messages = [
+            r.message
+            for r in sess.logs.records()
+            if r.stream == "serial" and r.event == "command_output"
+        ]
+        assert "get file" in messages
+        assert "  10%" in messages
+        assert "  20%" in messages
+        assert not any("\r" in message for message in messages)
+
+        port.feed(b"\r  30%\n")
+        sess.wait("30%", timeout=1)
+        messages = [
+            r.message
+            for r in sess.logs.records()
+            if r.stream == "serial" and r.event == "command_output"
+        ]
+        assert "  30%" in messages
+        assert "" not in messages
+
+
 def test_wsl_without_binary_raises_session_connection_error(monkeypatch):
     """§CORE-01：``rpm.wsl()`` 找不到 ``wsl.exe`` 时立即抛 ``SessionConnectionError``。
 
@@ -316,3 +347,70 @@ def test_wsl_without_binary_raises_session_connection_error(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     with pytest.raises(SessionConnectionError):
         rpm.wsl()
+
+
+def test_wsl_tilde_stays_lazy_until_used():
+    """§CORE-01/wsl/tilde-lazy：构造不探测家目录，``_home_dir`` 保持懒加载哨兵。"""
+    from redpymake._session import LAZY_HOME
+
+    sess = rpm.wsl(wsl_path="wsl-not-used")
+    try:
+        assert sess._home_dir is LAZY_HOME
+        assert sess.home_dir is None
+        view = sess.at("/tmp")
+        assert view._home_dir is LAZY_HOME
+        assert view.home_dir is None
+    finally:
+        sess.close()
+
+
+def test_wsl_tilde_expands_from_lazy_home(monkeypatch):
+    """§CORE-01/wsl/tilde-expand：第一次 ``~`` 才探测，并缓存在 root 上；视图共享该结果。"""
+    sess = rpm.wsl(wsl_path="wsl-not-used")
+    calls = {"n": 0}
+
+    def _probe(_self) -> str:
+        calls["n"] += 1
+        return "/home/me"
+
+    monkeypatch.setattr(type(sess), "_probe_home_dir", _probe)
+    try:
+        view = sess.at("/tmp")
+        assert calls["n"] == 0
+        assert view.path("~/work").path == "/home/me/work"
+        assert calls["n"] == 1
+        assert sess.path("~").path == "/home/me"
+        assert calls["n"] == 1
+        assert sess.home_dir == "/home/me"
+        assert view.home_dir == "/home/me"
+    finally:
+        sess.close()
+
+
+def test_wsl_tilde_probe_failure_propagates(monkeypatch):
+    """§CORE-01/wsl/tilde-probe-fails：读 ``$HOME`` 失败时原样抛出，不记成空家目录。"""
+    from redpymake._session import LAZY_HOME
+
+    sess = rpm.wsl(wsl_path="wsl-not-used")
+
+    def _failed(_self, extra, timeout=None, stdin=None):
+        return 1, "", "wsl-boom"
+
+    monkeypatch.setattr(type(sess), "_run_wsl", _failed)
+    try:
+        with pytest.raises(CommandError) as ei:
+            sess.at("~/work/tree")
+        assert ei.value.returncode == 1
+        assert ei.value.stderr == "wsl-boom"
+        assert sess._home_dir is LAZY_HOME
+
+        def _missing(_self, extra, timeout=None, stdin=None):
+            raise OSError("wsl missing")
+
+        monkeypatch.setattr(type(sess), "_run_wsl", _missing)
+        with pytest.raises(SessionConnectionError) as wrapped:
+            sess.path("~/work/tree")
+        assert isinstance(wrapped.value.cause, OSError)
+        assert sess._home_dir is LAZY_HOME
+    finally:
+        sess.close()
