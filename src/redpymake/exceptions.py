@@ -93,7 +93,14 @@ class CommandTimeoutError(CommandError):
 
 
 class TransferError(RedPyMakeError):
-    """push/pull/copy 传输失败。"""
+    """push/pull/copy 传输失败。
+
+    除 ``source`` / ``target`` / ``cause`` 外，当失败来自底层壳命令
+    （WSL 的 ``_wsl_shell``、ADB 的 ``_shell_probe`` 发出的 ``cp`` / ``stat`` /
+    ``rm`` / ``mkdir`` 等）时，可通过 ``returncode`` / ``stdout`` / ``stderr``
+    把诊断信息带出。这些字段默认为 ``None`` / ``""``，与 ``CommandError`` 对齐，
+    避免调用方只能靠正则 message 来猜根因。
+    """
 
     def __init__(
         self,
@@ -102,11 +109,17 @@ class TransferError(RedPyMakeError):
         source: Any = None,
         target: Any = None,
         cause: BaseException | None = None,
+        returncode: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
     ) -> None:
         super().__init__(message)
         self.source = source
         self.target = target
         self.cause = cause
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class ResourceError(RedPyMakeError):

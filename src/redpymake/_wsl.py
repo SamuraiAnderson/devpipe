@@ -110,10 +110,20 @@ class WslSession(Session):
 
     def _wsl_shell(
         self, cmd: str, *, timeout: float | None = 10.0
-    ) -> tuple[int, str]:
-        """在 WSL 内跑一段 shell 命令，返回 ``(rc, stdout)``；不写日志。"""
-        rc, out, _err = self._run_wsl(["--", "sh", "-c", cmd], timeout=timeout)
-        return rc, out
+    ) -> tuple[int, str, str]:
+        """在 WSL 内跑一段 shell 命令，返回 ``(rc, stdout, stderr)``；不写日志。
+
+        注意：**不得丢弃 ``stderr``**。cp/stat/rm/mkdir 等 POSIX 工具的失败原因
+        基本都写在 stderr，调用方失败分支要把它透出来，否则 ``TransferError``
+        就会退化成 ``"wsl ... failed:"`` 这种没有根因的消息
+        （project-overview.mdc "捕获后若没有在同一个函数里重新抛出，就是掩盖失败"）。
+        """
+        return self._run_wsl(["--", "sh", "-c", cmd], timeout=timeout)
+
+    @staticmethod
+    def _shell_detail(stderr: str, stdout: str) -> str:
+        """从壳命令的 stderr/stdout 里挑一条可读的失败原因；均空时给个占位符。"""
+        return stderr.strip() or stdout.strip() or "<no output>"
 
     def _probe_home_dir(self) -> str:
         """第一次展开 ``~`` 时调用。发行版未运行则会在这里冷启动。失败直接抛出。"""
@@ -244,25 +254,25 @@ class WslSession(Session):
     # ------------------------------ 资源 ------------------------------
 
     def _resource_exists(self, path: str) -> bool:
-        rc, out = self._wsl_shell(
+        rc, out, _err = self._wsl_shell(
             f"[ -e {shlex.quote(path)} ] && echo yes || echo no"
         )
         return "yes" in out.strip()
 
     def _resource_is_file(self, path: str) -> bool:
-        rc, out = self._wsl_shell(
+        rc, out, _err = self._wsl_shell(
             f"[ -f {shlex.quote(path)} ] && echo yes || echo no"
         )
         return "yes" in out.strip()
 
     def _resource_is_dir(self, path: str) -> bool:
-        rc, out = self._wsl_shell(
+        rc, out, _err = self._wsl_shell(
             f"[ -d {shlex.quote(path)} ] && echo yes || echo no"
         )
         return "yes" in out.strip()
 
     def _resource_stat(self, path: str) -> ResourceStat:
-        rc, out = self._wsl_shell(f"stat -c '%s %Y %F' {shlex.quote(path)}")
+        rc, out, _err = self._wsl_shell(f"stat -c '%s %Y %F' {shlex.quote(path)}")
         text = out.strip()
         if rc != 0 or not text:
             raise ResourceNotFoundError(
@@ -281,17 +291,29 @@ class WslSession(Session):
             ) from exc
 
     def _resource_remove(self, path: str, *, missing_ok: bool = False) -> None:
-        rc, out = self._wsl_shell(f"rm -rf {shlex.quote(path)}")
+        rc, out, err = self._wsl_shell(f"rm -rf {shlex.quote(path)}")
         if rc != 0 and not missing_ok:
-            raise TransferError(f"wsl remove failed: {out}", target=path)
+            raise TransferError(
+                f"wsl remove failed (rc={rc}): {self._shell_detail(err, out)}",
+                target=path,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
+            )
 
     def _resource_mkdir(
         self, path: str, *, parents: bool = False, exist_ok: bool = False
     ) -> None:
         flag = "-p " if parents or exist_ok else ""
-        rc, out = self._wsl_shell(f"mkdir {flag}{shlex.quote(path)}")
+        rc, out, err = self._wsl_shell(f"mkdir {flag}{shlex.quote(path)}")
         if rc != 0 and not exist_ok:
-            raise TransferError(f"wsl mkdir failed: {out}", target=path)
+            raise TransferError(
+                f"wsl mkdir failed (rc={rc}): {self._shell_detail(err, out)}",
+                target=path,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
+            )
 
     # ------------------------------ 传输 ------------------------------
 
@@ -310,13 +332,18 @@ class WslSession(Session):
                 f"local source not found: {local_source}", path=local_source
             )
         mnt_src = _win_to_mnt(local_source)
-        rc, out = self._wsl_shell(
+        rc, out, err = self._wsl_shell(
             f"cp -f {shlex.quote(mnt_src)} {shlex.quote(remote_target)}",
             timeout=timeout,
         )
         if rc != 0:
             raise TransferError(
-                f"wsl push failed: {out}", source=local_source, target=remote_target
+                f"wsl push failed (rc={rc}): {self._shell_detail(err, out)}",
+                source=local_source,
+                target=remote_target,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
             )
         try:
             size = os.path.getsize(local_source)
@@ -338,13 +365,18 @@ class WslSession(Session):
         if parent:
             os.makedirs(parent, exist_ok=True)
         mnt_tgt = _win_to_mnt(local_target)
-        rc, out = self._wsl_shell(
+        rc, out, err = self._wsl_shell(
             f"cp -f {shlex.quote(remote_source)} {shlex.quote(mnt_tgt)}",
             timeout=timeout,
         )
         if rc != 0:
             raise TransferError(
-                f"wsl pull failed: {out}", source=remote_source, target=local_target
+                f"wsl pull failed (rc={rc}): {self._shell_detail(err, out)}",
+                source=remote_source,
+                target=local_target,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
             )
         try:
             size = os.path.getsize(local_target)
@@ -363,10 +395,15 @@ class WslSession(Session):
         cmd = f"cp -f {shlex.quote(source)} {shlex.quote(target)}"
         if not overwrite:
             cmd = f"[ -e {shlex.quote(target)} ] || {cmd}"
-        rc, out = self._wsl_shell(cmd, timeout=timeout)
+        rc, out, err = self._wsl_shell(cmd, timeout=timeout)
         if rc != 0:
             raise TransferError(
-                f"wsl in-distro copy failed: {out}", source=source, target=target
+                f"wsl in-distro copy failed (rc={rc}): {self._shell_detail(err, out)}",
+                source=source,
+                target=target,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
             )
         try:
             size = int(self._resource_stat(target).size)

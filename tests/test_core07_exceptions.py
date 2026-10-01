@@ -117,7 +117,11 @@ def test_log_wait_timeout_fields(local_session):
 
 
 def test_transfer_error_fields(fake_remote, local_session, tmp_path):
-    """§CORE-07：``TransferError`` 携带 ``source`` / ``target``。"""
+    """§CORE-07：``TransferError`` 携带 ``source`` / ``target``；
+    并支持可选的 ``returncode`` / ``stdout`` / ``stderr`` 字段，用于让底层壳
+    命令（WSL/ADB 的 cp/stat/rm/mkdir）失败时把诊断信息完整传递到调用方，
+    避免出现 "wsl pull failed:" 这种只有前缀的消息。
+    """
     src = tmp_path / "s.txt"
     src.write_text("ok")
     with pytest.raises(TransferError) as ei:
@@ -126,6 +130,23 @@ def test_transfer_error_fields(fake_remote, local_session, tmp_path):
         )
     assert ei.value.source is not None
     assert ei.value.target is not None
+    # 默认字段存在且为空（即使这次失败不是壳命令失败）
+    assert ei.value.returncode is None
+    assert ei.value.stdout == ""
+    assert ei.value.stderr == ""
+
+    # 可直接构造 + 读取字段
+    constructed = TransferError(
+        "boom",
+        source="/s",
+        target="/t",
+        returncode=2,
+        stdout="hi\n",
+        stderr="cp: cannot stat '/s': No such file or directory",
+    )
+    assert constructed.returncode == 2
+    assert constructed.stdout == "hi\n"
+    assert "No such file" in constructed.stderr
 
 
 def test_session_connection_error_fields(monkeypatch):

@@ -289,6 +289,7 @@ def run(
 
 - 不提供独立 `sh()`。
 - `shell=False`：每个位置参数都是独立参数，不解析 `|`、`&&`、`>`。
+- `shell=False` 的位置参数按**字面量**传递，**不展开** `~` / `~/...`、`$VAR` / `${VAR}`、`*` / `?` / `[...]` 等 shell 构造；跨平台会话（SSH/WSL/ADB）通过 `shlex.quote` 保证远端 shell 也不展开。需要展开请走 `session.path("~/…")`（CORE-03）预解析为绝对路径，或传 `shell=True`。
 - `shell=True`：只允许一条完整命令字符串；同时传额外位置参数时抛出 `TypeError`。
 - `command` 为 `bytes` 时仅串口允许：原样写入、不追加 `newline`；带 `*args` 或 `shell=True` 抛 `TypeError`。其他会话抛 `TypeError`。
 - 底层不得使用简单的 `" ".join(args)`，必须做平台正确的参数传递或转义。
@@ -404,6 +405,7 @@ rpm.copy("build/app", "backup/app")  # 裸字符串是本机路径
 - 任一端会话已关闭则抛 `SessionClosedError`。
 - 支持 `overwrite`、超时等选项。
 - 返回 `TransferResult`，至少包含：源、目标、是否实际传输、字节数、耗时。
+- **失败消息必须保留底层诊断信息**。当实现为了跑 `cp` / `stat` / `rm` / `mkdir` 等 POSIX 工具而内部壳调用（如 `WslSession._wsl_shell`、`AdbSession._shell_probe`）时，一旦返回非零必须把 `stderr`（优先）或 `stdout` 写进 `TransferError.message`，并通过 `TransferError.returncode` / `stdout` / `stderr` 结构化带出，不得退化成 `"wsl pull failed:"` 这种没有根因的消息（契约测试见 `§CORE-04/failure/surfaces-stderr/*`）。
 
 跨远端示例：
 

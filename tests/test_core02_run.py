@@ -9,6 +9,10 @@
     §CORE-02/run/shell/single       → test_run_shell_true_executes_pipeline
     §CORE-02/run/shell/no-extra     → test_run_shell_true_forbids_extra_args
     §CORE-02/run/no-naive-join      → test_run_default_does_not_naive_join_args
+    §CORE-02/run/argv/literal-tilde      → test_run_positional_does_not_expand_tilde
+    §CORE-02/run/argv/literal-dollar-var → test_run_positional_does_not_expand_env_var
+    §CORE-02/run/argv/literal-glob       → test_run_positional_does_not_expand_glob
+    §CORE-02/run/argv/literal-via-wsl    → test_run_argv_literal_through_shlex_quote_on_wsl
     §CORE-02/run/check=True         → test_run_check_true_raises_command_error
     §CORE-02/run/check=False        → test_run_check_false_returns_result
     §CORE-02/run/timeout            → test_run_timeout_raises_command_timeout
@@ -80,6 +84,75 @@ def test_run_default_does_not_naive_join_args(local_session, python_probe):
     # 若被 " ".join，则 argv 会退化为 ["hello", "world", "a", "b", "c"] 5 项
     assert "'hello world'" in res.stdout
     assert "'a b c'" in res.stdout
+
+
+# ----------------------------------------------- argv 字面量：不展开 ~ / $VAR / glob
+
+
+def test_run_positional_does_not_expand_tilde(local_session, python_probe):
+    """§CORE-02/run/argv/literal-tilde：
+    ``shell=False`` 时位置参数按字面量传递，``~`` / ``~/...`` 不展开。
+    需要展开应走 ``session.path("~/…")``（CORE-03）或 ``shell=True``。
+    """
+    argv = python_probe("import sys; sys.stdout.write(sys.argv[1])") + ["~"]
+    res = local_session.run(*argv)
+    assert res.stdout == "~"
+
+
+def test_run_positional_does_not_expand_env_var(local_session, python_probe):
+    """§CORE-02/run/argv/literal-dollar-var：``$VAR`` 不在 argv 位置展开。"""
+    argv = python_probe("import sys; sys.stdout.write(sys.argv[1])") + ["$HOME"]
+    res = local_session.run(*argv, env={"HOME": "/should-not-appear"})
+    assert res.stdout == "$HOME"
+
+
+def test_run_positional_does_not_expand_glob(local_session, python_probe):
+    """§CORE-02/run/argv/literal-glob：``*.ext`` / ``?`` 等通配符不在 argv 位置展开。"""
+    argv = python_probe("import sys; sys.stdout.write(sys.argv[1])") + ["*.py"]
+    res = local_session.run(*argv)
+    assert res.stdout == "*.py"
+
+
+def test_run_argv_literal_through_shlex_quote_on_wsl(monkeypatch):
+    """§CORE-02/run/argv/literal-via-wsl：
+    远端会话（这里以 WSL 为代表）的 ``shell=False`` 分支必须 shell-quote 每个
+    位置参数，确保 ``~`` / ``$VAR`` / ``*`` 在远端 shell 中保持字面量。
+    监听底层 ``subprocess.Popen`` 的 argv，断言包含 ``'~'``、``'$HOME'`` 等
+    被单引号保护的实参，而非裸的 ``~`` / ``$HOME``。
+    """
+    import subprocess
+
+    import redpymake._wsl as wsl_mod
+
+    sess = rpm.wsl(wsl_path="wsl-not-used")
+    captured: list[list[str]] = []
+
+    class _FakePopen:
+        def __init__(self, argv, *_, **__):
+            captured.append(list(argv))
+            self.stdout = None
+            self.stderr = None
+            self.stdin = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", _FakePopen)
+    # 另外 _execute_command 会起 pump 线程读 stdout/stderr；None 流直接 return。
+    try:
+        sess.run("echo", "~", "$HOME", "*.py")
+    finally:
+        sess.close()
+
+    assert captured, "wsl _execute_command did not invoke subprocess.Popen"
+    # 最后一个参数是传给 sh -c 的 wrapped 命令字符串
+    wrapped = captured[-1][-1]
+    assert "'~'" in wrapped
+    assert "'$HOME'" in wrapped
+    assert "'*.py'" in wrapped
+    # 反向保证：裸的 "~" / "$HOME" 不会出现在命令里（否则会被远端 shell 展开）
+    assert " ~ " not in f" {wrapped} "
+    assert "$HOME " not in wrapped.replace("'$HOME'", "")
 
 
 # ------------------------------------------------------------------- check

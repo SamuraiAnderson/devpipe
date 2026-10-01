@@ -15,6 +15,11 @@
     §CORE-04/copy/closed                   → test_copy_closed_session_raises
     §CORE-04/remote-to-remote/via-local    → test_remote_to_remote_via_local_tmp
     §CORE-04/result/fields                 → test_transfer_result_fields
+    §CORE-04/failure/surfaces-stderr/wsl-pull   → test_wsl_pull_failure_surfaces_stderr
+    §CORE-04/failure/surfaces-stderr/wsl-push   → test_wsl_push_failure_surfaces_stderr
+    §CORE-04/failure/surfaces-stderr/wsl-copy   → test_wsl_in_distro_copy_failure_surfaces_stderr
+    §CORE-04/failure/surfaces-stderr/wsl-mkdir  → test_wsl_mkdir_failure_surfaces_stderr
+    §CORE-04/failure/surfaces-stderr/adb-mkdir  → test_adb_mkdir_failure_surfaces_stderr
 """
 
 from __future__ import annotations
@@ -238,3 +243,160 @@ def test_copy_closed_session_raises(tmp_path: Path):
     sess.close()
     with pytest.raises(SessionClosedError):
         rpm.copy(src_path, dst_path)
+
+
+# ---------------------------------------------- 失败消息必须透传底层 stderr
+#
+# 这些用例覆盖的核心契约：
+#   当某个会话实现为了跑 cp / stat / rm / mkdir 等 POSIX 工具而内部"壳调用"
+#   （WSL 走 ``_wsl_shell``、ADB 走 ``_shell_probe``）时，一旦底层返回非零，
+#   失败分支必须把 ``stderr`` 写进 ``TransferError.message`` + ``TransferError.stderr``；
+#   不得只回传 ``stdout``（它通常是空的），让异常退化成 "wsl pull failed:" 这种
+#   不说原因的消息。project-overview.mdc："捕获后若没有在同一个函数里重新抛
+#   出，就是掩盖失败"——丢诊断信息是同类问题的一种。
+
+
+def _wsl_fake_run(stderr_msg: str, *, home: str | None = "/root"):
+    """构造一个假 ``_run_wsl``：对家目录探测放行，其余命令统一返回 ``(1, "", stderr_msg)``。"""
+
+    def _impl(_self, extra, *, timeout=None, stdin=None):
+        joined = " ".join(extra)
+        if home is not None and 'printf %s "$HOME"' in joined:
+            return 0, home, ""
+        return 1, "", stderr_msg
+
+    return _impl
+
+
+def test_wsl_pull_failure_surfaces_stderr(
+    monkeypatch, local_session, tmp_path: Path
+):
+    """§CORE-04/failure/surfaces-stderr/wsl-pull：
+    ``pull()`` 走 WSL 的 ``cp`` 失败时，``TransferError`` 必须携带 stderr。
+    """
+    sess = rpm.wsl(wsl_path="wsl-not-used")
+    monkeypatch.setattr(
+        type(sess),
+        "_run_wsl",
+        _wsl_fake_run("cp: cannot stat '/no/such': No such file or directory"),
+    )
+    try:
+        with pytest.raises(TransferError) as ei:
+            sess.pull(
+                sess.path("/no/such"),
+                local_session.path(str(tmp_path / "out.bin")),
+            )
+    finally:
+        sess.close()
+    msg = str(ei.value)
+    assert "No such file or directory" in msg, (
+        f"stderr was swallowed; message={msg!r}"
+    )
+    assert "cp:" in msg
+    assert ei.value.stderr and "No such file" in ei.value.stderr
+    assert ei.value.returncode == 1
+
+
+def test_wsl_push_failure_surfaces_stderr(
+    monkeypatch, local_session, tmp_path: Path
+):
+    """§CORE-04/failure/surfaces-stderr/wsl-push：
+    ``push()`` 走 WSL 的 ``cp`` 失败时，``TransferError`` 必须携带 stderr。
+    """
+    src = tmp_path / "s.bin"
+    src.write_bytes(b"x")
+    sess = rpm.wsl(wsl_path="wsl-not-used")
+    monkeypatch.setattr(
+        type(sess),
+        "_run_wsl",
+        _wsl_fake_run(
+            "cp: cannot create regular file '/ro/x': Read-only file system"
+        ),
+    )
+    try:
+        with pytest.raises(TransferError) as ei:
+            sess.push(local_session.path(str(src)), sess.path("/ro/x"))
+    finally:
+        sess.close()
+    msg = str(ei.value)
+    assert "Read-only file system" in msg, (
+        f"stderr was swallowed; message={msg!r}"
+    )
+    assert ei.value.stderr and "Read-only file system" in ei.value.stderr
+    assert ei.value.returncode == 1
+
+
+def test_wsl_in_distro_copy_failure_surfaces_stderr(monkeypatch):
+    """§CORE-04/failure/surfaces-stderr/wsl-copy：
+    同一 WSL 会话内 ``copy()`` 失败时，``TransferError`` 必须携带 stderr。
+    """
+    sess = rpm.wsl(wsl_path="wsl-not-used")
+    monkeypatch.setattr(
+        type(sess),
+        "_run_wsl",
+        _wsl_fake_run("cp: cannot stat '/a': No such file or directory"),
+    )
+    try:
+        with pytest.raises(TransferError) as ei:
+            rpm.copy(sess.path("/a"), sess.path("/b"))
+    finally:
+        sess.close()
+    msg = str(ei.value)
+    assert "No such file or directory" in msg, (
+        f"stderr was swallowed; message={msg!r}"
+    )
+    assert ei.value.stderr
+
+
+def test_wsl_mkdir_failure_surfaces_stderr(monkeypatch):
+    """§CORE-04/failure/surfaces-stderr/wsl-mkdir：
+    ``ResourcePath.mkdir()`` 走 WSL 的 ``mkdir`` 失败时，``TransferError``
+    必须携带 stderr。
+    """
+    sess = rpm.wsl(wsl_path="wsl-not-used")
+    monkeypatch.setattr(
+        type(sess),
+        "_run_wsl",
+        _wsl_fake_run(
+            "mkdir: cannot create directory '/ro/x': Read-only file system"
+        ),
+    )
+    try:
+        with pytest.raises(TransferError) as ei:
+            sess.path("/ro/x").mkdir()
+    finally:
+        sess.close()
+    msg = str(ei.value)
+    assert "Read-only file system" in msg, (
+        f"stderr was swallowed; message={msg!r}"
+    )
+    assert ei.value.stderr and "Read-only file system" in ei.value.stderr
+
+
+def test_adb_mkdir_failure_surfaces_stderr(monkeypatch):
+    """§CORE-04/failure/surfaces-stderr/adb-mkdir：
+    ADB 的 ``_shell_probe`` 对接 ``mkdir`` 失败时，必须把 stderr 透出来，
+    不得只留 ``"adb mkdir failed:"`` 这种空消息。
+    """
+    from redpymake._adb import AdbSession
+
+    def _fake(_self, extra, *, timeout=None, stdin=None):
+        if extra and extra[0] == "get-state":
+            return 0, "device\n", ""
+        # 任何 shell 调用都返回失败 + stderr
+        return 1, "", (
+            "mkdir: '/ro/x': Read-only file system"
+        )
+
+    monkeypatch.setattr(AdbSession, "_run_adb", _fake)
+    sess = rpm.adb(adb_path="adb-not-used")
+    try:
+        with pytest.raises(TransferError) as ei:
+            sess.path("/ro/x").mkdir()
+    finally:
+        sess.close()
+    msg = str(ei.value)
+    assert "Read-only file system" in msg, (
+        f"stderr was swallowed; message={msg!r}"
+    )
+    assert ei.value.stderr and "Read-only file system" in ei.value.stderr

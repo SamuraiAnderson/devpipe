@@ -217,31 +217,44 @@ class AdbSession(Session):
 
     # ------------------------------ 资源 ------------------------------
 
-    def _shell_probe(self, cmd: str, *, timeout: float | None = 10.0) -> tuple[int, str]:
-        rc, out, _err = self._run_adb(["shell", cmd], timeout=timeout)
-        return rc, out
+    def _shell_probe(
+        self, cmd: str, *, timeout: float | None = 10.0
+    ) -> tuple[int, str, str]:
+        """在设备上跑一段 shell 命令，返回 ``(rc, stdout, stderr)``；不写日志。
+
+        与 ``WslSession._wsl_shell`` 同纪律：**不得丢弃 stderr**，否则 cp/stat/
+        rm/mkdir 的失败原因就会被静默掩盖
+        （project-overview.mdc "捕获后若没有在同一个函数里重新抛出，就是掩盖失败"）。
+        """
+        return self._run_adb(["shell", cmd], timeout=timeout)
+
+    @staticmethod
+    def _shell_detail(stderr: str, stdout: str) -> str:
+        return stderr.strip() or stdout.strip() or "<no output>"
 
     def _resource_exists(self, path: str) -> bool:
-        rc, _ = self._shell_probe(
+        rc, out, _err = self._shell_probe(
             f"[ -e {shlex.quote(path)} ] && echo yes || echo no"
         )
-        return "yes" in _.strip()
+        return "yes" in out.strip()
 
     def _resource_is_file(self, path: str) -> bool:
-        rc, out = self._shell_probe(
+        rc, out, _err = self._shell_probe(
             f"[ -f {shlex.quote(path)} ] && echo yes || echo no"
         )
         return "yes" in out.strip()
 
     def _resource_is_dir(self, path: str) -> bool:
-        rc, out = self._shell_probe(
+        rc, out, _err = self._shell_probe(
             f"[ -d {shlex.quote(path)} ] && echo yes || echo no"
         )
         return "yes" in out.strip()
 
     def _resource_stat(self, path: str) -> ResourceStat:
         # `stat -c '%s %Y %F'` 在多数 Android 上可用
-        rc, out = self._shell_probe(f"stat -c '%s %Y %F' {shlex.quote(path)}")
+        rc, out, _err = self._shell_probe(
+            f"stat -c '%s %Y %F' {shlex.quote(path)}"
+        )
         text = out.strip()
         if rc != 0 or not text:
             raise ResourceNotFoundError(
@@ -260,17 +273,29 @@ class AdbSession(Session):
             ) from exc
 
     def _resource_remove(self, path: str, *, missing_ok: bool = False) -> None:
-        rc, out = self._shell_probe(f"rm -rf {shlex.quote(path)}")
+        rc, out, err = self._shell_probe(f"rm -rf {shlex.quote(path)}")
         if rc != 0 and not missing_ok:
-            raise TransferError(f"adb remove failed: {out}", target=path)
+            raise TransferError(
+                f"adb remove failed (rc={rc}): {self._shell_detail(err, out)}",
+                target=path,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
+            )
 
     def _resource_mkdir(
         self, path: str, *, parents: bool = False, exist_ok: bool = False
     ) -> None:
         flag = "-p " if parents or exist_ok else ""
-        rc, out = self._shell_probe(f"mkdir {flag}{shlex.quote(path)}")
+        rc, out, err = self._shell_probe(f"mkdir {flag}{shlex.quote(path)}")
         if rc != 0 and not exist_ok:
-            raise TransferError(f"adb mkdir failed: {out}", target=path)
+            raise TransferError(
+                f"adb mkdir failed (rc={rc}): {self._shell_detail(err, out)}",
+                target=path,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
+            )
 
     # ------------------------------ 传输 ------------------------------
 
@@ -284,7 +309,12 @@ class AdbSession(Session):
         )
         if rc != 0:
             raise TransferError(
-                f"adb push failed: {err or out}", source=local_source, target=remote_target
+                f"adb push failed (rc={rc}): {self._shell_detail(err, out)}",
+                source=local_source,
+                target=remote_target,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
             )
         try:
             size = os.path.getsize(local_source)
@@ -305,7 +335,12 @@ class AdbSession(Session):
         )
         if rc != 0:
             raise TransferError(
-                f"adb pull failed: {err or out}", source=remote_source, target=local_target
+                f"adb pull failed (rc={rc}): {self._shell_detail(err, out)}",
+                source=remote_source,
+                target=local_target,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
             )
         try:
             size = os.path.getsize(local_target)
@@ -319,10 +354,15 @@ class AdbSession(Session):
         cmd = f"cp -f {shlex.quote(source)} {shlex.quote(target)}"
         if not overwrite:
             cmd = f"[ -e {shlex.quote(target)} ] || {cmd}"
-        rc, out = self._shell_probe(cmd, timeout=timeout)
+        rc, out, err = self._shell_probe(cmd, timeout=timeout)
         if rc != 0:
             raise TransferError(
-                f"adb in-device copy failed: {out}", source=source, target=target
+                f"adb in-device copy failed (rc={rc}): {self._shell_detail(err, out)}",
+                source=source,
+                target=target,
+                returncode=rc,
+                stdout=out,
+                stderr=err,
             )
         try:
             size = self._resource_stat(target).size
