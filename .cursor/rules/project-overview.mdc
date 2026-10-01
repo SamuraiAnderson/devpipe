@@ -21,7 +21,8 @@ alwaysApply: true
   - `_stale.py` — 顶级函数 `stale(...) -> bool`
   - `exceptions.py` — 统一异常层次（`RedPyMakeError` 根）
 - `tests/` — 不依赖网络/真实设备的单元测试（集成测试用 `@pytest.mark.integration`）
-- `doc/core-lib-requirements.md` — **规范来源**：任何行为分歧以此文档为准
+- `doc/core-lib-requirements.md` — **规范来源**（应然）：任何行为分歧以此文档为准
+- `doc/api-cheatsheet.md` — 公开 API 速查（实然）：签名逐个核对 `src/`，不得照抄规格（规格为 v0.5 草案，已知漂移 `connect_timeout` / `wsl_path` / `new_log_on_start`）。与规格不一致 = 其中之一是 bug，不是"可以选一边信"
 
 ## 约定
 
@@ -31,6 +32,7 @@ alwaysApply: true
 - 失败属于接口：立刻 `raise ... from exc`。禁止 `except Exception` 之后 `return None`、`pass`、自动重试，或把失败记成空值再继续。
 - 捕获后若没有在同一个函数里重新抛出，就是掩盖失败。
 - 库自身不调用 `logging.basicConfig()`；日志通过 `SessionLogs` 收集。
+- 文档写作：删掉这段，读者下一步动作会不会变？不变就删。整个项目 / 单份文档 / 单个章节三层的详略由 agent 自行权衡。
 
 ## 导入约定
 

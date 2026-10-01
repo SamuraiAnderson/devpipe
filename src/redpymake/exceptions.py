@@ -175,6 +175,25 @@ class UnsupportedOperationError(RedPyMakeError):
     """当前平台不支持所请求的能力。用于替代直接暴露 NotImplementedError。"""
 
 
+class TargetConfigError(RedPyMakeError):
+    """命名目标的配置无法解析（CORE-10）。
+
+    配置文件里的字面量 ``password``、未知目标名、非法 ``kind``、工厂不接受的键、
+    未设置的 ``password_env`` 都走这里。``source`` 是出错的文件路径或层名。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        name: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.name = name
+        self.source = source
+
+
 class WorkspaceStoppedError(RedPyMakeError):
     """用户通过 ``Workspace.stop_current()`` 请求终止当前 run。
 
@@ -200,5 +219,6 @@ __all__ = [
     "InputNotFoundError",
     "LogWaitTimeoutError",
     "UnsupportedOperationError",
+    "TargetConfigError",
     "WorkspaceStoppedError",
 ]

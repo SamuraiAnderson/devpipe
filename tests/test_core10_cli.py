@@ -8,6 +8,24 @@
     §CORE-10/cli/run-exit-code    → test_cli_run_propagates_exit_code
     §CORE-10/cli/run-warns-missing→ test_cli_run_warns_when_script_has_no_block
     §CORE-10/cli/report-self-contained → test_cli_report_generates_self_contained_html
+    §CORE-10/cli/usage-64         → test_cli_usage_error_exits_64
+    §CORE-10/cli/run-missing-66   → test_cli_run_missing_script_exits_66
+    §CORE-10/cli/report-missing-66 → test_cli_report_missing_ndjson_exits_66
+    §CORE-10/cli/targets-json     → test_cli_targets_json_hides_secrets
+    §CORE-10/cli/targets-empty    → test_cli_targets_empty_is_success
+    §CORE-10/cli/targets-no-connect → test_cli_targets_does_not_connect
+    §CORE-10/cli/exec-probe       → test_cli_exec_probe_connects_without_command
+    §CORE-10/cli/exec-passthrough → test_cli_exec_passthrough_rc_and_streams
+    §CORE-10/cli/exec-shell       → test_cli_exec_shell_joins_command
+    §CORE-10/cli/exec-cwd         → test_cli_exec_cwd_overrides_once
+    §CORE-10/cli/exec-remainder   → test_cli_exec_flags_after_target_are_remote_args
+    §CORE-10/cli/exec-bad-name    → test_cli_exec_illegal_name_exits_64
+    §CORE-10/cli/exec-unknown     → test_cli_exec_unknown_target_exits_78
+    §CORE-10/cli/exec-timeout     → test_cli_exec_timeout_exits_124
+    §CORE-10/cli/exec-connect     → test_cli_exec_connection_failure_exits_69
+    §CORE-10/cli/exec-shell-usage → test_cli_exec_shell_without_command_exits_64
+    §CORE-10/cli/logs-missing-66  → test_cli_logs_discard_missing_exits_66
+    §CORE-10/cli/serve-missing-69 → test_cli_serve_missing_web_extra_exits_69
     §CORE-11/cli/serve-url        → test_serve_url_builder
     §CORE-11/cli/serve-open-flag  → test_should_open_browser_flag_precedence
     §CORE-11/cli/serve-open-env   → test_should_open_browser_env_var
@@ -15,6 +33,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -219,6 +238,248 @@ def test_should_open_browser_flag_precedence(monkeypatch):
     assert _should_open_browser(True) is True
     # 显式 False → 关闭
     assert _should_open_browser(False) is False
+
+
+def _local_project(root: Path, name: str = "box") -> None:
+    (root / "pyproject.toml").write_text(
+        f'[tool.redpymake.targets.{name}]\nkind = "local"\n',
+        encoding="utf-8",
+    )
+
+
+def test_cli_usage_error_exits_64():
+    """§CORE-10/cli/usage-64：缺子命令是用法错误，退出 64。"""
+    res = _run_cli()
+    assert res.returncode == 64
+    assert "redpymake:" in res.stderr
+
+
+def test_cli_run_missing_script_exits_66(tmp_path: Path):
+    """§CORE-10/cli/run-missing-66：脚本不存在退出 66，而不是 2。"""
+    res = _run_cli("run", str(tmp_path / "missing.py"))
+    assert res.returncode == 66
+    assert res.stderr.startswith("redpymake:")
+
+
+def test_cli_report_missing_ndjson_exits_66(tmp_path: Path):
+    """§CORE-10/cli/report-missing-66：NDJSON 不存在退出 66。"""
+    res = _run_cli("report", str(tmp_path / "nope.ndjson"), "-o", str(tmp_path / "out.html"))
+    assert res.returncode == 66
+    assert res.stderr.startswith("redpymake:")
+
+
+def test_cli_targets_json_hides_secrets(tmp_path: Path, monkeypatch):
+    """§CORE-10/cli/targets-json：--json 给出合并结果，params 里没有口令值。"""
+    monkeypatch.setenv("BOARD_PASSWORD", "s3cret-cli")
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.redpymake.targets.board]
+kind = "ssh"
+user = "root"
+password_env = "BOARD_PASSWORD"
+""",
+        encoding="utf-8",
+    )
+    local = tmp_path / ".redpymake"
+    local.mkdir()
+    (local / "targets.toml").write_text(
+        '[board]\nhost = "10.1.2.3"\n',
+        encoding="utf-8",
+    )
+    res = _run_cli("targets", "--json", "--root", str(tmp_path))
+    assert res.returncode == 0, res.stderr
+    data = json.loads(res.stdout)
+    assert data[0]["name"] == "board"
+    assert data[0]["kind"] == "ssh"
+    assert data[0]["source"] == ["pyproject", ".redpymake/targets.toml"]
+    assert data[0]["params"]["host"] == "10.1.2.3"
+    assert data[0]["params"]["password_env"] == "BOARD_PASSWORD"
+    assert "password" not in data[0]["params"]
+    assert "s3cret-cli" not in res.stdout
+
+
+def test_cli_targets_empty_is_success(tmp_path: Path):
+    """§CORE-10/cli/targets-empty：没有配置时退出 0，--json 是空数组。"""
+    res = _run_cli("targets", "--json", "--root", str(tmp_path))
+    assert res.returncode == 0, res.stderr
+    assert json.loads(res.stdout) == []
+
+
+def test_cli_targets_does_not_connect(tmp_path: Path):
+    """§CORE-10/cli/targets-no-connect：列出 ssh 目标时不去握手。"""
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.redpymake.targets.down]
+kind = "ssh"
+host = "127.0.0.1"
+port = 1
+connect_timeout = 30
+""",
+        encoding="utf-8",
+    )
+    res = _run_cli("targets", "--json", "--root", str(tmp_path))
+    assert res.returncode == 0, res.stderr
+    data = json.loads(res.stdout)
+    assert data[0]["kind"] == "ssh"
+    assert data[0]["params"]["port"] == 1
+
+
+def test_cli_exec_probe_connects_without_command(tmp_path: Path):
+    """§CORE-10/cli/exec-probe：省略命令只建连，成功退出 0。"""
+    _local_project(tmp_path)
+    res = _run_cli("exec", "--root", str(tmp_path), "@box")
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == ""
+    assert not (tmp_path / ".redpymake" / "runs").exists()
+
+
+def test_cli_exec_passthrough_rc_and_streams(tmp_path: Path):
+    """§CORE-10/cli/exec-passthrough：远端 rc / stdout / stderr 原样透传，失败不带 redpymake 前缀。"""
+    _local_project(tmp_path)
+    code = "import sys; print('OUT'); print('ERR', file=sys.stderr); raise SystemExit(7)"
+    res = _run_cli(
+        "exec",
+        "--root",
+        str(tmp_path),
+        "box",
+        sys.executable,
+        "-c",
+        code,
+    )
+    assert res.returncode == 7, res.stderr
+    assert res.stdout.strip() == "OUT"
+    assert res.stderr.strip() == "ERR"
+    assert "redpymake:" not in res.stderr
+
+
+def test_cli_exec_shell_joins_command(tmp_path: Path):
+    """§CORE-10/cli/exec-shell：--shell 把各段拼成一条交给 shell。"""
+    _local_project(tmp_path)
+    res = _run_cli("exec", "--shell", "--root", str(tmp_path), "box", "echo", "RPM-SHELL")
+    assert res.returncode == 0, res.stderr
+    assert "RPM-SHELL" in res.stdout
+
+
+def test_cli_exec_cwd_overrides_once(tmp_path: Path):
+    """§CORE-10/cli/exec-cwd：--cwd 只影响这一次命令。"""
+    work = tmp_path / "work"
+    work.mkdir()
+    _local_project(tmp_path)
+    res = _run_cli(
+        "exec",
+        "--cwd",
+        str(work),
+        "--root",
+        str(tmp_path),
+        "box",
+        sys.executable,
+        "-c",
+        "import os; print(os.getcwd())",
+    )
+    assert res.returncode == 0, res.stderr
+    assert Path(res.stdout.strip()).resolve() == work.resolve()
+
+
+def test_cli_exec_flags_after_target_are_remote_args(tmp_path: Path):
+    """§CORE-10/cli/exec-remainder：写在目标名后面的选项是远端参数。"""
+    _local_project(tmp_path)
+    res = _run_cli(
+        "exec",
+        "--root",
+        str(tmp_path),
+        "box",
+        sys.executable,
+        "-c",
+        "import sys; print(sys.argv[-1])",
+        "--cwd",
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "--cwd"
+
+
+def test_cli_exec_illegal_name_exits_64(tmp_path: Path):
+    """§CORE-10/cli/exec-bad-name：不合法的目标名是用法错误。"""
+    _local_project(tmp_path)
+    res = _run_cli("exec", "--root", str(tmp_path), "bad name", "echo")
+    assert res.returncode == 64
+    assert res.stderr.startswith("redpymake:")
+
+
+def test_cli_exec_unknown_target_exits_78(tmp_path: Path):
+    """§CORE-10/cli/exec-unknown：未知目标退出 78，并列出已有名字。"""
+    _local_project(tmp_path)
+    res = _run_cli("exec", "--root", str(tmp_path), "nope")
+    assert res.returncode == 78
+    assert res.stderr.startswith("redpymake:")
+    assert "box" in res.stderr
+
+
+def test_cli_exec_timeout_exits_124(tmp_path: Path):
+    """§CORE-10/cli/exec-timeout：命令超时退出 124。"""
+    _local_project(tmp_path)
+    res = _run_cli(
+        "exec",
+        "--timeout",
+        "1",
+        "--root",
+        str(tmp_path),
+        "box",
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+    )
+    assert res.returncode == 124, res.stderr
+    assert res.stderr.startswith("redpymake:") or "redpymake:" in res.stderr
+
+
+def test_cli_exec_connection_failure_exits_69(tmp_path: Path):
+    """§CORE-10/cli/exec-connect：建连失败退出 69。"""
+    pytest.importorskip("paramiko")
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.redpymake.targets.down]
+kind = "ssh"
+host = "127.0.0.1"
+port = 1
+user = "nobody"
+connect_timeout = 2
+""",
+        encoding="utf-8",
+    )
+    res = _run_cli("exec", "--root", str(tmp_path), "down")
+    assert res.returncode == 69, res.stderr
+    assert res.stderr.startswith("redpymake:")
+
+
+def test_cli_exec_shell_without_command_exits_64(tmp_path: Path):
+    """§CORE-10/cli/exec-shell-usage：--shell 但没有命令是用法错误。"""
+    _local_project(tmp_path)
+    res = _run_cli("exec", "--shell", "--root", str(tmp_path), "box")
+    assert res.returncode == 64
+    assert res.stderr.startswith("redpymake:")
+
+
+def test_cli_logs_discard_missing_exits_66(tmp_path: Path):
+    """§CORE-10/cli/logs-missing-66：日志组 id 不存在退出 66。"""
+    res = _run_cli("logs", "discard", str(tmp_path), "missing-log")
+    assert res.returncode == 66, res.stderr
+    assert res.stderr.startswith("redpymake:")
+
+
+def test_cli_serve_missing_web_extra_exits_69(monkeypatch):
+    """§CORE-10/cli/serve-missing-69：web extra 缺失时退出 69。"""
+    import redpymake._cli as cli
+
+    monkeypatch.setitem(sys.modules, "redpymake._web.server", None)
+    args = argparse.Namespace(
+        root=".",
+        host="127.0.0.1",
+        port=9,
+        open_browser=False,
+        resume_log=False,
+    )
+    code = cli._cmd_serve(args)
+    assert code == 69
 
 
 def test_should_open_browser_env_var(monkeypatch):

@@ -274,8 +274,10 @@ class Workspace:
         self._initial_log_name = log_name
         self._new_log_on_start = new_log_on_start
 
-        # 会话池：key -> real Session
+        # 会话池：key -> real Session。池内会话不带 default_cwd（见 _borrow）
         self._pool: dict[str, "Session"] = {}
+        # key -> 建池时的连接身份参数，用于检测同 key 冲突
+        self._pool_params: dict[str, dict[str, Any]] = {}
         self._pool_lock = threading.Lock()
 
         # 队列
@@ -382,6 +384,7 @@ class Workspace:
             with self._pool_lock:
                 sessions = list(self._pool.values())
                 self._pool.clear()
+                self._pool_params.clear()
             for sess in sessions:
                 try:
                     sess.close()
@@ -415,14 +418,24 @@ class Workspace:
         return None
 
     def _get_or_create(
-        self, key: str, factory: Callable[[], "Session"]
+        self,
+        key: str,
+        factory: Callable[[], "Session"],
+        *,
+        params: dict[str, Any],
+        default_cwd: str | None = None,
     ) -> _BorrowedSession:
-        """通用池取用；若已缓存则复用（并尝试补 attach 到当前 ScriptRun），否则新建。"""
+        """通用池取用；若已缓存则复用（并尝试补 attach 到当前 ScriptRun），否则新建。
+
+        ``params`` 是 key 之外还会影响连接身份的参数，命中时不一致即冲突。
+        ``default_cwd`` 不参与冲突判断，由 :meth:`_borrow` 转成 ``at()`` 视图。
+        """
         with self._pool_lock:
             existing = self._pool.get(key)
             if existing is not None and not existing.closed:
+                self._check_pool_conflict(key, params)
                 self._maybe_attach_to_current_script(existing)
-                return _BorrowedSession(existing, self)
+                return self._borrow(existing, default_cwd)
         # 新建放在锁外，避免 __init__ 里的 ContextVar 读取与其他锁交互；
         # 若并发拿同一 key，取"先到者"，晚到者关掉自己。
         sess = factory()
@@ -434,10 +447,39 @@ class Workspace:
                     sess.close()
                 except Exception:  # pragma: no cover
                     _diag_logger.exception("workspace: failed to close redundant session")
+                self._check_pool_conflict(key, params)
                 self._maybe_attach_to_current_script(already)
-                return _BorrowedSession(already, self)
+                return self._borrow(already, default_cwd)
             self._pool[key] = sess
-        return _BorrowedSession(sess, self)
+            self._pool_params[key] = params
+        return self._borrow(sess, default_cwd)
+
+    def _check_pool_conflict(self, key: str, params: dict[str, Any]) -> None:
+        """同 key 但连接身份参数不同时抛出。调用方须持有 ``_pool_lock``。
+
+        静默复用会让后续每条命令都跑在错的身份/通道上，而错误要到很远的地方才
+        暴露。消息只列参数名——``password`` / ``key_filename`` 的值不得进异常文本。
+        """
+        stored = self._pool_params.get(key)
+        if stored is None:
+            return
+        conflicts = sorted(name for name, value in params.items() if stored.get(name) != value)
+        if conflicts:
+            raise ValueError(
+                f"workspace session key conflict: {key!r} is already pooled with a "
+                f"different {', '.join(conflicts)}; use a key that distinguishes them "
+                f"(e.g. a separate host/port/distribution) or run outside the workspace"
+            )
+
+    def _borrow(self, sess: "Session", default_cwd: str | None) -> _BorrowedSession:
+        """包出借用代理；给了 ``default_cwd`` 就借出 ``at()`` 视图而非池会话本身。
+
+        视图与池会话共享连接和日志缓冲（CORE-02），所以多个脚本可以各用各的工作
+        目录而不互相干扰，也不必为此新建连接。
+        """
+        if default_cwd is None:
+            return _BorrowedSession(sess, self)
+        return _BorrowedSession(sess.at(default_cwd), self)
 
     def _maybe_attach_to_current_script(self, session: "Session") -> None:
         """如果当前有活跃 ScriptRun，把 session 补挂到它的 subscribe 上（幂等）。"""
@@ -456,7 +498,7 @@ class Workspace:
         from ._local import LocalSession
 
         return self._get_or_create(
-            "local", lambda: LocalSession(default_cwd=default_cwd)
+            "local", LocalSession, params={}, default_cwd=default_cwd
         )
 
     def ssh(
@@ -481,9 +523,14 @@ class Workspace:
                 port=port,
                 password=password,
                 key_filename=key_filename,
-                default_cwd=default_cwd,
                 connect_timeout=connect_timeout,
             ),
+            params={
+                "password": password,
+                "key_filename": os.fspath(key_filename) if key_filename else None,
+                "connect_timeout": connect_timeout,
+            },
+            default_cwd=default_cwd,
         )
 
     def adb(
@@ -502,9 +549,10 @@ class Workspace:
             lambda: AdbSession(
                 serial=serial,
                 adb_path=adb_path,
-                default_cwd=default_cwd,
                 connect_timeout=connect_timeout,
             ),
+            params={"adb_path": adb_path, "connect_timeout": connect_timeout},
+            default_cwd=default_cwd,
         )
 
     def serial(
@@ -526,6 +574,7 @@ class Workspace:
                 newline=newline,
                 encoding=encoding,
             ),
+            params={"newline": newline, "encoding": encoding},
         )
 
     def wsl(
@@ -545,8 +594,9 @@ class Workspace:
                 distribution=distribution,
                 user=user,
                 wsl_path=wsl_path,
-                default_cwd=default_cwd,
             ),
+            params={"user": user, "wsl_path": wsl_path},
+            default_cwd=default_cwd,
         )
 
     # ------------------------------------------------------ 发现

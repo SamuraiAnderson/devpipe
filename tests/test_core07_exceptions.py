@@ -52,6 +52,7 @@ def test_exception_hierarchy():
     assert issubclass(InputNotFoundError, ResourceError)
     assert issubclass(LogWaitTimeoutError, RedPyMakeError)
     assert issubclass(UnsupportedOperationError, RedPyMakeError)
+    assert issubclass(rpm.TargetConfigError, RedPyMakeError)
 
 
 def test_all_exceptions_reexported():
@@ -65,6 +66,9 @@ def test_all_exceptions_reexported():
     assert rpm.InputNotFoundError is InputNotFoundError
     assert rpm.LogWaitTimeoutError is LogWaitTimeoutError
     assert rpm.UnsupportedOperationError is UnsupportedOperationError
+    from redpymake.exceptions import TargetConfigError
+
+    assert rpm.TargetConfigError is TargetConfigError
 
 
 # ---------------------------------------------------- 各类异常字段

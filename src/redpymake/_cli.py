@@ -1,13 +1,15 @@
 """顶层 CLI (CORE-10 / CORE-11)。
 
-四个子命令：
-
 - ``redpymake discover [ROOT] [--json]``：AST 发现，输出树或 JSON；
 - ``redpymake run PATH [--sink FILE]``：子进程运行单个脚本，环境变量注入
   ``REDPYMAKE_LIVE_SINK`` 使 CORE-10 sink 生效；透传脚本 exit code；
+- ``redpymake targets [--root] [--json]``：列出命名目标，不建连；
+- ``redpymake exec [选项] TARGET [CMD ...]``：在命名目标上跑一条命令；
 - ``redpymake report NDJSON -o OUT.html``：从 NDJSON 生成自包含 HTML 报告；
 - ``redpymake serve [ROOT] [--host --port]``：起 FastAPI Web UI（依赖 ``[web]`` extra）；
   每次启动另起一份活跃日志（上一份为空则复用），``--resume-log`` 可续用上次那份。
+
+本地侧失败的 stderr 以 ``redpymake: `` 开头。退出码见 CORE-10。
 
 同时提供 ``python -m redpymake`` 入口（见 ``__main__.py``）。
 """
@@ -27,14 +29,37 @@ from pathlib import Path
 from typing import Sequence
 
 from ._discover import ScriptCard, discover
+from ._targets import legal_target_spec, list_targets, target
+from .exceptions import (
+    CommandTimeoutError,
+    SessionConnectionError,
+    TargetConfigError,
+    UnsupportedOperationError,
+)
+
+# sysexits。3 是日志组状态冲突的既有码，不并进这组。
+EX_USAGE = 64
+EX_NOINPUT = 66
+EX_UNAVAILABLE = 69
+EX_CONFIG = 78
+EX_TIMEOUT = 124
+EX_CONFLICT = 3
+
+
+class _Parser(argparse.ArgumentParser):
+    """用法错误统一退出 64，诊断带 ``redpymake: `` 前缀。"""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(EX_USAGE, f"redpymake: {message}\n")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="redpymake",
         description="RedPyMake 脚本发现 / 运行 / 可视化 CLI",
     )
-    subs = parser.add_subparsers(dest="command", required=True)
+    subs = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
 
     # discover
     p_disc = subs.add_parser("discover", help="扫描目录，列出所有 rpm_*.py 脚本")
@@ -51,6 +76,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="NDJSON 输出路径；缺省用 <script_dir>/.redpymake/runs/<name>-<ts>.ndjson",
     )
     p_run.set_defaults(func=_cmd_run)
+
+    # targets
+    p_targets = subs.add_parser("targets", help="列出命名目标（不建连）")
+    p_targets.add_argument("--root", default=".", help="查找项目根的起点（默认当前目录）")
+    p_targets.add_argument("--json", action="store_true", help="输出 JSON 列表")
+    p_targets.set_defaults(func=_cmd_targets)
+
+    # exec。选项必须写在 TARGET 前面：CMD 用 remainder，后面的 flag 会变成远端参数。
+    p_exec = subs.add_parser(
+        "exec",
+        help="在命名目标上执行一条命令（选项必须写在目标名前面）",
+    )
+    p_exec.add_argument("--cwd", default=None, help="只覆盖这一次命令的工作目录")
+    p_exec.add_argument("--shell", action="store_true", help="把命令交给远端 shell")
+    p_exec.add_argument("--timeout", type=float, default=None, help="秒；超时退出 124")
+    p_exec.add_argument("--root", default=".", help="查找项目根的起点（默认当前目录）")
+    p_exec.add_argument("target", help="目标名，board 与 @board 等价")
+    p_exec.add_argument("cmd", nargs=argparse.REMAINDER, help="要执行的命令")
+    p_exec.set_defaults(func=_cmd_exec)
 
     # report
     p_rep = subs.add_parser("report", help="从 NDJSON 生成自包含 HTML 报告")
@@ -164,8 +208,7 @@ def _try_relative(path: Path, root: Path) -> bool:
 def _cmd_run(args: argparse.Namespace) -> int:
     script = Path(args.path).resolve()
     if not script.exists():
-        print(f"error: script not found: {script}", file=sys.stderr)
-        return 2
+        return _die(EX_NOINPUT, f"script not found: {script}")
     # 决定 sink 路径
     if args.sink:
         sink_path = Path(args.sink).resolve()
@@ -206,6 +249,86 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return int(proc.returncode)
 
 
+# ------------------------------------------------------------ targets / exec
+
+
+def _cmd_targets(args: argparse.Namespace) -> int:
+    try:
+        infos = list_targets(args.root)
+    except TargetConfigError as exc:
+        return _die(EX_CONFIG, str(exc))
+    if args.json:
+        payload = [info.to_dict() for info in infos]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if not infos:
+        return 0
+    for info in infos:
+        summary = " ".join(f"{key}={info.params[key]}" for key in sorted(info.params))
+        src = " + ".join(info.source)
+        line = f"{info.name}  {info.kind}  {summary}  ({src})".rstrip()
+        try:
+            print(line)
+        except UnicodeEncodeError:  # pragma: no cover - Windows GBK 等极端本地化终端
+            sys.stdout.buffer.write(line.encode("utf-8", "replace") + b"\n")
+    return 0
+
+
+def _cmd_exec(args: argparse.Namespace) -> int:
+    if not legal_target_spec(args.target):
+        return _die(EX_USAGE, f"illegal target name {args.target!r}")
+    cmd = list(args.cmd)
+    if cmd[:1] == ["--"]:
+        cmd = cmd[1:]
+    if args.shell and not cmd:
+        return _die(EX_USAGE, "--shell requires a command")
+    try:
+        sess = target(args.target, root=args.root)
+    except TargetConfigError as exc:
+        return _die(EX_CONFIG, str(exc))
+    except (SessionConnectionError, UnsupportedOperationError) as exc:
+        return _die(EX_UNAVAILABLE, str(exc))
+    with sess:
+        if not cmd:
+            return 0
+        try:
+            if args.shell:
+                res = sess.run(
+                    " ".join(cmd),
+                    shell=True,
+                    cwd=args.cwd,
+                    timeout=args.timeout,
+                    check=False,
+                )
+            else:
+                res = sess.run(
+                    cmd[0],
+                    *cmd[1:],
+                    cwd=args.cwd,
+                    timeout=args.timeout,
+                    check=False,
+                )
+        except CommandTimeoutError as exc:
+            _write_streams(exc.stdout, exc.stderr)
+            return _die(EX_TIMEOUT, str(exc))
+        except (SessionConnectionError, UnsupportedOperationError) as exc:
+            return _die(EX_UNAVAILABLE, str(exc))
+        _write_streams(res.stdout, res.stderr)
+        return int(res.returncode)
+
+
+def _write_streams(stdout: str, stderr: str) -> None:
+    if stdout:
+        sys.stdout.write(stdout)
+    if stderr:
+        sys.stderr.write(stderr)
+
+
+def _die(code: int, message: str) -> int:
+    print(f"redpymake: {message}", file=sys.stderr)
+    return code
+
+
 # ------------------------------------------------------------ report
 
 
@@ -214,8 +337,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
     ndjson = Path(args.ndjson).resolve()
     if not ndjson.exists():
-        print(f"error: ndjson not found: {ndjson}", file=sys.stderr)
-        return 2
+        return _die(EX_NOINPUT, f"ndjson not found: {ndjson}")
     out = Path(args.output).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     render_report(ndjson, out)
@@ -230,21 +352,19 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     try:
         from ._web.server import build_app
     except ImportError as exc:
-        print(
-            "error: redpymake[web] extras not installed. "
+        return _die(
+            EX_UNAVAILABLE,
+            "redpymake[web] extras not installed. "
             "run `pip install 'redpymake[web]'` first.\n"
             f"underlying: {exc}",
-            file=sys.stderr,
         )
-        return 2
     try:
         import uvicorn
     except ImportError:
-        print(
-            "error: uvicorn not installed. run `pip install 'redpymake[web]'` first.",
-            file=sys.stderr,
+        return _die(
+            EX_UNAVAILABLE,
+            "uvicorn not installed. run `pip install 'redpymake[web]'` first.",
         )
-        return 2
     from . import workspace as _make_ws
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
@@ -303,11 +423,9 @@ def _cmd_logs_rename(args: argparse.Namespace) -> int:
         try:
             log = ws.rename_log(args.log_id, args.name, description=args.description)
         except KeyError:
-            print(f"error: log not found: {args.log_id}", file=sys.stderr)
-            return 2
+            return _die(EX_NOINPUT, f"log not found: {args.log_id}")
         except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
+            return _die(EX_USAGE, str(exc))
     print(f"renamed: {log.id}  ->  {log.name}")
     return 0
 
@@ -319,8 +437,7 @@ def _cmd_logs_rotate(args: argparse.Namespace) -> int:
         try:
             log = ws.rotate_log(name=args.name)
         except RuntimeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 3
+            return _die(EX_CONFLICT, str(exc))
     print(f"new active log: {log.id}  ({log.name})")
     return 0
 
@@ -332,8 +449,7 @@ def _cmd_logs_pin(args: argparse.Namespace) -> int:
         try:
             log = ws.pin_log(args.log_id, pinned=args.pin)
         except KeyError:
-            print(f"error: log not found: {args.log_id}", file=sys.stderr)
-            return 2
+            return _die(EX_NOINPUT, f"log not found: {args.log_id}")
     print(f"{'pinned' if log.pinned else 'unpinned'}: {log.id}")
     return 0
 
@@ -345,11 +461,9 @@ def _cmd_logs_discard(args: argparse.Namespace) -> int:
         try:
             ws.discard_log(args.log_id)
         except KeyError:
-            print(f"error: log not found: {args.log_id}", file=sys.stderr)
-            return 2
+            return _die(EX_NOINPUT, f"log not found: {args.log_id}")
         except RuntimeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 3
+            return _die(EX_CONFLICT, str(exc))
     print(f"discarded: {args.log_id}")
     return 0
 

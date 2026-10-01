@@ -1,0 +1,31 @@
+# RedPyMake
+
+> Cross-environment Python automation library. One `Session` interface over local,
+> SSH, ADB, serial and WSL targets for command execution, file transfer, and log
+> collection with pattern waiting. Python 3.10+, zero core dependencies, PEP 561
+> typed. Recommended usage is `import redpymake as rpm`, then obtain a `Session`
+> from `rpm.local()` / `rpm.ssh(...)` / `rpm.adb(...)` / `rpm.serial(...)` / `rpm.wsl(...)`.
+
+Five counter-intuitive semantics: `run()` defaults to `check=True` and raises on a
+non-zero exit; `at()` returns a new view instead of mutating the session;
+`shell=False` passes arguments literally without expanding `~`, `$VAR` or globs;
+`wait()` only scans forward from the call site unless you use `run(...).wait(...)`;
+serial `run()` appends no line terminator.
+
+## Docs
+
+- [Agent guide](AGENTS.md): the five semantics above in full, the error-handling rules, and the mandatory test-first workflow. Start here.
+- [API cheatsheet](doc/api-cheatsheet.md): real signatures for the factories, `Session`, the top-level functions and `Workspace`, plus field tables for the data classes and the exception tree. Not exhaustive — check `rpm.__all__` for the rest.
+- [README](readme.md): installation, extras, factory table, ten-minute examples, common pitfalls.
+
+## Specification
+
+- [Core library requirements](doc/core-lib-requirements.md): the single source of truth, CORE-01 through CORE-11. Behavior disputes are resolved here. ~1600 lines.
+- [TODO](doc/TODO.md): roadmap split into P0 polish, P1 follow-up versions, P2 ecosystem.
+
+## Examples
+
+- [Examples index](examples/README.md): what each directory demonstrates.
+- [quickstart](examples/quickstart/hello_ssh.py): minimal SSH session.
+- [wsl_session](examples/wsl_session/README.md): transfer, `rpm.stale`, log waiting, `rpm.script`, and a long pipeline.
+- [serial_session](examples/serial_session/shell_wait.py): prompt-matching patterns for UART. These are copyable conventions, not library behavior.

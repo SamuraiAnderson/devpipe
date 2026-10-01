@@ -22,7 +22,7 @@ import redpymake as rpm
 
 EXPECTED_PUBLIC = {
     "local", "ssh", "adb", "serial", "wsl",
-    "script", "workspace", "discover",
+    "script", "workspace", "discover", "target",
     "Session", "LocalSession", "SshSession", "AdbSession", "SerialSession",
     "WslSession", "ScriptRun", "ScriptSnapshot", "ScriptCard",
     "Workspace", "WorkspaceLog", "WorkspaceRun",
@@ -33,6 +33,7 @@ EXPECTED_PUBLIC = {
     "SessionClosedError", "CommandError", "CommandTimeoutError",
     "TransferError", "ResourceError", "ResourceNotFoundError",
     "InputNotFoundError", "LogWaitTimeoutError", "UnsupportedOperationError",
+    "TargetConfigError",
     "__version__",
 }
 

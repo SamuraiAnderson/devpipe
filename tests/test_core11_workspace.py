@@ -4,6 +4,10 @@
     §CORE-11/factory                    → test_workspace_factory_returns_context_manager
     §CORE-11/pool/lazy-cache            → test_workspace_local_is_cached_by_key
     §CORE-11/pool/close-all-on-exit     → test_workspace_closes_sessions_on_exit
+    §CORE-11/pool/key-conflict          → test_workspace_pool_rejects_conflicting_args
+                                        → test_workspace_pool_conflict_omits_values
+    §CORE-11/pool/default-cwd-view      → test_workspace_pool_default_cwd_yields_view
+                                        → test_workspace_pool_default_cwd_applies_to_run
     §CORE-11/borrow/no-close-on-with-exit→ test_borrowed_session_survives_with_block
     §CORE-11/borrow/factory-integration → test_factory_borrows_when_workspace_active
     §CORE-11/borrow/no-workspace        → test_factory_returns_owned_session_without_workspace
@@ -77,6 +81,60 @@ def test_workspace_closes_sessions_on_exit(tmp_path: Path):
         # 记住底层 root
         root = sess.root
     assert root.closed is True
+
+
+def test_workspace_pool_rejects_conflicting_args(tmp_path: Path):
+    """§CORE-11/pool/key-conflict：同 key 但连接身份参数不同时抛 ``ValueError``。
+
+    规格举的例子：同一 wsl distro 但不同 ``user``——``user`` 不在 key 里，静默复用
+    会让后续每条命令都在错的身份下跑。
+    """
+    with rpm.workspace(tmp_path) as ws:
+        ws.wsl(distribution="Ubuntu", user="root", wsl_path="wsl-not-used")
+        with pytest.raises(ValueError) as ei:
+            ws.wsl(distribution="Ubuntu", user="build", wsl_path="wsl-not-used")
+    msg = str(ei.value)
+    assert "conflict" in msg
+    assert "user" in msg
+
+
+def test_workspace_pool_conflict_omits_values(tmp_path: Path):
+    """§CORE-11/pool/key-conflict：冲突消息只列参数名，不带值（``password`` 不得泄漏）。"""
+    with rpm.workspace(tmp_path) as ws:
+        ws.wsl(distribution="Ubuntu", user="root", wsl_path="wsl-not-used")
+        with pytest.raises(ValueError) as ei:
+            ws.wsl(distribution="Ubuntu", user="s3cret-user", wsl_path="wsl-not-used")
+    msg = str(ei.value)
+    assert "s3cret-user" not in msg
+    assert "root" not in msg
+
+
+def test_workspace_pool_default_cwd_yields_view(tmp_path: Path):
+    """§CORE-11/pool/default-cwd-view：``default_cwd`` 不算冲突，借出 ``at()`` 视图。
+
+    ``local()`` 的 key 恒为 ``"local"``，调用方无法"显式区分"，因此不能按冲突处理；
+    而"同连接、同日志、不同工作目录"正是视图的语义。
+    """
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+    with rpm.workspace(tmp_path) as ws:
+        a = ws.local(default_cwd=str(first))
+        b = ws.local(default_cwd=str(second))
+        assert a.root is b.root, "连接仍应复用"
+        assert a.default_cwd == str(first)
+        assert b.default_cwd == str(second)
+
+
+def test_workspace_pool_default_cwd_applies_to_run(tmp_path: Path, python_probe):
+    """§CORE-11/pool/default-cwd-view：借出的视图真的在各自的工作目录里执行命令。"""
+    target = tmp_path / "cwd-probe"
+    target.mkdir()
+    with rpm.workspace(tmp_path) as ws:
+        sess = ws.local(default_cwd=str(target))
+        out = sess.run(*python_probe("import os; print(os.getcwd())")).stdout.strip()
+    assert Path(out).resolve() == target.resolve()
 
 
 # ------------------------------------------------------------ 借出语义

@@ -151,9 +151,11 @@ with rpm.script(name="build", dump_on_error="logs/") as run:
 ```python
 cards = rpm.discover("./scripts")           # 列出目录下所有 rpm_*.py 的元数据
 os.environ["REDPYMAKE_LIVE_SINK"] = "file:///tmp/live.ndjson"  # 激活 sink
+with rpm.target("board") as sess:           # pyproject 里声明过的命名目标
+    sess.run("make", "-C", "/workspace")
 ```
 
-**文件级发现**：递归扫 `rpm_*.py`，AST 抽取 `with rpm.script(...)` 元信息；**运行时实时流**：通过环境变量激活 NDJSON 追加写，供外部工具（Web UI、CI）tail 拿到 `SessionLogRecord` 事件流。详见 CORE-10。
+**文件级发现**：递归扫 `rpm_*.py`，AST 抽取 `with rpm.script(...)` 元信息；**运行时实时流**：通过环境变量激活 NDJSON 追加写，供外部工具（Web UI、CI）tail 拿到 `SessionLogRecord` 事件流；**命名目标**：连接参数在 `pyproject.toml` 里声明一次，脚本 `rpm.target(...)` 与 `redpymake exec` 共用。详见 CORE-10。
 
 ### 二级接口组 F：Workspace 与 Web UI
 
@@ -767,7 +769,8 @@ RedPyMakeError
 │   ├── ResourceNotFoundError
 │   └── InputNotFoundError
 ├── LogWaitTimeoutError
-└── UnsupportedOperationError
+├── UnsupportedOperationError
+└── TargetConfigError          .name .source
 ```
 
 要求：
@@ -875,8 +878,12 @@ run.detach(sess) -> None
 塞入 `run._merged`。这条不进任何 `Session` 的 `LogBuffer`（保持"session 侧只装 session 事件"的语义）。
 
 约束：
-- 库默认仍不调用 `logging.basicConfig()`（CORE-06 约束不变）；Script 只挂 Handler，不改任何 logger 的 `level`。
-- **CLI 模式与控制台流输出**：当通过 `redpymake run` 命令行启动脚本时（或环境变量 `REDPYMAKE_CLI=1`），若 root logger 尚未配置 handler，`rpm.script(...)` 默认自动调用 `logging.basicConfig()` 配置终端输出（级别跟随 `log_level`，默认输出可读格式），使用户在终端能直接看到 logging 输出；亦可通过 `with rpm.script(..., console=True)` 显式开启。
+- 库默认仍不调用 `logging.basicConfig()`（CORE-06 约束不变）；Script 只挂 Handler，不改任何 logger 的 `level`——唯一例外是下面的 console 模式。
+- **CLI 模式与控制台流输出**：当通过 `redpymake run` 命令行启动脚本时（或环境变量 `REDPYMAKE_CLI=1`），`rpm.script(...)` 默认在 root logger 上挂一个自己的 `StreamHandler`（级别跟随 `log_level`，可读格式），使用户在终端能直接看到 logging 输出；亦可通过 `with rpm.script(..., console=True)` 显式开启。约束：
+  - **不得调用 `logging.basicConfig()`**。它是全局一次性副作用（root 已有 handler 时静默跳过），装上之后也无法干净卸载；挂自己的 handler 才能在出块时还原。
+  - root logger 上已有任何 `StreamHandler`（含子类 `FileHandler`）时不挂，避免重复输出。
+  - 仅此一处允许改 root logger 的 `level`：root 比 `log_level` 更严或为 `NOTSET` 时降到 `log_level`。否则 root 默认的 `WARNING` 会在 logger 层面拦掉 INFO 记录，handler 收不到任何东西，功能等于不存在。
+  - **出块时必须摘掉 handler 并还原 `level`**，不留全局残留——宿主程序的日志配置不能因为跑过一次脚本而改变。
 
 ### 快照
 
@@ -1050,26 +1057,100 @@ class ScriptCard:
 - 写入失败（磁盘满 / 权限）只走 `_diag_logger.exception(...)`，不掩盖用户代码异常；
 - 库仍不 `logging.basicConfig()`（保持 CORE-06 / CORE-09 约束）。
 
-### CLI
+### 命名目标（named targets）
 
-新增 `redpymake` 入口点（`pyproject.toml [project.scripts]`）：
+**动机**：写脚本之前要先摸环境——连上板子看目录、试一条编译命令能不能跑通。把连接参数声明一次，脚本（`rpm.target`）和 CLI（`exec` / `targets`）共用同一份，凭据不进命令行、不进版本库。
 
-```bash
-redpymake discover [ROOT] [--json]           # 列所有 ScriptCard
-redpymake run PATH [--sink FILE]             # 独立子进程跑单个脚本 + 挂 sink
-redpymake report NDJSON -o report.html       # 从 NDJSON 生成自包含 HTML
-redpymake serve [ROOT] [--host H --port P] [--no-open] [--resume-log]   # 见 CORE-11
+两层配置，**键级合并**（不是整段替换）。本机文件只写 `host` 时，`kind` / `user` / `default_cwd` 仍从 pyproject 继承：
+
+```toml
+# pyproject.toml（提交）—— 形状
+[tool.redpymake.targets.board]
+kind = "ssh"                        # local | ssh | adb | serial | wsl
+user = "root"
+default_cwd = "/workspace"
+password_env = "BOARD_PASSWORD"     # 变量名；解析时读 os.environ 填 password
+
+# .redpymake/targets.toml（已在 .gitignore）—— 本机地址，顶层表名即目标名
+[board]
+host = "192.168.31.77"
+key_filename = "~/.ssh/board"
 ```
 
-- `discover` 默认输出人类可读树；`--json` 走结构化输出，供机器消费；
+**项目根**：从 `root` 向上最多 6 个目录（起点本身算第 1 个），取最近的含 `pyproject.toml` 的目录。两份文件都只从这一个根读取。6 层内没有 `pyproject.toml` 时，退化为最近的含 `.redpymake/targets.toml` 的目录。只有日志、没有 `targets.toml` 的 `.redpymake/`（`serve` 的运行时产物）**不算**项目根，避免子目录里的日志挡住上层配置。
+
+顶级入口：
+
+```python
+def target(
+    name: str,
+    *,
+    root: str | os.PathLike = ".",
+    **overrides,
+) -> Session: ...
+```
+
+要求：
+
+- 目标名字符集 `[A-Za-z0-9_.-]+`。`board` 与 `@board` 等价（`@` 只是可选前缀）；不合法的名字抛 `TargetConfigError`；
+- `kind` 必填，取值限于 `{"local", "ssh", "adb", "serial", "wsl"}`。除 `kind` / `password_env` 外的键原样作为关键字参数转发给对应工厂，可用键集 = 该工厂的签名。缺必填参数、工厂不接受的键，抛 `TargetConfigError`，不得漏出 `TypeError`；
+- 合并优先级：调用点 `**overrides` > `.redpymake/targets.toml` > `pyproject.toml`。`overrides` 可以带 `password`（程序调用，不落盘）；**两份配置文件里的字面量 `password` 一律拒绝**，消息不得回显该值；
+- `password_env` 在真正建连时读环境变量。变量未设置且 overrides 也没给 `password`，抛 `TargetConfigError`。只列目标（`targets` / `list_targets`）时**不**要求变量已设置，也**不**把解析出的口令放进返回值；
+- `key_filename` 若是字符串，做 `~` 展开；
+- 目标名不存在时，消息必须列出可用目标名（没有则标明空）；
+- `target(...)` 只转发到工厂，不自建连接，因此 CORE-11 的 workspace 借出自动生效。
+
+`TargetConfigError` 继承 `RedPyMakeError`，字段 `name`（目标名，没有则为 `None`）与 `source`（出错的文件路径或层名，没有则为 `None`）。
+
+### CLI
+
+`redpymake` 入口点（`pyproject.toml [project.scripts]`）：
+
+```bash
+redpymake discover [ROOT] [--json]
+redpymake run PATH [--sink FILE]
+redpymake targets [--root DIR] [--json]
+redpymake exec [--cwd DIR] [--shell] [--timeout S] [--root DIR] TARGET [CMD ...]
+redpymake report NDJSON -o report.html
+redpymake serve [ROOT] [--host H --port P] [--no-open] [--resume-log]   # 见 CORE-11
+redpymake logs ...                                                       # 见 CORE-11
+```
+
+- `discover` 默认输出人类可读树；`--json` 走结构化输出；
 - `run` 用 `subprocess.run([sys.executable, path])` 起子进程，环境变量 `REDPYMAKE_LIVE_SINK=file://<path>` 与 `REDPYMAKE_CLI=1` 由 CLI 注入；透传脚本 exit code 作为自身 exit code；
-- `report` 是纯离线操作：读 NDJSON，输出**自包含**的 HTML（无外链、无网络请求），供 CI artifact / 邮件附件分享。
+- `report` 是纯离线操作：读 NDJSON，输出**自包含**的 HTML（无外链、无网络请求）；
+- `targets` 列出合并后的目标，**不建连**。默认人类可读；`--json` 输出数组，元素为 `{name, kind, source, params}`。`source` 是 `["pyproject"]`、`[".redpymake/targets.toml"]` 或两者。`params` 含 `password_env` 的变量名，绝不含口令值。一个目标都没有时退出 0，`--json` 输出 `[]`；
+- `exec` 的选项必须写在 `TARGET` **前面**。`CMD` 用 remainder 接收，写在目标后面的 `--cwd` 会被当成远端参数。
+
+`exec` 语义：
+
+- 省略 `CMD` 时只建连再关闭，成功退出 0。这就是连通性探针，不另设 `doctor`；
+- 有命令时 `check=False`：远端 `returncode` 原样成为 CLI 退出码。stdout / stderr 原样透传，不加前缀、不落 NDJSON（留档是 `run` 的职责）；
+- `--shell` 把 `CMD` 各段用空格拼成一个字符串交给远端 shell。没给命令时这是用法错误。默认逐段字面传递；
+- `--cwd` 只覆盖这一次 `run()`，不改目标配置里的 `default_cwd`。
+
+退出码（全 CLI 共用）。本地侧失败的 stderr 一律以 `redpymake: ` 开头；远端透传的 rc **没有**这个前缀，调用方靠这个区分撞码：
+
+| 码 | 含义 |
+| --- | --- |
+| 0 | 成功 |
+| 1–255 | `exec` 透传的远端 returncode |
+| 64 | 用法：argparse 失败、目标名不合法、`--shell` 却没有命令、`logs rename` 的非法参数 |
+| 66 | 输入不存在：脚本路径、NDJSON、日志组 id |
+| 69 | `SessionConnectionError`，或目标平台依赖未装（`UnsupportedOperationError`） |
+| 78 | `TargetConfigError` |
+| 124 | `CommandTimeoutError` |
+| 3 | 仅日志组状态冲突（活跃 / pinned 拒绝 discard，running 拒绝 rotate） |
 
 ### 明确不做的能力
 
 - 不支持 `stdout://` / `tcp://` 等 sink URI（第一版仅 `file://`）；
 - 不做流式压缩、rotate、文件锁；
-- 不做非 Python 脚本发现（`.sh` / `.ps1` 等）。
+- 不做非 Python 脚本发现（`.sh` / `.ps1` 等）；
+- `exec` 不做跨进程连接复用（每次调用一次握手）；SSH 重复握手用 `~/.ssh/config` 的 `ControlMaster`；
+- `exec` 不分配 PTY，没有交互式 shell；
+- 不做内联 `ssh://user@host` 形式的目标。寻址收敛在单一解析函数上，以后加 URI 不改 `exec` / `targets` 的参数形状；
+- 第一版没有 `push` / `pull` 子命令。
 
 ---
 
@@ -1117,7 +1198,9 @@ ws.sessions() -> Mapping[str, Session]   # 只读快照
 | `adb(serial)` | `f"adb:{serial or 'default'}"` |
 | `serial(port, baudrate)` | `f"serial:{port}@{baudrate}"` |
 
-**同 key 冲突参数**（例如同一 wsl distro 但不同 `user`）抛 `ValueError("workspace session key conflict: ...")`，逼调用方显式区分。
+**同 key 冲突参数**（例如同一 wsl distro 但不同 `user`）抛 `ValueError("workspace session key conflict: ...")`，逼调用方显式区分。消息里只列冲突的参数名，不带值——`password` / `key_filename` 不得进异常文本。
+
+**`default_cwd` 是例外**，不按冲突处理，而是返回 `real.at(default_cwd)` 包出来的借出代理：`local()` 的 key 恒为 `"local"`，调用方没有任何参数能改变它，"显式区分"无路可走；而"同连接、同日志缓冲、不同工作目录"恰好就是 `at()` 视图的语义（CORE-02）。于是两个脚本各写 `rpm.local(default_cwd=...)` 时连接照旧复用，各自拿到自己的工作目录。
 
 ### ContextVar 联动：脚本代码零改动
 
@@ -1576,6 +1659,7 @@ Web UI 的行为分两层验证，边界按"要不要真实渲染"划：
 20. `redpymake serve` 每次启动另起一份活跃日志（上一份 `run_count == 0` 时复用），旧日志留在 `list_logs()` 与 LogDropdown 里可回看；`--resume-log` 续用上次；`rpm.workspace(root)` 默认行为不变。
 21. Web UI 支持按 session 分栏：SplitToggle 开启后 SessionList 的勾选项各占一列，脚本自身日志与 RunSeparator 进 ScriptPane；Live 与 Run detail 两态都可分栏，且回放时多列共享**同一个**播放头；勾选持久化到 `localStorage`。
 22. LiveBody 每列右侧有 ChronoRail：tick 的 y 按**全局 anchor 序列的排名 / 总数**（CDF）定位而非真实时间比例，长静默自动收缩、突发段自动展开；所有列共用同一份全局 anchor 表，同一个 ts 在各列落在同一高度；点任意 tick 触发跨列 snap sync，各列滚到最接近该 ts 的行并对齐到 viewport 40% 高度，其间 tail 冻结、LiveHeader 提示锁定点，滚回底部即恢复。Run detail 不建 rail（已有 playhead）。
+23. `[tool.redpymake.targets.<name>]` 与 `.redpymake/targets.toml` 键级合并后的目标可被 `rpm.target(name)` 与 `redpymake exec` / `targets` 共用。两份文件都拒绝字面量 `password`，口令只经 `password_env` 在建连时读入，列出目标时不出现口令值。未知目标名 / 非法 `kind` / 工厂不认的键抛 `TargetConfigError`（CLI 退出 78）。`exec` 以 `check=False` 透传远端 returncode，省略命令时只做连通性探针；本地侧失败带 `redpymake: ` 前缀，退出码按 64 / 66 / 69 / 78 / 124 区分。
 
 ---
 
@@ -1605,7 +1689,8 @@ Web UI 的行为分两层验证，边界按"要不要真实渲染"划：
 | 脚本发现 | 二级接口组 E：文件名前缀 `rpm_*.py`（`pyproject.toml [tool.redpymake.discovery] patterns` 可覆盖）+ AST 抽取元数据；不 import 目标脚本 |
 | 脚本身份 | 运行时依旧 `with rpm.script(...)`（CORE-09）；前缀只是文件级发现的锚点 |
 | 实时日志 sink | 环境变量 `REDPYMAKE_LIVE_SINK=file://...`；仅 file:// 一种传输；首/尾有 `script.begin` / `script.end` 元行；与 `dump_on_error` 正交 |
-| CLI 入口 | `redpymake discover` / `run` / `report` / `serve`；核心库零 UI 依赖，Web 走 `[web]` extra |
+| CLI 入口 | `redpymake discover` / `run` / `targets` / `exec` / `report` / `serve` / `logs`；核心库零 UI 依赖，Web 走 `[web]` extra |
+| 命名目标 | pyproject 放形状，`.redpymake/targets.toml` 键级覆盖；两份文件都拒绝字面量 `password`；`rpm.target` 与 `exec` / `targets` 共用 |
 | Workspace 会话池 | 懒创建 + 按 key 缓存 + 跨脚本复用；`__exit__` 时默认 `auto_close_sessions=True` 关全部 |
 | Workspace 执行模型 | 单线程串行队列 + `enqueue` 随时可加；`importlib.reload` 每次 ▶ 生效；主区跟随 `current_run` |
 | 脚本入口约定 | 必须 `def main() -> None`；`if __name__ == "__main__": main()` 保持 CLI 直跑等价 |

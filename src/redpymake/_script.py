@@ -147,6 +147,7 @@ class ScriptRun:
         "_loggers",
         "_console",
         "_console_handler",
+        "_prev_root_level",
         "_handler",
         "_handler_targets",
         "_cv_token",
@@ -177,6 +178,8 @@ class ScriptRun:
         self._loggers: tuple[str, ...] | None = tuple(loggers) if loggers is not None else None
         self._console = console
         self._console_handler: logging.Handler | None = None
+        # 仅在 console 模式真的降过 root level 时记下原值，供出块还原
+        self._prev_root_level: int | None = None
 
         self._handler: _ScriptLoggingHandler | None = None
         self._handler_targets: list[logging.Logger] = []
@@ -305,16 +308,20 @@ class ScriptRun:
                 )
                 root_logger.addHandler(handler)
                 self._console_handler = handler
+                # root 的默认 WARNING 会在 logger 层面拦掉 INFO，handler 再低也收不到。
+                # 这是 CORE-09 允许改 logger level 的唯一一处，出块必须还原。
                 if root_logger.level > self._log_level or root_logger.level == logging.NOTSET:
+                    self._prev_root_level = root_logger.level
                     root_logger.setLevel(self._log_level)
 
     def _uninstall_handler(self) -> None:
         if self._console_handler is not None:
-            try:
-                logging.getLogger().removeHandler(self._console_handler)
-            except Exception:  # pragma: no cover
-                pass
+            root_logger = logging.getLogger()
+            root_logger.removeHandler(self._console_handler)
             self._console_handler = None
+            if self._prev_root_level is not None:
+                root_logger.setLevel(self._prev_root_level)
+                self._prev_root_level = None
         if self._handler is None:
             return
         for lg in self._handler_targets:

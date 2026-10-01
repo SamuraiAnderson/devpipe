@@ -30,6 +30,7 @@ from ._path import ResourcePath, ResourceStat
 from ._script import ScriptRun, ScriptSnapshot, script
 from ._session import Session, copy
 from ._stale import PathSpec, StalePredicate, stale
+from ._targets import target
 from ._transfer import TransferResult
 from ._workspace import Workspace, WorkspaceLog, WorkspaceRun, workspace
 from .exceptions import (
@@ -44,6 +45,7 @@ from .exceptions import (
     SessionConnectionError,
     SessionError,
     TransferError,
+    TargetConfigError,
     UnsupportedOperationError,
     WorkspaceStoppedError,
 )
@@ -83,6 +85,7 @@ __all__ = [
     "script",
     "workspace",
     "discover",
+    "target",
     # 一级类型
     "Session",
     "LocalSession",
@@ -125,5 +128,6 @@ __all__ = [
     "InputNotFoundError",
     "LogWaitTimeoutError",
     "UnsupportedOperationError",
+    "TargetConfigError",
     "WorkspaceStoppedError",
 ]

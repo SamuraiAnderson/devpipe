@@ -111,7 +111,11 @@ redpymake discover examples/
 redpymake run rpm_build.py --sink run.ndjson
 redpymake report run.ndjson -o run.html
 redpymake serve examples/wsl_session         # 127.0.0.1:8765
+redpymake targets                            # 列出 pyproject + 本机覆盖，不建连
+redpymake exec @board ls /workspace          # 选项写在目标名前面
 ```
+
+目标声明在 `[tool.redpymake.targets.<name>]`，本机地址放 `.redpymake/targets.toml`（已 gitignore）。脚本里用 `rpm.target("board")` 拿到同一个目标。
 
 `redpymake serve` 背后是 `rpm.workspace(...)`，同一目标在多次 run 之间复用连接。
 
@@ -145,3 +149,9 @@ redpymake serve examples/wsl_session         # 127.0.0.1:8765
 ## 完整规格
 
 [`doc/core-lib-requirements.md`](doc/core-lib-requirements.md)
+
+## 给 LLM / Agent
+
+- [`AGENTS.md`](AGENTS.md) — 硬约束、五条反直觉语义、改码流程
+- [`doc/api-cheatsheet.md`](doc/api-cheatsheet.md) — 常用公开符号的真实签名与字段表，一页
+- [`llms.txt`](llms.txt) — 文档索引，按 [llmstxt.org](https://llmstxt.org/) 约定
