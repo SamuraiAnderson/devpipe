@@ -39,6 +39,7 @@ RedPyMake 是一个跨运行环境的 Python 自动化库。调用者通过统�
 - 脚本对象与日志分流 `rpm.script(...)`（二级接口组 D）
 - 脚本发现与实时日志（二级接口组 E，CORE-10）
 - Workspace 会话池 + 可视化 Web UI（二级接口组 F，CORE-11）
+- 会话组合与连接路由（二级接口组 G，链式会话）
 - 统一异常与结果对象
 - 标准 Python 包结构
 
@@ -166,7 +167,21 @@ with rpm.workspace("./scripts") as ws:
 
 `Workspace` 是"一次可视化 / 交互会话生命周期"内的运行时容器：会话池懒创建 + 跨脚本复用、`importlib.reload` 加载脚本、串行队列执行、`ScriptSnapshot` 历史归档。配合 `redpymake serve` 提供纯 Web UI（无桌面 App、无 TUI）。详见 CORE-11。
 
-六组二级接口相互独立，可分别扩展。
+### 二级接口组 G：会话组合与连接路由
+
+```python
+rpm.ssh(...).adb(...)
+rpm.ssh(...).serial(...)
+rpm.ssh(...).wsl(...)
+```
+
+职责是通过已有宿主会话构造终点会话，并管理连接依赖、所有权和资源释放。
+这是基础会话之上的可选组合能力，归为**二级功能**；返回值继续使用既有
+`Session` 接口。连接契约见 CORE-01/chain，执行、传输、等待及会话池规则
+分别见 CORE-02/04/06/11 的 chain 小节。
+
+七组二级接口可按需使用和扩展。这里的功能分级不表示连接跳数或开发优先级；
+当前规格未定义三级功能。
 
 ---
 
@@ -230,7 +245,28 @@ uart.wait(prompt, since=cursor, timeout=10)  # prompt 按这块设备自己写
 
 ---
 
+### 链式连接（chain）
+
+功能归属：第 4 节「二级接口组 G：会话组合与连接路由」。
+
+- 支持 `rpm.ssh(...).adb(...)`、`.serial(...)`、`.wsl(...)`，返回终点类型的 Session。首版仅 SSH 可承载下一跳；其他组合立即抛 `UnsupportedOperationError`。
+- SSH 增加 `platform="auto"`（可指定 `"posix"` / `"windows"`）；登录后以带标记的有界探测选择执行后端，失败保留诊断并抛 `SessionConnectionError`。WSL 要求 Windows 宿主，构造只检查远端 wsl 可执行文件，不启动发行版。
+- 独占链的所有权在派生时转给终点；成功后原宿主不能再次派生独占分支（共享需使用外层 `with` / Workspace）。终点关闭释放整个独占链；构造失败同样释放。被外层 `with` 或 Workspace 持有的宿主只借用，关闭设备或设备构造失败均不关闭宿主。
+- 连接依赖独立于 `at()` 的视图关系；终点保留独立 session_id、日志、home/cwd。宿主视图仅提供连接，不把其 cwd 传给设备。宿主主动关闭时先关闭依赖设备并唤醒等待者。
+- 环境探测结果仅缓存在连接内。远端不安装 RedPyMake，不依赖持久脚本/状态；临时目录按远端登录身份创建并清理，失败清理的路径与原因必须可见。
+- 远端串口要求 Python 3.10+ + pyserial（`python_path` 可覆盖解释器）；桥接程序按需启动，不申请 PTY。构造等待打开端口的 READY 确认，协议含版本、帧类型、长度、序号，并处理分包/部分写入。Windows 宿主要求 PowerShell/.NET 允许 `Add-Type`，以二进制管道转发原生程序。
+- 串口透传保留字节和顺序，不保证读取块边界、字节间隔或电气信号。文本编码/newline 仅在调用方执行一次。远端发 RX_IDLE 事件驱动无换行提示符冲刷，禁止用网络空闲冒充串口空闲。软件流控默认关闭，BREAK/DTR/RTS 控制不在首版范围。
+- 后台读取失败必须向调用方传播并唤醒 wait；主动 close 与意外断连分别报 SessionClosedError / SessionConnectionError。不自动重放结果未知的操作。
+- UART 桥接使用双向心跳；远端在客户端租约到期后关闭端口。租约为 `max(5, 2 * connect_timeout)` 秒，避免异常退出或网络分区无限占用端口。
+
 ## CORE-02：工作目录与命令执行
+
+### 链式执行（chain）
+
+所有 run 语义作用于终点；每层独立正确引用 argv，不在宿主展开终点的变量。
+输出只写入终点日志，退出码就绪后仍须读完 stdout/stderr。读取失败或缺失终点
+完成标记必须抛 SessionConnectionError，不能以空输出/中间进程 rc=0 代替。
+多阶段操作共享 monotonic deadline；超时保留已接收输出，不重放命令。
 
 ### 工作目录：`at()`
 
@@ -367,6 +403,12 @@ target = remote.path("/opt/app")
 ---
 
 ## CORE-04：文件传输（二级接口组 A）
+
+### 链式传输（chain）
+
+- SSH → ADB/WSL 的 push/pull 使用 SSH 宿主的用户临时目录，SFTP 与设备工具逐段传输；WSL 路径通过目标发行版的 `wslpath` 转换。
+- 同一操作共享单调时钟超时预算，SFTP 也受限。临时目录在成功和失败路径都清理；清理失败必须暴露，不能覆盖原始错误。
+- 权限错误、设备离线和连接故障不得当作“路径不存在”。Windows SFTP 路径转为正斜线，日志中的终点仍为设备路径。
 
 ### 三个接口
 
@@ -569,6 +611,12 @@ if rpm.stale(target, depends_on=sources, name="build_app"):
 ---
 
 ## CORE-06：日志收集与等待（二级接口组 B）
+
+### 链式与读取故障（chain）
+
+连接错误必须通知文本和字节 wait，保留底层原因；不能把读取异常作为正常 EOF。
+独立设备保留独立日志和游标，并记录上游 session_id。原始 RX 或文本日志的等待
+游标落在已经覆盖的数据之前时，明确报缓冲溢出，不能静默跳过后超时。
 
 ### 自动收集
 
@@ -1155,6 +1203,11 @@ redpymake logs ...                                                       # 见 C
 ---
 
 ## CORE-11：Workspace 与 Web UI（二级接口组 F）
+
+### 链式池（chain）
+
+链式派生也借出池代理，保留停止检查与日志登记；池键包含真实宿主连接身份和终点
+标识，不能把不同主机的同名设备合并。cwd 是视图参数。退出时按依赖顺序释放。
 
 ### 动机
 

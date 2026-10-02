@@ -31,6 +31,8 @@ from .exceptions import (
     LogWaitTimeoutError,
     SessionClosedError,
     SessionConnectionError,
+    SessionError,
+    RedPyMakeError,
     UnsupportedOperationError,
 )
 
@@ -177,16 +179,32 @@ class SerialSession(Session):
         baudrate: int = 115200,
         newline: str = "",
         encoding: str = "utf-8",
+        python_path: str | None = None,
+        connect_timeout: float = 15.0,
+        _host: Any = None,
     ) -> None:
-        pyserial = _require_pyserial()
+        pyserial = _require_pyserial() if _host is None else None
+        self._host = _host
         label = f"serial:{port}@{baudrate}"
         super().__init__(session_kind="serial", session_label=label, default_cwd=None)
         # 第一次 wait 从会话起点读，避免漏掉 run 之前到达的开机日志。
         self._wait_origin_seq = 0
         self.path_style = "posix"
+        self._rx = _RxRing()
+        self._write_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._reader = None
         try:
-            self._port = pyserial.Serial(port=port, baudrate=baudrate, timeout=0.05)
+            if _host is None:
+                self._port = pyserial.Serial(port=port, baudrate=baudrate, timeout=0.05)
+            else:
+                from ._serial_stream import _RemoteSerialPort
+                self._port = _RemoteSerialPort(_host, self, port=port, baudrate=baudrate,
+                    python_path=python_path, connect_timeout=connect_timeout)
         except Exception as exc:
+            self._closed = True
+            self._rx.close()
+            self._log_buffer.close()
             raise SessionConnectionError(
                 f"failed to open serial port {port}: {exc}",
                 session=self,
@@ -194,8 +212,6 @@ class SerialSession(Session):
             ) from exc
         self._newline = newline
         self._encoding = encoding
-        self._stop = threading.Event()
-        self._rx = _RxRing()
         self._cursor = _StreamCursor(self.session_id)
         self._reader = threading.Thread(
             target=self._reader_loop, name=f"serial-reader-{port}", daemon=True
@@ -223,7 +239,12 @@ class SerialSession(Session):
         buf = b""
         while not self._stop.is_set():
             try:
-                data = self._port.read(1)
+                if self._host is not None:
+                    kind, data = self._port.read_event()
+                    if kind == "tick":
+                        continue
+                else:
+                    data = self._port.read(1)
                 if not data:
                     if buf:
                         lines, rest = _consume_serial_text(buf, encoding=self._encoding)
@@ -237,13 +258,15 @@ class SerialSession(Session):
                 in_waiting = getattr(self._port, "in_waiting", 0)
                 if in_waiting:
                     data += self._port.read(in_waiting)
-            except Exception:
+                self._rx.append(data)
+                buf += data
+                lines, buf = _consume_serial_text(buf, encoding=self._encoding)
+                for text in lines:
+                    self._emit_serial_line(text)
+            except Exception as exc:
+                if not self._stop.is_set():
+                    self._fail(exc)
                 break
-            self._rx.append(data)
-            buf += data
-            lines, buf = _consume_serial_text(buf, encoding=self._encoding)
-            for text in lines:
-                self._emit_serial_line(text)
         if buf:
             try:
                 lines, rest = _consume_serial_text(buf, encoding=self._encoding)
@@ -252,8 +275,9 @@ class SerialSession(Session):
                 flushed = _flush_incomplete(rest, encoding=self._encoding)
                 if flushed:
                     self._emit_serial_line(flushed)
-            except Exception:
-                pass
+            except Exception as exc:
+                if not self._stop.is_set():
+                    self._fail(exc)
 
     def _wait_bytes(
         self,
@@ -270,6 +294,9 @@ class SerialSession(Session):
         haystack = b""
         with self._rx._cond:
             while True:
+                self._check_alive()
+                if start < self._rx._dropped:
+                    raise SessionError("UART buffer overrun: requested bytes were overwritten", session=self)
                 _actual, haystack = self._rx._window_unlocked(start)
                 found = _earliest_bytes_match(patterns, haystack)
                 if found is not None:
@@ -380,8 +407,19 @@ class SerialSession(Session):
         self._cursor.advance_to_command(rx_before, cursor_before.sequence)
         self._note_wait_origin(cursor_before.sequence)
         try:
-            self._port.write(payload)
-            self._port.flush()
+            with self._write_lock:
+                if self._host is not None:
+                    self._port.write(payload, timeout=timeout)
+                else:
+                    offset = 0
+                    while offset < len(payload):
+                        count = self._port.write(payload[offset:])
+                        if not count:
+                            raise OSError("serial write made no progress")
+                        offset += count
+                    self._port.flush()
+        except RedPyMakeError:
+            raise
         except Exception as exc:
             raise SessionConnectionError(
                 f"serial write failed: {exc}", session=self, cause=exc
@@ -414,16 +452,22 @@ class SerialSession(Session):
     def _close_impl(self) -> None:
         self._stop.set()
         self._rx.close()
+        failure = None
         try:
             if hasattr(self._port, "cancel_read"):
                 self._port.cancel_read()
-        except Exception:
-            pass
+        except Exception as exc:
+            failure = exc
         try:
             self._port.close()
-        except Exception:
-            pass
-        self._reader.join(timeout=2)
+        except Exception as exc:
+            raise SessionConnectionError(f"serial close failed: {exc}", session=self, cause=exc) from exc
+        finally:
+            if self._reader is not None and self._reader is not threading.current_thread():
+                self._reader.join(timeout=2)
+        if failure is not None:
+            raise SessionConnectionError(f"serial cancellation failed: {failure}",
+                                         session=self, cause=failure) from failure
 
 
 __all__ = ["SerialSession"]

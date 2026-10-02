@@ -12,7 +12,8 @@
 
 from __future__ import annotations
 
-import contextvars
+import contextlib
+import errno
 import os
 import shlex
 import threading
@@ -26,6 +27,7 @@ from .exceptions import (
     CommandError,
     CommandTimeoutError,
     ResourceNotFoundError,
+    ResourceError,
     SessionConnectionError,
     TransferError,
     UnsupportedOperationError,
@@ -45,290 +47,247 @@ def _require_paramiko():
 
 
 class SshSession(Session):
-    """基于 paramiko 的 SSH 会话。POSIX 路径风格。"""
+    """SSH command host with detected POSIX/Windows execution semantics."""
 
     _is_local = False
 
-    def __init__(
-        self,
-        host: str,
-        *,
-        user: str | None = None,
-        port: int = 22,
-        password: str | None = None,
-        key_filename: str | os.PathLike[str] | None = None,
-        default_cwd: str | None = None,
-        connect_timeout: float = 15.0,
-    ) -> None:
+    def __init__(self, host: str, *, user: str | None = None, port: int = 22,
+                 password: str | None = None,
+                 key_filename: str | os.PathLike[str] | None = None,
+                 default_cwd: str | None = None, connect_timeout: float = 15.0,
+                 platform: str = "auto") -> None:
+        from ._host import _detect_host, _SshHost
+        if platform not in {"auto", "posix", "windows"}:
+            raise ValueError("platform must be 'auto', 'posix', or 'windows'")
         paramiko = _require_paramiko()
         label = f"{user + '@' if user else ''}{host}:{port}"
-        super().__init__(
-            session_kind="ssh",
-            session_label=label,
-            default_cwd=default_cwd,
-        )
-        self.path_style = "posix"
+        super().__init__(session_kind="ssh", session_label=label, default_cwd=default_cwd)
+        self._sftp_lock = threading.RLock()
+        self._sftp = None
+        self._process_lock = threading.Lock()
+        self._processes = set()
+        self._monitor_stop = threading.Event()
+        self._monitor = None
+        self._connect_timeout = connect_timeout
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            self._client.connect(
-                hostname=host,
-                port=port,
-                username=user,
-                password=password,
+            self._client.connect(hostname=host, port=port, username=user, password=password,
                 key_filename=str(key_filename) if key_filename else None,
-                timeout=connect_timeout,
-                allow_agent=True,
-                look_for_keys=True,
-            )
+                timeout=connect_timeout, auth_timeout=connect_timeout, banner_timeout=connect_timeout,
+                allow_agent=True, look_for_keys=True)
+            detected, home = _detect_host(self, platform, connect_timeout)
+            self.path_style = "windows" if detected == "windows" else "posix"
+            self._home_dir = home
+            self._host_backend = _SshHost(self, detected)
+            transport = self._client.get_transport()
+            transport.set_keepalive(15)
+            self._log_buffer.append(event="session_open", level="INFO", stream="system",
+                message=f"ssh session established: {label} ({detected})",
+                fields={"platform": detected})
+            self._monitor = threading.Thread(target=self._watch_transport, daemon=True,
+                                             name=f"rpm-ssh-watch-{host}")
+            self._monitor.start()
         except Exception as exc:
-            self._log_buffer.append(
-                event="session_error",
-                level="ERROR",
-                stream="system",
-                message=f"ssh connect failed: {exc}",
-            )
-            raise SessionConnectionError(
-                f"failed to connect to {label}: {exc}",
-                session=self,
-                host=host,
-                cause=exc,
-            ) from exc
-
-        self._log_buffer.append(
-            event="session_open",
-            level="INFO",
-            stream="system",
-            message=f"ssh session established: {label}",
-        )
-
-        # 连接已经建立。家目录探测失败则关掉连接并抛出，不留一个不能展开 ~ 的会话。
-        try:
-            self._home_dir = self._probe_home_dir()
-        except Exception:
             try:
-                self._client.close()
-            except Exception:
-                pass
-            raise
+                self.close()
+            except Exception as cleanup:
+                setattr(exc, "cleanup_error", cleanup)
+            raise SessionConnectionError(f"failed to connect to {label}: {exc}",
+                                         session=self, host=host, cause=exc) from exc
 
-        self._sftp_lock = threading.Lock()
-        self._sftp = None  # 延迟打开
+    def _watch_transport(self) -> None:
+        next_probe = time.monotonic() + 15
+        while not self._monitor_stop.wait(0.2):
+            try:
+                transport = self._client.get_transport()
+                if transport is None or not transport.is_active():
+                    raise OSError("SSH transport disconnected")
+                if time.monotonic() >= next_probe:
+                    script = ("[Console]::Write('__RPM_ALIVE__')" if self.path_style == "windows"
+                              else "printf __RPM_ALIVE__")
+                    rc, out, err = self._host_backend.shell(script, timeout=min(5, self._connect_timeout))
+                    if rc or out.strip() != "__RPM_ALIVE__":
+                        raise OSError(f"SSH liveness probe failed: {err or out}")
+                    next_probe = time.monotonic() + 15
+            except Exception as exc:
+                if not self._monitor_stop.is_set():
+                    self._fail(exc)
+                return
 
-    # ------------------------------ 命令 ------------------------------
-
-    def _execute_command(
-        self,
-        argv: Sequence[str],
-        *,
-        shell: bool,
-        cwd: str | None,
-        env: Mapping[str, str] | None,
-        timeout: float | None,
-        encoding: str,
-        operation_id: str,
-    ) -> tuple[int, str, str]:
-        if shell:
-            cmd_str = argv[0]
-        else:
-            cmd_str = " ".join(shlex.quote(a) for a in argv)
-
-        prefix_parts: list[str] = []
-        if env:
-            for k, v in env.items():
-                prefix_parts.append(f"{shlex.quote(k)}={shlex.quote(v)}")
-        prefix = " ".join(prefix_parts)
-
-        if cwd:
-            wrapped = f"cd {shlex.quote(cwd)} && {cmd_str}"
-        else:
-            wrapped = cmd_str
-        if prefix:
-            wrapped = f"{prefix} {wrapped}"
-
-        stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
-
+    def _open_process(self, command: str, *, timeout: float | None):
+        from ._process import _Deadline, _SshProcess
+        self._check_alive()
+        deadline = _Deadline.start(timeout)
+        channel = None
+        timer = None
+        expired = threading.Event()
         try:
             transport = self._client.get_transport()
             if transport is None or not transport.is_active():
-                raise SessionConnectionError(
-                    "ssh transport is inactive", session=self
-                )
-            chan = transport.open_session()
-            chan.set_combine_stderr(False)
-            if timeout is not None:
-                chan.settimeout(timeout)
-            chan.exec_command(wrapped)
-        except SessionConnectionError:
-            raise
+                raise OSError("SSH transport is inactive")
+            channel = transport.open_session(timeout=deadline.remaining())
+            channel.set_combine_stderr(False)
+            channel.settimeout(0.2)
+
+            def cancel_start():
+                expired.set()
+                channel.close()
+
+            left = deadline.remaining()
+            if left is not None:
+                timer = threading.Timer(left, cancel_start)
+                timer.daemon = True
+                timer.start()
+            channel.exec_command(command)
+            if expired.is_set():
+                raise TimeoutError("SSH exec request timed out")
+            process = _SshProcess(channel, self)
+            with self._process_lock:
+                self._check_alive()
+                self._processes.add(process)
+            return process
         except Exception as exc:
-            raise SessionConnectionError(
-                f"failed to open ssh channel: {exc}", session=self, cause=exc
-            ) from exc
+            if channel is not None:
+                channel.close()
+            if isinstance(exc, (TimeoutError, CommandTimeoutError)) or expired.is_set():
+                raise CommandTimeoutError("SSH process start timed out; remote state unconfirmed",
+                                          session=self, command=(command,), timeout=timeout) from exc
+            raise SessionConnectionError(f"failed to open SSH channel: {exc}",
+                                         session=self, cause=exc, outcome="unknown") from exc
+        finally:
+            if timer is not None:
+                timer.cancel()
 
-        def _pump(recv_fn, sink: list[str], stream_name: str) -> None:
-            buf = b""
-            while True:
-                try:
-                    data = recv_fn(4096)
-                except Exception:
-                    data = b""
-                if not data:
-                    break
-                buf += data
-                while b"\n" in buf:
-                    line_bytes, buf = buf.split(b"\n", 1)
-                    text = line_bytes.decode(encoding, errors="replace").rstrip("\r")
-                    sink.append(text)
-                    self._log_buffer.append(
-                        event="command_output",
-                        level="INFO",
-                        stream=stream_name,
-                        message=text,
-                        operation_id=operation_id,
-                    )
-            if buf:
-                text = buf.decode(encoding, errors="replace").rstrip("\r")
-                sink.append(text)
-                self._log_buffer.append(
-                    event="command_output",
-                    level="INFO",
-                    stream=stream_name,
-                    message=text,
-                    operation_id=operation_id,
-                )
+    def _release_process(self, process) -> None:
+        with self._process_lock:
+            self._processes.discard(process)
 
-        # 每个 pump 线程各自 copy 一份上下文（继承 ``logs.tag`` 等），
-        # 避免两线程共享同一 Context 时的 "context already entered" 错误。
-        ctx_out = contextvars.copy_context()
-        ctx_err = contextvars.copy_context()
-        t_out = threading.Thread(
-            target=lambda: ctx_out.run(_pump, chan.recv, stdout_parts, "stdout"),
-            daemon=True,
-        )
-        t_err = threading.Thread(
-            target=lambda: ctx_err.run(_pump, chan.recv_stderr, stderr_parts, "stderr"),
-            daemon=True,
-        )
-        t_out.start()
-        t_err.start()
+    def _raw_capture(self, command: str, *, timeout: float | None) -> tuple[int, str, str]:
+        from ._process import _Deadline, _capture
+        deadline = _Deadline.start(timeout)
+        process = self._open_process(command, timeout=deadline.remaining())
+        return _capture(process, session=self, command=(command,), timeout=timeout, deadline=deadline)
 
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while not chan.exit_status_ready():
-            if deadline is not None and time.monotonic() > deadline:
-                chan.close()
-                t_out.join(timeout=1)
-                t_err.join(timeout=1)
-                raise CommandTimeoutError(
-                    f"ssh command timed out after {timeout}s: {list(argv)!r}",
-                    session=self,
-                    command=argv,
-                    timeout=timeout,
-                    stdout="\n".join(stdout_parts),
-                    stderr="\n".join(stderr_parts),
-                )
-            time.sleep(0.02)
-
-        rc = chan.recv_exit_status()
-        chan.close()
-        t_out.join()
-        t_err.join()
-        return rc, "\n".join(stdout_parts), "\n".join(stderr_parts)
+    def _execute_command(self, argv, *, shell, cwd, env, timeout, encoding, operation_id):
+        from ._process import _Deadline, _capture
+        deadline = _Deadline.start(timeout)
+        command = self._host_backend.build(argv, shell=shell, cwd=cwd, env=env)
+        process = self._open_process(command, timeout=deadline.remaining())
+        return _capture(process, session=self, command=argv, timeout=timeout, deadline=deadline,
+                        encoding=encoding, operation_id=operation_id)
 
     def _exec_capture(self, cmd: str, *, timeout: float | None) -> tuple[int, str]:
-        """内部工具：执行一段 shell 命令，返回 (rc, stdout)。不写日志。"""
-        transport = self._client.get_transport()
-        if transport is None:
-            raise SessionConnectionError("ssh transport is inactive", session=self)
-        chan = transport.open_session()
-        if timeout is not None:
-            chan.settimeout(timeout)
-        chan.exec_command(cmd)
-        out = b""
-        while True:
-            data = chan.recv(4096)
-            if not data:
-                break
-            out += data
-        rc = chan.recv_exit_status()
-        chan.close()
-        return rc, out.decode("utf-8", errors="replace")
+        rc, out, err = self._raw_capture(cmd, timeout=timeout)
+        return rc, out if rc == 0 else (err or out)
 
     def _probe_home_dir(self) -> str:
-        cmd = 'printf %s "$HOME"'
-        try:
-            rc, out = self._exec_capture(cmd, timeout=5.0)
-        except Exception as exc:
-            raise SessionConnectionError(
-                f"failed to read $HOME: {exc}",
-                session=self,
-                cause=exc,
-            ) from exc
-        text = out.strip()
-        if rc != 0 or not text:
-            raise CommandError(
-                f"failed to read $HOME (exit {rc})",
-                session=self,
-                command=(cmd,),
-                returncode=rc,
-                stdout=out,
-            )
-        return text
+        return self._home_dir
 
     # ------------------------------ 资源 ------------------------------
 
-    def _get_sftp(self):
+    def _get_sftp(self, timeout: float | None = None):
+        self._check_alive()
         with self._sftp_lock:
             if self._sftp is None:
+                channel = None
+                timer = None
                 try:
-                    self._sftp = self._client.open_sftp()
+                    transport = self._client.get_transport()
+                    channel = transport.open_session(timeout=timeout or self._connect_timeout)
+                    channel.settimeout(timeout or self._connect_timeout)
+                    timer = threading.Timer(timeout or self._connect_timeout, channel.close)
+                    timer.daemon = True
+                    timer.start()
+                    channel.invoke_subsystem("sftp")
+                    self._sftp = _require_paramiko().SFTPClient(channel)
                 except Exception as exc:
+                    if channel is not None:
+                        channel.close()
                     raise SessionConnectionError(
                         f"failed to open sftp: {exc}", session=self, cause=exc
                     ) from exc
+                finally:
+                    if timer is not None:
+                        timer.cancel()
             return self._sftp
 
-    def _resource_exists(self, path: str) -> bool:
-        sftp = self._get_sftp()
+    @contextlib.contextmanager
+    def _sftp_operation(self, deadline):
+        left = deadline.remaining()
+        acquired = self._sftp_lock.acquire() if left is None else self._sftp_lock.acquire(timeout=left)
+        if not acquired:
+            raise CommandTimeoutError("SFTP lock deadline exceeded", timeout=deadline.timeout)
+        timer = None
+        expired = threading.Event()
+        sftp = None
         try:
-            sftp.stat(path)
+            sftp = self._get_sftp(deadline.remaining())
+            channel = sftp.get_channel()
+            left = deadline.remaining()
+            channel.settimeout(left)
+            if left is not None:
+                def cancel():
+                    expired.set()
+                    channel.close()
+                timer = threading.Timer(left, cancel)
+                timer.daemon = True
+                timer.start()
+            yield sftp
+            deadline.remaining()
+        finally:
+            if timer is not None:
+                timer.cancel()
+            if expired.is_set():
+                self._sftp = None
+            self._sftp_lock.release()
+
+    def _sftp_path(self, path: str) -> str:
+        return path.replace("\\", "/") if self.path_style == "windows" else path
+
+    def _stat_attrs(self, path: str):
+        from ._process import _Deadline
+        try:
+            with self._sftp_operation(_Deadline.start(self._connect_timeout)) as sftp:
+                return sftp.stat(self._sftp_path(path))
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                raise ResourceNotFoundError(f"remote resource not found: {path}", path=path) from exc
+            raise ResourceError(f"cannot stat {path}: {exc}", path=path) from exc
+        except (SessionConnectionError, CommandTimeoutError):
+            raise
+        except Exception as exc:
+            raise ResourceError(f"cannot stat {path}: {exc}", path=path) from exc
+
+    def _resource_exists(self, path: str) -> bool:
+        try:
+            self._stat_attrs(path)
             return True
-        except FileNotFoundError:
-            return False
-        except IOError:
+        except ResourceNotFoundError:
             return False
 
     def _resource_is_file(self, path: str) -> bool:
         import stat as _s
 
-        sftp = self._get_sftp()
         try:
-            attrs = sftp.stat(path)
-        except (FileNotFoundError, IOError):
+            attrs = self._stat_attrs(path)
+        except ResourceNotFoundError:
             return False
         return _s.S_ISREG(attrs.st_mode or 0)
 
     def _resource_is_dir(self, path: str) -> bool:
         import stat as _s
 
-        sftp = self._get_sftp()
         try:
-            attrs = sftp.stat(path)
-        except (FileNotFoundError, IOError):
+            attrs = self._stat_attrs(path)
+        except ResourceNotFoundError:
             return False
         return _s.S_ISDIR(attrs.st_mode or 0)
 
     def _resource_stat(self, path: str) -> ResourceStat:
         import stat as _s
 
-        sftp = self._get_sftp()
-        try:
-            attrs = sftp.stat(path)
-        except (FileNotFoundError, IOError) as exc:
-            raise ResourceNotFoundError(
-                f"remote resource not found: {path}", path=path
-            ) from exc
+        attrs = self._stat_attrs(path)
         return ResourceStat(
             size=int(attrs.st_size or 0),
             mtime=float(attrs.st_mtime or 0.0),
@@ -384,32 +343,42 @@ class SshSession(Session):
     def _do_copy_into(
         self, local_source: str, remote_target: str, *, overwrite: bool, timeout: float | None
     ) -> tuple[int, bool]:
-        sftp = self._get_sftp()
-        if self._resource_exists(remote_target) and not overwrite:
-            return 0, False
+        from ._process import _Deadline
+        deadline = _Deadline.start(timeout)
         try:
-            attrs = sftp.put(local_source, remote_target)
-        except FileNotFoundError as exc:
-            raise ResourceNotFoundError(
-                f"local source not found: {local_source}", path=local_source
-            ) from exc
+            with self._sftp_operation(deadline) as sftp:
+                path = self._sftp_path(remote_target)
+                if not overwrite:
+                    try:
+                        sftp.stat(path)
+                    except OSError as exc:
+                        if exc.errno != errno.ENOENT:
+                            raise
+                    else:
+                        return 0, False
+                attrs = sftp.put(local_source, path, callback=lambda *_: deadline.remaining())
+        except Exception as exc:
+            raise TransferError(f"SFTP put failed: {exc}", source=local_source,
+                                target=remote_target, cause=exc) from exc
         return int(attrs.st_size or os.path.getsize(local_source)), True
 
     def _do_copy_from(
         self, remote_source: str, local_target: str, *, overwrite: bool, timeout: float | None
     ) -> tuple[int, bool]:
-        sftp = self._get_sftp()
+        from ._process import _Deadline
+        deadline = _Deadline.start(timeout)
         if os.path.exists(local_target) and not overwrite:
             return 0, False
         parent = os.path.dirname(local_target)
         if parent:
             os.makedirs(parent, exist_ok=True)
         try:
-            sftp.get(remote_source, local_target)
-        except FileNotFoundError as exc:
-            raise ResourceNotFoundError(
-                f"remote source not found: {remote_source}", path=remote_source
-            ) from exc
+            with self._sftp_operation(deadline) as sftp:
+                sftp.get(self._sftp_path(remote_source), local_target,
+                         callback=lambda *_: deadline.remaining())
+        except Exception as exc:
+            raise TransferError(f"SFTP get failed: {exc}", source=remote_source,
+                                target=local_target, cause=exc) from exc
         return os.path.getsize(local_target), True
 
     def _do_copy_within(
@@ -433,17 +402,31 @@ class SshSession(Session):
     # ------------------------------ 关闭 ------------------------------
 
     def _close_impl(self) -> None:
+        self._monitor_stop.set()
+        failures = []
+        with self._process_lock:
+            processes = list(self._processes)
+        for process in processes:
+            try:
+                process.close()
+            except Exception as exc:
+                failures.append(exc)
         with self._sftp_lock:
             if self._sftp is not None:
                 try:
                     self._sftp.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    failures.append(exc)
                 self._sftp = None
         try:
             self._client.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            failures.append(exc)
+        if self._monitor is not None and self._monitor is not threading.current_thread():
+            self._monitor.join(timeout=2)
+        if failures:
+            raise SessionConnectionError(f"SSH cleanup failed: {failures[0]}",
+                                         session=self, cause=failures[0]) from failures[0]
 
 
 __all__ = ["SshSession"]

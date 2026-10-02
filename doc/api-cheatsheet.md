@@ -15,7 +15,7 @@ and defers distro failures to the first `run()` as a `CommandError`.
 | Signature | Requires |
 | --- | --- |
 | `rpm.local(*, default_cwd=None) -> Session` | — |
-| `rpm.ssh(host, *, user=None, port=22, password=None, key_filename=None, default_cwd=None, connect_timeout=15.0) -> Session` | `[ssh]` (paramiko) |
+| `rpm.ssh(host, *, user=None, port=22, password=None, key_filename=None, default_cwd=None, connect_timeout=15.0, platform="auto") -> Session` | `[ssh]` (paramiko) |
 | `rpm.adb(serial=None, *, adb_path=None, default_cwd=None, connect_timeout=10.0) -> Session` | `adb` on PATH |
 | `rpm.serial(port, *, baudrate=115200, newline="", encoding="utf-8") -> Session` | `[serial]` (pyserial) |
 | `rpm.wsl(distribution=None, *, user=None, wsl_path=None, default_cwd=None) -> Session` | Windows |
@@ -26,6 +26,29 @@ view over the shared connection, while the other arguments must match what the
 pool was built with — see `Workspace` below.
 
 ## Session
+
+SSH sessions can create a device session on the SSH host:
+
+```python
+session.adb(serial=None, *, adb_path=None, default_cwd=None, connect_timeout=10.0)
+session.wsl(distribution=None, *, user=None, wsl_path=None, default_cwd=None)
+session.serial(port, *, baudrate=115200, newline="", encoding="utf-8",
+               python_path=None, connect_timeout=15.0)
+```
+
+These return the endpoint's Session implementation with independent logs and paths.
+Only SSH hosts are supported in this release; WSL requires a Windows SSH host.
+`platform="auto"` probes POSIX/Windows; explicit values are `"posix"` and `"windows"`.
+Remote UART needs Python 3.10+ with pyserial; no persistent RedPyMake installation.
+The bridge preserves bytes/order, not timing or UART control signals. Its client
+lease expires after `max(5, 2 * connect_timeout)` seconds without control frames.
+
+Closing an exclusively chained leaf closes its upstream connection. An outer
+`with host:` scope or Workspace retains ownership, permitting multiple children.
+Closing the parent closes children first. `at()` remains a view of the endpoint;
+the host view's cwd is never inherited. Workspace keys include upstream identity.
+Unexpected read/disconnect failures wake waits with `SessionConnectionError`;
+`SessionError` reports overwritten wait data. Unconfirmed operations are not replayed.
 
 Context manager. `close()` is idempotent; operations after close raise
 `SessionClosedError` but collected logs remain readable.

@@ -46,7 +46,46 @@ with rpm.ssh("192.168.1.10", user="root") as remote:
     print(remote.at("/tmp").run("pwd").stdout.strip())
 ```
 
-### 命令
+### 经 SSH 连接设备
+
+链式调用返回终点会话，命令、工作目录、路径和日志都属于终点：
+
+```python
+with rpm.ssh("lab-linux", user="tester").adb("DEVICE_SN") as android:
+    print(android.run("getprop", "ro.product.model").stdout)
+    android.push("firmware.bin", "/data/local/tmp/firmware.bin", timeout=60)
+
+with rpm.ssh("lab-windows").wsl("Ubuntu") as linux:
+    linux.at("/home/test/project").run("make", timeout=120)
+
+with rpm.ssh("lab-linux").serial("/dev/ttyUSB0", newline="\r") as uart:
+    uart.run("version").wait("OK", timeout=5)
+    uart.run(b"\x00\xff")  # bytes 原样写入，不追加 newline
+```
+
+SSH 自动检测 POSIX / Windows，也可传 `platform="posix"` 或 `"windows"`。
+远端需具备相应工具：ADB、Windows 的 WSL，或 Python 3.10+ 和 pyserial。
+串口可用 `python_path` 指定远端解释器；本机只需 `[ssh]`，无需本机 pyserial。
+Windows 后端使用 Windows PowerShell 与 .NET，需要允许执行命令和 `Add-Type`。
+
+远端无需安装 RedPyMake。串口桥接源码从标准输入发送，关闭或客户端租约到期后释放端口；
+文件传输使用远端登录用户的临时目录并在完成后清理，清理失败会报错。
+UART 不分配 PTY，保留字节及顺序；读取块边界、字节间隔和电气信号不属于透传保证。
+UART `run()` 成功表示驱动接受写入，设备是否执行成功仍需 `wait()` 确认。
+不会在断线后自动重连并重发命令。
+
+一条独占链关闭终点就会关闭 SSH。多个设备共享宿主时使用外层作用域：
+
+```python
+with rpm.ssh("lab-linux") as host:
+    with host.adb("DEVICE_SN") as android, host.serial("/dev/ttyUSB0") as uart:
+        android.run("echo", "ready")
+```
+
+Workspace 会按宿主和设备身份复用链式会话，退出 Workspace 时统一释放。
+首版支持 SSH → ADB / serial / WSL；其他嵌套组合会明确报 `UnsupportedOperationError`。
+
+### 命令执行
 
 ```python
 res = remote.run("make", "-j8")               # 非零抛 CommandError
@@ -133,7 +172,11 @@ redpymake exec @board ls /workspace          # 选项写在目标名前面
 | 二级 B：日志与等待 | `session.logs`, `session.wait`, `run(...).wait` | 自动收集、订阅、tag、等待 |
 | 二级 C：过时判断 | `rpm.stale(target, depends_on=...)` | 增量优化辅助 |
 | 二级 D：脚本对象 | `rpm.script(...)` | 多会话日志合流、异常自动落盘 |
-| 二级 E：工作区与可视化 | `rpm.workspace(...)`, `rpm.discover(...)` | 连接复用、脚本发现、Web UI 后端 |
+| 二级 E：脚本发现与实时日志 | `rpm.discover(...)`, `rpm.target(...)`、live sink | 脚本发现、命名目标、实时日志输出 |
+| 二级 F：Workspace 与 Web UI | `rpm.workspace(...)`、`redpymake serve` | 连接复用、脚本队列、Web UI |
+| 二级 G：会话组合与连接路由 | `rpm.ssh(...).adb(...)` / `.serial(...)` / `.wsl(...)` | 构造终点会话、管理上游依赖与生命周期 |
+
+功能分级与连接跳数、开发优先级分别定义；当前规格未定义三级功能。
 
 所有异常继承 `RedPyMakeError`，不会漏出 paramiko 原生异常或裸 `RuntimeError`。
 

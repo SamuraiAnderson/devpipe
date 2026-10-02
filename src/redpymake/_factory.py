@@ -76,6 +76,7 @@ def ssh(
     key_filename: str | os.PathLike[str] | None = None,
     default_cwd: str | None = None,
     connect_timeout: float = 15.0,
+    platform: str = "auto",
 ) -> "Session":
     """构造 SSH 会话（立即连接，失败抛 ``SessionConnectionError``）。"""
     ws = _active_workspace_or_none()
@@ -88,6 +89,7 @@ def ssh(
             key_filename=key_filename,
             default_cwd=default_cwd,
             connect_timeout=connect_timeout,
+            platform=platform,
         )
     from ._ssh import SshSession
 
@@ -99,6 +101,7 @@ def ssh(
         key_filename=key_filename,
         default_cwd=default_cwd,
         connect_timeout=connect_timeout,
+        platform=platform,
     )
 
 

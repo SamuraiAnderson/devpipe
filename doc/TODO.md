@@ -9,6 +9,9 @@
 
 ## P0：第一版打磨
 
+- [x] SSH → ADB / serial / WSL 链式会话：宿主平台探测、临时文件中转、二进制 UART 桥接、生命周期和 Workspace 复用。
+- [ ] 链式会话真实设备与长时间稳定性验收：Linux/Windows SSH、USB 拔插、网络分区、持续 UART 压力（测试入口 `tests/integration/test_chained_sessions.py`）。
+
 > 已合并 `9ce30b7` 后立即可以起手做的事，用于让 v0.5 达到"日常可用"。
 
 ### P0-1 examples 与前十分钟场景

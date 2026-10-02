@@ -385,7 +385,7 @@ class Workspace:
                 sessions = list(self._pool.values())
                 self._pool.clear()
                 self._pool_params.clear()
-            for sess in sessions:
+            for sess in reversed(sessions):
                 try:
                     sess.close()
                 except Exception:  # pragma: no cover
@@ -450,6 +450,8 @@ class Workspace:
                 self._check_pool_conflict(key, params)
                 self._maybe_attach_to_current_script(already)
                 return self._borrow(already, default_cwd)
+            sess._pool_owned = True
+            sess._workspace_owner = self
             self._pool[key] = sess
             self._pool_params[key] = params
         return self._borrow(sess, default_cwd)
@@ -470,6 +472,21 @@ class Workspace:
                 f"different {', '.join(conflicts)}; use a key that distinguishes them "
                 f"(e.g. a separate host/port/distribution) or run outside the workspace"
             )
+
+    def _derive_session(self, parent: "Session", kind: str,
+                        params: dict[str, Any]) -> _BorrowedSession:
+        from ._route import _create_child
+
+        identity = dict(params)
+        cwd = identity.pop("default_cwd", None)
+        target = identity.get({"adb": "serial", "serial": "port", "wsl": "distribution"}[kind])
+        key = f"via:{parent.session_id}/{kind}:{target or 'default'}"
+        if kind == "serial":
+            key += f"@{identity['baudrate']}"
+        return self._get_or_create(
+            key, lambda: _create_child(parent, kind, identity, owned=False),
+            params=identity, default_cwd=cwd,
+        )
 
     def _borrow(self, sess: "Session", default_cwd: str | None) -> _BorrowedSession:
         """包出借用代理；给了 ``default_cwd`` 就借出 ``at()`` 视图而非池会话本身。
@@ -511,6 +528,7 @@ class Workspace:
         key_filename: str | os.PathLike[str] | None = None,
         default_cwd: str | None = None,
         connect_timeout: float = 15.0,
+        platform: str = "auto",
     ) -> _BorrowedSession:
         from ._ssh import SshSession
 
@@ -524,11 +542,13 @@ class Workspace:
                 password=password,
                 key_filename=key_filename,
                 connect_timeout=connect_timeout,
+                platform=platform,
             ),
             params={
                 "password": password,
                 "key_filename": os.fspath(key_filename) if key_filename else None,
                 "connect_timeout": connect_timeout,
+                "platform": platform,
             },
             default_cwd=default_cwd,
         )

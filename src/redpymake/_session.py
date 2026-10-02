@@ -23,6 +23,7 @@ import subprocess
 import threading
 import time
 import uuid
+import weakref
 from abc import ABC, abstractmethod
 from typing import Any, Mapping, Pattern, Sequence
 
@@ -35,6 +36,8 @@ from .exceptions import (
     CommandTimeoutError,
     ResourceNotFoundError,
     SessionClosedError,
+    SessionConnectionError,
+    SessionError,
     TransferError,
     UnsupportedOperationError,
 )
@@ -97,6 +100,13 @@ class Session(ABC):
         self._logs = SessionLogs(self._log_buffer)
         self._closed = False
         self._close_lock = threading.Lock()
+        self._context_depth = 0
+        self._pool_owned = False
+        self._chain_transferred = False
+        self._via: Session | None = None
+        self._owns_via = False
+        self._dependents: weakref.WeakSet[Session] = weakref.WeakSet()
+        self._failure: SessionConnectionError | None = None
         # None：wait() 从调用当下的缓冲末尾开始。run() 会把它拨到该命令开始前。
         # 串口在子类里设为 0，以便第一次 wait 看到开机日志。
         self._wait_origin_seq: int | None = None
@@ -180,10 +190,22 @@ class Session(ABC):
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "Session":
+        self._check_alive()
+        if not self.is_view:
+            self._context_depth += 1
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
+        if not self.is_view:
+            self._context_depth = max(0, self._context_depth - 1)
+            if self._context_depth:
+                return
+        try:
+            self.close()
+        except Exception as cleanup:
+            if exc is None:
+                raise
+            setattr(exc, "cleanup_error", cleanup)
 
     def close(self) -> None:
         """幂等关闭：仅 root 触发底层资源释放，视图直接返回。"""
@@ -193,8 +215,24 @@ class Session(ABC):
             if self._closed:
                 return
             self._closed = True
+        failures: list[Exception] = []
         try:
-            self._close_impl()
+            for dependent in list(self._dependents):
+                try:
+                    dependent.close()
+                except Exception as exc:
+                    failures.append(exc)
+            try:
+                self._close_impl()
+            except Exception as exc:
+                failures.append(exc)
+            if self._via is not None:
+                self._via._dependents.discard(self)
+                if self._owns_via:
+                    try:
+                        self._via.close()
+                    except Exception as exc:
+                        failures.append(exc)
         finally:
             self._log_buffer.append(
                 event="session_closed",
@@ -204,6 +242,9 @@ class Session(ABC):
             )
             # 关闭日志缓冲：拒绝新写入，但已收集记录仍可读取。
             self._log_buffer.close()
+        if failures:
+            raise SessionConnectionError(f"session cleanup failed: {failures[0]}",
+                                         session=self, cause=failures[0]) from failures[0]
 
     def _check_alive(self) -> None:
         if self.closed:
@@ -211,6 +252,52 @@ class Session(ABC):
                 f"session '{self._session_label}' is closed",
                 session=self,
             )
+        if self.root._failure is not None:
+            raise self.root._failure
+        if self.root._via is not None:
+            self.root._via._check_alive()
+
+    def _fail(self, error: Exception) -> None:
+        root = self.root
+        if root.closed or root._failure is not None:
+            return
+        failure = SessionConnectionError(f"{root.label}: {error}", session=root, cause=error,
+                                         outcome="unknown")
+        failure.__cause__ = error
+        root._failure = failure
+        root._log_buffer.append(event="session_error", level="ERROR", stream="system",
+                                message=str(failure))
+        root._log_buffer._fail(failure)
+        rx = getattr(root, "_rx", None)
+        if rx is not None:
+            with rx._cond:
+                rx._cond.notify_all()
+        for child in list(root._dependents):
+            child._fail(failure)
+
+    def adb(self, serial: str | None = None, *, adb_path: str | None = None,
+            default_cwd: str | None = None, connect_timeout: float = 10.0) -> "Session":
+        """Open an ADB endpoint on this SSH host (CORE-01/chain)."""
+        return self._derive("adb", serial=serial, adb_path=adb_path,
+                            default_cwd=default_cwd, connect_timeout=connect_timeout)
+
+    def serial(self, port: str, *, baudrate: int = 115200, newline: str = "",
+               encoding: str = "utf-8", python_path: str | None = None,
+               connect_timeout: float = 15.0) -> "Session":
+        """Open a binary serial bridge on this SSH host."""
+        return self._derive("serial", port=port, baudrate=baudrate, newline=newline,
+                            encoding=encoding, python_path=python_path,
+                            connect_timeout=connect_timeout)
+
+    def wsl(self, distribution: str | None = None, *, user: str | None = None,
+            wsl_path: str | None = None, default_cwd: str | None = None) -> "Session":
+        """Open a WSL endpoint on this Windows SSH host."""
+        return self._derive("wsl", distribution=distribution, user=user,
+                            wsl_path=wsl_path, default_cwd=default_cwd)
+
+    def _derive(self, kind: str, **kwargs: Any) -> "Session":
+        from ._route import _derive
+        return _derive(self, kind, kwargs)
 
     # ------------------------------------------------------------------
     # 工作目录视图

@@ -37,10 +37,16 @@ class SessionConnectionError(SessionError):
         session: "Session | None" = None,
         host: str | None = None,
         cause: BaseException | None = None,
+        stdout: str = "",
+        stderr: str = "",
+        outcome: str | None = None,
     ) -> None:
         super().__init__(message, session=session)
         self.host = host
         self.cause = cause
+        self.stdout = stdout
+        self.stderr = stderr
+        self.outcome = outcome
 
 
 class SessionClosedError(SessionError):

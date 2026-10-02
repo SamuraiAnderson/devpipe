@@ -12,13 +12,14 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from ._path import ResourceStat
 from ._session import Session
 from .exceptions import (
     CommandTimeoutError,
     ResourceNotFoundError,
+    ResourceError,
     SessionConnectionError,
     TransferError,
     UnsupportedOperationError,
@@ -37,8 +38,10 @@ class AdbSession(Session):
         adb_path: str | None = None,
         default_cwd: str | None = None,
         connect_timeout: float = 10.0,
+        _host: Any = None,
     ) -> None:
-        adb_exe = adb_path or shutil.which("adb")
+        self._host = _host
+        adb_exe = (adb_path or _host.executable("adb", timeout=connect_timeout)) if _host else (adb_path or shutil.which("adb"))
         if not adb_exe:
             raise SessionConnectionError(
                 "adb executable not found in PATH; set adb_path=... or install adb"
@@ -87,6 +90,8 @@ class AdbSession(Session):
         timeout: float | None,
         stdin: bytes | None = None,
     ) -> tuple[int, str, str]:
+        if self._host is not None:
+            return self._host.capture(self._adb_argv(extra), timeout=timeout, session=self)
         proc = subprocess.run(
             self._adb_argv(extra),
             input=stdin,
@@ -128,10 +133,35 @@ class AdbSession(Session):
         else:
             wrapped = f"{env_prefix}{cmd_str}"
 
+        if self._host is not None:
+            from ._host import _posix_command
+            wrapped = _posix_command(argv, shell=shell, cwd=cwd, env=env)
         # 使用 shell -c "..." 把返回码带出：adb shell 的 rc 不可靠。
         # 用魔术标记从 stdout 抽取 rc。
         marker = f"__RPM_EXIT_{operation_id}__"
-        remote_cmd = f"{wrapped}; printf '\\n{marker}%d\\n' $?"
+        remote_cmd = f"({wrapped}); printf '\\n{marker}%d\\n' $?"
+
+        if self._host is not None:
+            import re
+            completion: list[int] = []
+
+            def keep_line(stream: int, line: str) -> bool:
+                if stream == 0 and line.startswith(marker):
+                    match = re.fullmatch(re.escape(marker) + r"(-?\d+)", line)
+                    if match is None:
+                        raise SessionConnectionError("invalid ADB completion marker; result unknown", session=self)
+                    completion.append(int(match.group(1)))
+                    return False
+                return True
+
+            rc, out, err = self._host.capture(self._adb_argv(["shell", remote_cmd]),
+                timeout=timeout, session=self, encoding=encoding, operation_id=operation_id,
+                line_filter=keep_line)
+            if rc != 0 or len(completion) != 1:
+                raise SessionConnectionError(f"ADB command completion unconfirmed (transport rc={rc}): {err}",
+                    session=self, stdout=out, stderr=err, outcome="unknown")
+            output = "\n".join(line for line in out.splitlines() if not line.startswith(marker)).rstrip("\r\n")
+            return completion[0], output, err
 
         popen = subprocess.Popen(
             self._adb_argv(["shell", remote_cmd]),
@@ -232,27 +262,33 @@ class AdbSession(Session):
     def _shell_detail(stderr: str, stdout: str) -> str:
         return stderr.strip() or stdout.strip() or "<no output>"
 
-    def _resource_exists(self, path: str) -> bool:
-        rc, out, _err = self._shell_probe(
-            f"[ -e {shlex.quote(path)} ] && echo yes || echo no"
+    def _resource_exists(self, path: str, *, timeout: float | None = 10) -> bool:
+        rc, out, err = self._shell_probe(
+            f"[ -e {shlex.quote(path)} ] && echo yes || echo no", timeout=timeout
         )
-        return "yes" in out.strip()
+        if rc or out.strip() not in {"yes", "no"}:
+            raise ResourceError(f"device path probe failed: {err or out}", path=path)
+        return out.strip() == "yes"
 
     def _resource_is_file(self, path: str) -> bool:
-        rc, out, _err = self._shell_probe(
+        rc, out, err = self._shell_probe(
             f"[ -f {shlex.quote(path)} ] && echo yes || echo no"
         )
-        return "yes" in out.strip()
+        if rc or out.strip() not in {"yes", "no"}:
+            raise ResourceError(f"device path probe failed: {err or out}", path=path)
+        return out.strip() == "yes"
 
     def _resource_is_dir(self, path: str) -> bool:
-        rc, out, _err = self._shell_probe(
+        rc, out, err = self._shell_probe(
             f"[ -d {shlex.quote(path)} ] && echo yes || echo no"
         )
-        return "yes" in out.strip()
+        if rc or out.strip() not in {"yes", "no"}:
+            raise ResourceError(f"device path probe failed: {err or out}", path=path)
+        return out.strip() == "yes"
 
     def _resource_stat(self, path: str) -> ResourceStat:
         # `stat -c '%s %Y %F'` 在多数 Android 上可用
-        rc, out, _err = self._shell_probe(
+        rc, out, err = self._shell_probe(
             f"stat -c '%s %Y %F' {shlex.quote(path)}"
         )
         text = out.strip()
@@ -274,7 +310,7 @@ class AdbSession(Session):
 
     def _resource_remove(self, path: str, *, missing_ok: bool = False) -> None:
         rc, out, err = self._shell_probe(f"rm -rf {shlex.quote(path)}")
-        if rc != 0 and not missing_ok:
+        if rc != 0:
             raise TransferError(
                 f"adb remove failed (rc={rc}): {self._shell_detail(err, out)}",
                 target=path,
@@ -288,7 +324,7 @@ class AdbSession(Session):
     ) -> None:
         flag = "-p " if parents or exist_ok else ""
         rc, out, err = self._shell_probe(f"mkdir {flag}{shlex.quote(path)}")
-        if rc != 0 and not exist_ok:
+        if rc != 0:
             raise TransferError(
                 f"adb mkdir failed (rc={rc}): {self._shell_detail(err, out)}",
                 target=path,
@@ -302,8 +338,19 @@ class AdbSession(Session):
     def _do_copy_into(
         self, local_source: str, remote_target: str, *, overwrite: bool, timeout: float | None
     ) -> tuple[int, bool]:
-        if self._resource_exists(remote_target) and not overwrite:
+        from ._process import _Deadline
+        deadline = _Deadline.start(timeout)
+        if not overwrite and self._resource_exists(remote_target, timeout=deadline.remaining()):
             return 0, False
+        if self._host is not None:
+            with self._host.temporary_directory(deadline) as directory:
+                staging = self._host.join(directory, "payload")
+                self._host.put(local_source, staging, deadline)
+                rc, out, err = self._run_adb(["push", staging, remote_target], timeout=deadline.remaining())
+                if rc:
+                    raise TransferError(f"adb push failed: {err or out}", source=local_source,
+                        target=remote_target, returncode=rc, stdout=out, stderr=err)
+                return os.path.getsize(local_source), True
         rc, out, err = self._run_adb(
             ["push", local_source, remote_target], timeout=timeout
         )
@@ -330,6 +377,17 @@ class AdbSession(Session):
         parent = os.path.dirname(local_target)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        if self._host is not None:
+            from ._process import _Deadline
+            deadline = _Deadline.start(timeout)
+            with self._host.temporary_directory(deadline) as directory:
+                staging = self._host.join(directory, "payload")
+                rc, out, err = self._run_adb(["pull", remote_source, staging], timeout=deadline.remaining())
+                if rc:
+                    raise TransferError(f"adb pull failed: {err or out}", source=remote_source,
+                        target=local_target, returncode=rc, stdout=out, stderr=err)
+                self._host.get(staging, local_target, deadline)
+                return os.path.getsize(local_target), True
         rc, out, err = self._run_adb(
             ["pull", remote_source, local_target], timeout=timeout
         )

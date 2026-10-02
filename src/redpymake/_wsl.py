@@ -25,7 +25,7 @@ import shlex
 import shutil
 import subprocess
 import threading
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from ._path import ResourceStat
 from ._session import Session
@@ -33,6 +33,7 @@ from .exceptions import (
     CommandError,
     CommandTimeoutError,
     ResourceNotFoundError,
+    ResourceError,
     SessionConnectionError,
     TransferError,
 )
@@ -50,8 +51,10 @@ class WslSession(Session):
         user: str | None = None,
         wsl_path: str | None = None,
         default_cwd: str | None = None,
+        _host: Any = None,
     ) -> None:
-        wsl_exe = wsl_path or shutil.which("wsl")
+        self._host = _host
+        wsl_exe = _host.executable(wsl_path or "wsl.exe") if _host else (wsl_path or shutil.which("wsl"))
         if not wsl_exe:
             raise SessionConnectionError(
                 "wsl executable not found in PATH; set wsl_path=... or install "
@@ -96,6 +99,8 @@ class WslSession(Session):
         stdin: bytes | None = None,
     ) -> tuple[int, str, str]:
         """一次性调用 wsl.exe，捕获全部 stdout/stderr（不做流式日志）。"""
+        if self._host is not None:
+            return self._host.capture(self._wsl_argv(extra), timeout=timeout, session=self)
         proc = subprocess.run(
             self._wsl_argv(extra),
             input=stdin,
@@ -184,6 +189,11 @@ class WslSession(Session):
         else:
             wrapped = f"{env_prefix}{cmd_str}"
 
+        if self._host is not None:
+            from ._host import _posix_command
+            wrapped = _posix_command(argv, shell=shell, cwd=cwd, env=env)
+            return self._host.capture(self._wsl_argv(["--", "sh", "-c", wrapped]),
+                timeout=timeout, session=self, encoding=encoding, operation_id=operation_id)
         popen = subprocess.Popen(
             self._wsl_argv(["--", "sh", "-c", wrapped]),
             stdout=subprocess.PIPE,
@@ -253,26 +263,32 @@ class WslSession(Session):
 
     # ------------------------------ 资源 ------------------------------
 
-    def _resource_exists(self, path: str) -> bool:
-        rc, out, _err = self._wsl_shell(
-            f"[ -e {shlex.quote(path)} ] && echo yes || echo no"
+    def _resource_exists(self, path: str, *, timeout: float | None = 10) -> bool:
+        rc, out, err = self._wsl_shell(
+            f"[ -e {shlex.quote(path)} ] && echo yes || echo no", timeout=timeout
         )
-        return "yes" in out.strip()
+        if rc or out.strip() not in {"yes", "no"}:
+            raise ResourceError(f"device path probe failed: {err or out}", path=path)
+        return out.strip() == "yes"
 
     def _resource_is_file(self, path: str) -> bool:
-        rc, out, _err = self._wsl_shell(
+        rc, out, err = self._wsl_shell(
             f"[ -f {shlex.quote(path)} ] && echo yes || echo no"
         )
-        return "yes" in out.strip()
+        if rc or out.strip() not in {"yes", "no"}:
+            raise ResourceError(f"device path probe failed: {err or out}", path=path)
+        return out.strip() == "yes"
 
     def _resource_is_dir(self, path: str) -> bool:
-        rc, out, _err = self._wsl_shell(
+        rc, out, err = self._wsl_shell(
             f"[ -d {shlex.quote(path)} ] && echo yes || echo no"
         )
-        return "yes" in out.strip()
+        if rc or out.strip() not in {"yes", "no"}:
+            raise ResourceError(f"device path probe failed: {err or out}", path=path)
+        return out.strip() == "yes"
 
     def _resource_stat(self, path: str) -> ResourceStat:
-        rc, out, _err = self._wsl_shell(f"stat -c '%s %Y %F' {shlex.quote(path)}")
+        rc, out, err = self._wsl_shell(f"stat -c '%s %Y %F' {shlex.quote(path)}")
         text = out.strip()
         if rc != 0 or not text:
             raise ResourceNotFoundError(
@@ -292,7 +308,7 @@ class WslSession(Session):
 
     def _resource_remove(self, path: str, *, missing_ok: bool = False) -> None:
         rc, out, err = self._wsl_shell(f"rm -rf {shlex.quote(path)}")
-        if rc != 0 and not missing_ok:
+        if rc != 0:
             raise TransferError(
                 f"wsl remove failed (rc={rc}): {self._shell_detail(err, out)}",
                 target=path,
@@ -306,7 +322,7 @@ class WslSession(Session):
     ) -> None:
         flag = "-p " if parents or exist_ok else ""
         rc, out, err = self._wsl_shell(f"mkdir {flag}{shlex.quote(path)}")
-        if rc != 0 and not exist_ok:
+        if rc != 0:
             raise TransferError(
                 f"wsl mkdir failed (rc={rc}): {self._shell_detail(err, out)}",
                 target=path,
@@ -325,12 +341,25 @@ class WslSession(Session):
         overwrite: bool,
         timeout: float | None,
     ) -> tuple[int, bool]:
-        if self._resource_exists(remote_target) and not overwrite:
+        from ._process import _Deadline
+        deadline = _Deadline.start(timeout)
+        if not overwrite and self._resource_exists(remote_target, timeout=deadline.remaining()):
             return 0, False
         if not os.path.exists(local_source):
             raise ResourceNotFoundError(
                 f"local source not found: {local_source}", path=local_source
             )
+        if self._host is not None:
+            with self._host.temporary_directory(deadline) as directory:
+                staging = self._host.join(directory, "payload")
+                self._host.put(local_source, staging, deadline)
+                mapped = self._host.wsl_path(staging, self._wsl_argv([]), deadline)
+                rc, out, err = self._wsl_shell(f"cp -f -- {shlex.quote(mapped)} {shlex.quote(remote_target)}",
+                                              timeout=deadline.remaining())
+                if rc:
+                    raise TransferError(f"wsl push failed: {err or out}", source=local_source,
+                        target=remote_target, returncode=rc, stdout=out, stderr=err)
+                return os.path.getsize(local_source), True
         mnt_src = _win_to_mnt(local_source)
         rc, out, err = self._wsl_shell(
             f"cp -f {shlex.quote(mnt_src)} {shlex.quote(remote_target)}",
@@ -364,6 +393,19 @@ class WslSession(Session):
         parent = os.path.dirname(local_target)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        if self._host is not None:
+            from ._process import _Deadline
+            deadline = _Deadline.start(timeout)
+            with self._host.temporary_directory(deadline) as directory:
+                staging = self._host.join(directory, "payload")
+                mapped = self._host.wsl_path(staging, self._wsl_argv([]), deadline)
+                rc, out, err = self._wsl_shell(f"cp -f -- {shlex.quote(remote_source)} {shlex.quote(mapped)}",
+                                              timeout=deadline.remaining())
+                if rc:
+                    raise TransferError(f"wsl pull failed: {err or out}", source=remote_source,
+                        target=local_target, returncode=rc, stdout=out, stderr=err)
+                self._host.get(staging, local_target, deadline)
+                return os.path.getsize(local_target), True
         mnt_tgt = _win_to_mnt(local_target)
         rc, out, err = self._wsl_shell(
             f"cp -f {shlex.quote(remote_source)} {shlex.quote(mnt_tgt)}",

@@ -37,7 +37,7 @@ from typing import (
     Sequence,
 )
 
-from .exceptions import LogWaitTimeoutError, SessionClosedError
+from .exceptions import LogWaitTimeoutError, SessionClosedError, SessionError
 
 if TYPE_CHECKING:  # pragma: no cover
     from ._command import CommandResult
@@ -151,6 +151,7 @@ class LogBuffer:
         "_seq",
         "_subscribers",
         "_closed",
+        "_failure",
     )
 
     def __init__(self, session_id: str, *, capacity: int = 10_000) -> None:
@@ -164,6 +165,7 @@ class LogBuffer:
         self._seq = count(0)
         self._subscribers: list[Subscriber] = []
         self._closed = False
+        self._failure: Exception | None = None
 
     @property
     def session_id(self) -> str:
@@ -232,6 +234,11 @@ class LogBuffer:
         """标记缓冲已关闭；已有记录仍可读取和保存。"""
         with self._cond:
             self._closed = True
+            self._cond.notify_all()
+
+    def _fail(self, error: Exception) -> None:
+        with self._cond:
+            self._failure = error
             self._cond.notify_all()
 
     @property
@@ -334,8 +341,13 @@ class LogBuffer:
             if since is not None and since.session_id != self._session_id:
                 raise ValueError("cursor belongs to a different session")
 
-            scan_from_idx = 0
+            scan_from_seq = start_seq
             while True:
+                if self._failure is not None:
+                    raise self._failure
+                needed = start_seq if multiline else scan_from_seq
+                if self._records and needed < self._records[0].sequence:
+                    raise SessionError("log buffer overrun: requested output was overwritten", session=session)
                 if multiline:
                     hit = self._match_multiline(
                         patterns,
@@ -344,9 +356,8 @@ class LogBuffer:
                     )
                 else:
                     hit = None
-                    for idx in range(scan_from_idx, len(self._records)):
-                        rec = self._records[idx]
-                        if rec.sequence < start_seq:
+                    for rec in self._records:
+                        if rec.sequence < scan_from_seq:
                             continue
                         if allowed_streams is not None and rec.stream not in allowed_streams:
                             continue
@@ -355,7 +366,7 @@ class LogBuffer:
                             pat, index, matched = found
                             hit = (pat, index, matched, rec)
                             break
-                    scan_from_idx = len(self._records)
+                    scan_from_seq = self._records[-1].sequence + 1 if self._records else 0
 
                 if hit is not None:
                     pat, index, matched, rec = hit
