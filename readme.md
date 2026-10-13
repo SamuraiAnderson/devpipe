@@ -165,9 +165,18 @@ redpymake report run.ndjson -o run.html
 redpymake serve examples/wsl_session         # 127.0.0.1:8765
 redpymake targets                            # 列出 pyproject + 本机覆盖，不建连
 redpymake exec @board ls /workspace          # 选项写在目标名前面
+redpymake cp dist/app.bin @board:/tmp/app.bin # 上传文件
+redpymake cp @board:/var/log/app.log ./app.log # 下载文件
+redpymake cp @board:/tmp/app.bin @backup:/tmp/app.bin # 目标之间复制
 ```
 
 目标声明在 `[tool.redpymake.targets.<name>]`，本机地址放 `.redpymake/targets.toml`（已 gitignore）。脚本里用 `rpm.target("board")` 拿到同一个目标。
+
+`cp SOURCE DEST` 也支持本机文件复制；目标是已有目录时保留源文件名。
+默认覆盖，`-n` / `--no-clobber` 跳过已有文件，`--timeout 30` 设置底层传输超时。
+`--root DIR` 指定目标配置的查找起点，本机相对路径仍基于当前目录。
+一次复制一个文件，不递归复制目录；命名目标路径必须写成 `@名称:路径`，
+本机以 `@` 开头的文件名写成 `./@file`，以 `-` 开头的路径放在 `--` 后。
 
 `redpymake serve` 背后是 `rpm.workspace(...)`，同一目标在多次 run 之间复用连接。
 

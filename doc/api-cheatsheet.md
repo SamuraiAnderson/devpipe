@@ -418,6 +418,7 @@ redpymake discover [ROOT] [--json]
 redpymake run PATH [--sink FILE]
 redpymake targets [--root DIR] [--json]
 redpymake exec [--cwd DIR] [--shell] [--timeout S] [--root DIR] TARGET [CMD ...]
+redpymake cp [--root DIR] [--timeout S] [-n | --no-clobber] SOURCE DEST
 redpymake report NDJSON -o report.html
 redpymake serve [ROOT] [--host H] [--port P] [--no-open] [--resume-log]
 redpymake logs list [ROOT] [--json]
@@ -442,5 +443,16 @@ arguments. No command means connect and exit 0. A command runs with
 stdout/stderr are copied through unchanged and nothing is written to NDJSON.
 
 Local failures print `redpymake: ...` on stderr: 64 usage, 66 missing input,
-69 connection or missing extra, 78 `TargetConfigError`, 124 command timeout.
+69 connection or unsupported capability, 74 copy/file access failure,
+78 `TargetConfigError`, 124 command or transfer timeout.
 Log-group state conflicts stay on exit code 3.
+
+`cp` copies one file using `rpm.copy()`. Plain paths are local (relative to the
+process cwd); `@NAME:PATH` uses a named target's cwd/home. Both endpoints can be
+named targets, including the same target. `--root` only selects configuration.
+An existing destination directory receives the source filename. Directories
+cannot be sources. Default: overwrite; `-n` / `--no-clobber` skips existing files.
+`--timeout` is a finite positive number of seconds passed to the transfer;
+connection and path queries retain their own timeouts. Success/skips exit 0
+without output. Use `./@file` for local names starting with `@`, and `--` before
+paths starting with `-`. Windows drive and UNC paths remain local.

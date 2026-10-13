@@ -1184,6 +1184,7 @@ redpymake discover [ROOT] [--json]
 redpymake run PATH [--sink FILE]
 redpymake targets [--root DIR] [--json]
 redpymake exec [--cwd DIR] [--shell] [--timeout S] [--root DIR] TARGET [CMD ...]
+redpymake cp [--root DIR] [--timeout S] [-n | --no-clobber] SOURCE DEST
 redpymake report NDJSON -o report.html
 redpymake serve [ROOT] [--host H --port P] [--no-open] [--resume-log]   # 见 CORE-11
 redpymake logs ...                                                       # 见 CORE-11
@@ -1202,6 +1203,14 @@ redpymake logs ...                                                       # 见 C
 - `--shell` 把 `CMD` 各段用空格拼成一个字符串交给远端 shell。没给命令时这是用法错误。默认逐段字面传递；
 - `--cwd` 只覆盖这一次 `run()`，不改目标配置里的 `default_cwd`。
 
+`cp` 语义（`§CORE-10/cli/cp`）：
+
+- **路径**：普通路径表示本机路径，相对路径基于启动 CLI 的工作目录；`@NAME:PATH` 表示命名目标内的路径，按该目标的 `default_cwd` / 家目录解析。只把以 `@` 开头的参数当作目标引用，Windows 盘符与 UNC 路径不受影响；本机文件名以 `@` 开头时用 `./@file`，以 `-` 开头时用 `--` 分隔选项。两端都必须非空，目标引用必须含合法名称与非空路径；用法错误退出 64，且在建连前检查。
+- **方向**：支持本机到本机、本机与命名目标互传、同一命名目标内部以及不同命名目标之间复制。使用 CORE-04 `rpm.copy()` 传输；一次调用内每个目标只打开一次，所有已打开会话在成功或失败时都关闭。
+- **文件**：一次复制一个文件；源目录退出 69，不提供递归复制。目标为已存在目录时，使用源文件名作为目录内的目标路径；否则目标参数就是完整文件路径。路径字面传递，不做 shell 展开或通配符匹配。
+- **选项**：默认覆盖；`-n` / `--no-clobber` 转发 `overwrite=False`，跳过已有目标也退出 0。`--timeout` 必须为有限正数，按秒转发给 `rpm.copy()`；仅约束底层传输，连接与路径查询沿用各自的超时。`--root` 只决定目标配置的查找起点，不改变本机路径基准。
+- **结果**：成功或跳过时退出 0，不输出文本。失败保留底层诊断并以 `redpymake: ` 开头，不打印 traceback。配置错误退出 78，缺失输入退出 66，连接失败或不支持的能力退出 69，传输超时退出 124，其余传输 / 文件访问失败退出 74；`TransferError` 包裹上述已知原因时仍使用对应退出码。
+
 退出码（全 CLI 共用）。本地侧失败的 stderr 一律以 `redpymake: ` 开头；远端透传的 rc **没有**这个前缀，调用方靠这个区分撞码：
 
 | 码 | 含义 |
@@ -1209,10 +1218,11 @@ redpymake logs ...                                                       # 见 C
 | 0 | 成功 |
 | 1–255 | `exec` 透传的远端 returncode |
 | 64 | 用法：argparse 失败、目标名不合法、`--shell` 却没有命令、`logs rename` 的非法参数 |
-| 66 | 输入不存在：脚本路径、NDJSON、日志组 id |
+| 66 | 输入不存在：脚本路径、NDJSON、日志组 id、`cp` 源文件 |
 | 69 | `SessionConnectionError`，或目标平台依赖未装（`UnsupportedOperationError`） |
+| 74 | `cp` 传输 / 文件访问失败（没有更具体的已知原因） |
 | 78 | `TargetConfigError` |
-| 124 | `CommandTimeoutError` |
+| 124 | `CommandTimeoutError` 或 `cp` 传输超时 |
 | 3 | 仅日志组状态冲突（活跃 / pinned 拒绝 discard，running 拒绝 rotate） |
 
 ### 明确不做的能力
@@ -1223,7 +1233,7 @@ redpymake logs ...                                                       # 见 C
 - `exec` 不做跨进程连接复用（每次调用一次握手）；SSH 重复握手用 `~/.ssh/config` 的 `ControlMaster`；
 - `exec` 不分配 PTY，没有交互式 shell；
 - 不做内联 `ssh://user@host` 形式的目标。寻址收敛在单一解析函数上，以后加 URI 不改 `exec` / `targets` 的参数形状；
-- 第一版没有 `push` / `pull` 子命令。
+- 不设独立的 `push` / `pull` 子命令；CLI 文件传输统一使用 `cp`。
 
 ---
 
@@ -1767,7 +1777,7 @@ Web UI 的行为分两层验证，边界按"要不要真实渲染"划：
 | 脚本发现 | 二级接口组 E：文件名前缀 `rpm_*.py`（`pyproject.toml [tool.redpymake.discovery] patterns` 可覆盖）+ AST 抽取元数据；不 import 目标脚本 |
 | 脚本身份 | 运行时依旧 `with rpm.script(...)`（CORE-09）；前缀只是文件级发现的锚点 |
 | 实时日志 sink | 环境变量 `REDPYMAKE_LIVE_SINK=file://...`；仅 file:// 一种传输；首/尾有 `script.begin` / `script.end` 元行；与 `dump_on_error` 正交 |
-| CLI 入口 | `redpymake discover` / `run` / `targets` / `exec` / `report` / `serve` / `logs`；核心库零 UI 依赖，Web 走 `[web]` extra |
+| CLI 入口 | `redpymake discover` / `run` / `targets` / `exec` / `cp` / `report` / `serve` / `logs`；核心库零 UI 依赖，Web 走 `[web]` extra |
 | 命名目标 | pyproject 放形状，`.redpymake/targets.toml` 键级覆盖；两份文件都拒绝字面量 `password`；`rpm.target` 与 `exec` / `targets` 共用 |
 | Workspace 会话池 | 懒创建 + 按 key 缓存 + 跨脚本复用；`__exit__` 时默认 `auto_close_sessions=True` 关全部 |
 | Workspace 执行模型 | 单线程串行队列 + `enqueue` 随时可加；`importlib.reload` 每次 ▶ 生效；主区跟随 `current_run` |

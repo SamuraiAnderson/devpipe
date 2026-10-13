@@ -5,6 +5,7 @@
   ``REDPYMAKE_LIVE_SINK`` 使 CORE-10 sink 生效；透传脚本 exit code；
 - ``redpymake targets [--root] [--json]``：列出命名目标，不建连；
 - ``redpymake exec [选项] TARGET [CMD ...]``：在命名目标上跑一条命令；
+- ``redpymake cp [选项] SOURCE DEST``：复制本机或 ``@目标:路径`` 中的文件；
 - ``redpymake report NDJSON -o OUT.html``：从 NDJSON 生成自包含 HTML 报告；
 - ``redpymake serve [ROOT] [--host --port]``：起 FastAPI Web UI（依赖 ``[web]`` extra）；
   每次启动另起一份活跃日志（上一份为空则复用），``--resume-log`` 可续用上次那份。
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import socket
 import subprocess
@@ -25,15 +27,23 @@ import sys
 import threading
 import time
 import webbrowser
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence, TextIO
 
 from ._discover import ScriptCard, discover
+from ._factory import local
+from ._path import ResourcePath
+from ._session import Session, copy
 from ._targets import legal_target_spec, list_targets, target
 from .exceptions import (
     CommandTimeoutError,
+    RedPyMakeError,
+    ResourceNotFoundError,
     SessionConnectionError,
     TargetConfigError,
+    TransferError,
     UnsupportedOperationError,
 )
 
@@ -41,6 +51,7 @@ from .exceptions import (
 EX_USAGE = 64
 EX_NOINPUT = 66
 EX_UNAVAILABLE = 69
+EX_IOERR = 74
 EX_CONFIG = 78
 EX_TIMEOUT = 124
 EX_CONFLICT = 3
@@ -111,6 +122,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_exec.add_argument("target", help="目标名，board 与 @board 等价")
     p_exec.add_argument("cmd", nargs=argparse.REMAINDER, help="要执行的命令")
     p_exec.set_defaults(func=_cmd_exec)
+
+    # cp。只有显式 @NAME:PATH 才是目标引用，避免与 Windows 盘符冲突。
+    p_cp = subs.add_parser("cp", help="复制单个文件（本机路径或 @目标:路径）")
+    p_cp.add_argument("--root", default=".", help="查找项目根的起点（默认当前目录）")
+    p_cp.add_argument(
+        "--timeout", type=_cp_timeout, default=None, help="传输超时秒数（有限正数）",
+    )
+    p_cp.add_argument(
+        "-n", "--no-clobber", dest="overwrite", action="store_false",
+        help="跳过已有目标文件（默认覆盖）",
+    )
+    p_cp.add_argument("source", type=_cp_endpoint, help="源文件：本机路径或 @目标:路径")
+    p_cp.add_argument("dest", type=_cp_endpoint, help="目标文件路径或已有目录")
+    p_cp.set_defaults(func=_cmd_cp)
 
     # report
     p_rep = subs.add_parser("report", help="从 NDJSON 生成自包含 HTML 报告")
@@ -332,6 +357,79 @@ def _write_streams(stdout: str, stderr: str) -> None:
         _write_text(stdout, sys.stdout)
     if stderr:
         _write_text(stderr, sys.stderr)
+
+
+# ------------------------------------------------------------ cp
+
+
+@dataclass(frozen=True)
+class _CopyEndpoint:
+    name: str | None
+    path: str
+
+
+def _cp_endpoint(value: str) -> _CopyEndpoint:
+    if not value:
+        raise argparse.ArgumentTypeError("copy path must not be empty")
+    if not value.startswith("@"):
+        return _CopyEndpoint(None, value)
+    spec, separator, path = value.partition(":")
+    if not separator or not path or not legal_target_spec(spec):
+        raise argparse.ArgumentTypeError(
+            f"invalid copy endpoint {value!r}; expected @NAME:PATH "
+            "(use ./@file for a local filename starting with @)"
+        )
+    return _CopyEndpoint(spec[1:], path)
+
+
+def _cp_timeout(value: str) -> float:
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError("--timeout must be a finite positive number")
+    return timeout
+
+
+def _cmd_cp(args: argparse.Namespace) -> int:
+    try:
+        with ExitStack() as stack:
+            sessions: dict[str | None, Session] = {}
+            paths: list[ResourcePath] = []
+            for endpoint in (args.source, args.dest):
+                if endpoint.name not in sessions:
+                    sess = (
+                        local() if endpoint.name is None
+                        else target(endpoint.name, root=args.root)
+                    )
+                    sessions[endpoint.name] = stack.enter_context(sess)
+                paths.append(sessions[endpoint.name].path(endpoint.path))
+            source, dest = paths
+            if source.stat().is_dir:
+                raise UnsupportedOperationError("cp does not support directory sources")
+            if dest.is_dir():
+                # 文件名是字面的；避免 ~ 开头的名字被再次当成家目录展开。
+                dest = dest.session.at(dest.path).path("./" + source.name)
+            copy(source, dest, overwrite=args.overwrite, timeout=args.timeout)
+    except (RedPyMakeError, OSError) as exc:
+        return _die(_cp_error_code(exc), str(exc))
+    return 0
+
+
+def _cp_error_code(exc: BaseException) -> int:
+    # CORE-04 包裹后端异常；仍按已知根因区分缺文件、超时和连接失败。
+    while isinstance(exc, TransferError):
+        cause = exc.cause or exc.__cause__
+        if cause is None:
+            break
+        exc = cause
+    if isinstance(exc, TargetConfigError):
+        return EX_CONFIG
+    if isinstance(exc, (ResourceNotFoundError, FileNotFoundError)):
+        return EX_NOINPUT
+    if isinstance(exc, (CommandTimeoutError, TimeoutError)):
+        return EX_TIMEOUT
+    if isinstance(exc, (SessionConnectionError, UnsupportedOperationError)):
+        return EX_UNAVAILABLE
+    return EX_IOERR
 
 
 def _die(code: int, message: str) -> int:
