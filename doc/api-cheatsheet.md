@@ -78,6 +78,31 @@ Working-directory precedence: `run(cwd=...)` > `at()` > session default.
 (`TypeError`). `bytes` is serial-only: written verbatim, no `newline` appended,
 no `*args`, no `shell=True`.
 
+On POSIX endpoints (SSH / WSL / ADB, including chained sessions), `cwd` and
+`env` apply to the **whole script**. A failed `cd` prevents every command from
+running, even with `;`, `||`, or `&`. Environment values are exported before
+the script is expanded, including to its children. Overriding `PATH` does not
+prevent the interpreter itself from starting. WSL uses `--exec sh -c` so
+the distro's default shell does not reparse the arguments.
+
+`run()` waits for the invoked command and collected output; it does not manage
+detached jobs. With `shell=True`, `rc` belongs to the shell. For a job started
+with `&`, explicitly wait for its PID to obtain its status:
+
+```python
+linux.run('./build >build.log 2>&1 & pid=$!; wait "$pid"',
+          shell=True, cwd="/workspace", env={"MODE": "release"}, timeout=120)
+```
+
+`nohup`, `setsid`, or a fixed `sleep` do not guarantee survival after a WSL
+launcher exits. See the [WSL reproduction and tested environment](../examples/wsl_session/README.md#wsl-后台进程复现).
+
+`encoding` describes **command output bytes**, not the caller's terminal.
+Results, exceptions, and logs retain Unicode. Default UTF-8 WSL calls and
+internal file operations request UTF-8 launcher diagnostics using `WSL_UTF8=1`
+(WSL 0.64+), including through SSH. Specify `encoding="gbk"` only for commands
+that actually emit GBK; it does not select the encoding of WSL's own errors.
+
 ```python
 session.wait(
     pattern: str | bytes | re.Pattern | Sequence[...],
@@ -110,6 +135,36 @@ Properties: `session_id`, `kind`, `label`, `logs`, `default_cwd`, `path_style`
 
 `home_dir` is `None` until a `~` expansion probes it — reading the property never
 triggers the probe. Use `session.path("~")` when you need the value.
+
+## TFTP helper (independent of Session)
+
+```python
+rpm.tftpd(root_dir: str | os.PathLike[str], *, host="127.0.0.1", port=69,
+          timeout=2.0, retries=3) -> TftpServer
+```
+
+Requires `pip install "redpymake[tftp]"`; dependency loading and UDP binding
+happen on context entry. Missing extra raises `UnsupportedOperationError`.
+Use `with rpm.tftpd(...) as server:`. Entry returns with an IPv4 listener ready;
+exit or idempotent `close()` stops active transfers and releases files, sockets,
+and the worker. `host` must be a local interface reachable by the device;
+`port=0` selects a free test port. Port 69 can require privileges on POSIX.
+
+- Properties: `host`, `port` (actual address), `root_dir: Path`, `logs: SessionLogs`.
+- `wait(filename, timeout=30.0) -> None`: one successful download since entry,
+  including the final ACK. It does not confirm a device checksum or flash.
+- `check() -> None`: raise any background failure. First failed request stops
+  the service and raises `TransferError` on `wait()`, `check()`, or context exit.
+- `timeout` / `retries`: per-block ACK deadline / maximum retransmissions.
+  `wait()` has a separate deadline. Retries are visible as `transfer_retry` events.
+
+Read-only octet RRQ downloads use relative ASCII protocol filenames; local root
+directories may contain Unicode. WRQ, directories, absolute paths, `..`, and
+links escaping the root are rejected. Keep the root unchanged while serving.
+Use a dedicated distribution directory: all files within it can be downloaded.
+TFTP has no authentication; UDP listener and negotiated transfer ports must be
+reachable on the device network. The [serial example](../examples/serial_session/tftp_download.py)
+uses an explicit BusyBox command, checks its status, then verifies SHA-256.
 
 ## Top-level functions
 
@@ -351,6 +406,12 @@ Parse fields, not messages. `TransferError.stderr` carries the underlying shell
 error when the failure came from an internal `cp` / `stat` / `rm` / `mkdir` probe.
 
 ## CLI and environment
+
+CLI messages and `exec` text use the current stdout/stderr encoding. Chinese is
+preserved on GBK streams; unsupported characters are escaped with
+`backslashreplace`. JSON uses valid JSON escapes and round-trips the original
+Unicode. This does not alter global console settings, exception fields, logs,
+or exit codes. A script launched by `redpymake run` manages its own printing.
 
 ```bash
 redpymake discover [ROOT] [--json]

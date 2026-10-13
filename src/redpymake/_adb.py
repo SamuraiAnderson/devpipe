@@ -117,25 +117,9 @@ class AdbSession(Session):
         encoding: str,
         operation_id: str,
     ) -> tuple[int, str, str]:
-        if shell:
-            cmd_str = argv[0]
-        else:
-            cmd_str = " ".join(shlex.quote(a) for a in argv)
+        from ._host import _posix_command
 
-        env_prefix = ""
-        if env:
-            env_prefix = " ".join(
-                f"{shlex.quote(k)}={shlex.quote(v)}" for k, v in env.items()
-            ) + " "
-
-        if cwd:
-            wrapped = f"cd {shlex.quote(cwd)} && {env_prefix}{cmd_str}"
-        else:
-            wrapped = f"{env_prefix}{cmd_str}"
-
-        if self._host is not None:
-            from ._host import _posix_command
-            wrapped = _posix_command(argv, shell=shell, cwd=cwd, env=env)
+        wrapped = _posix_command(argv, shell=shell, cwd=cwd, env=env)
         # 使用 shell -c "..." 把返回码带出：adb shell 的 rc 不可靠。
         # 用魔术标记从 stdout 抽取 rc。
         marker = f"__RPM_EXIT_{operation_id}__"

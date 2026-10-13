@@ -32,6 +32,7 @@ from ._session import Session, copy
 from ._stale import PathSpec, StalePredicate, stale
 from ._targets import target
 from ._transfer import TransferResult
+from ._tftp import tftpd
 from ._workspace import Workspace, WorkspaceLog, WorkspaceRun, workspace
 from .exceptions import (
     CommandError,
@@ -59,6 +60,10 @@ def __getattr__(name: str):
         from ._ssh import SshSession as _SshSession
 
         return _SshSession
+    if name == "TftpServer":
+        from ._tftp import TftpServer as _TftpServer
+
+        return _TftpServer
     if name == "AdbSession":
         from ._adb import AdbSession as _AdbSession
 
@@ -82,6 +87,7 @@ __all__ = [
     "adb",
     "serial",
     "wsl",
+    "tftpd",
     "script",
     "workspace",
     "discover",
@@ -93,6 +99,7 @@ __all__ = [
     "AdbSession",
     "SerialSession",
     "WslSession",
+    "TftpServer",
     "ScriptRun",
     "ScriptSnapshot",
     "ScriptCard",

@@ -10,6 +10,9 @@
 ## P0：第一版打磨
 
 - [x] SSH → ADB / serial / WSL 链式会话：宿主平台探测、临时文件中转、二进制 UART 桥接、生命周期和 Workspace 复用。
+- [x] POSIX `shell=True + cwd + env` 整段语义：SSH / ADB / WSL 共用引用逻辑；WSL 使用 `--exec` 避免二次解析；真实 WSL 验证环境继承、字面 argv 和切目录失败。
+- [x] WSL UTF-8 启动器诊断与 CLI GBK 输出：保留 Unicode 字段，终端无法表示的字符转义，JSON 可无损解析。
+- [x] WSL 后台存活复现脚本及版本化观察记录：`examples/wsl_session/background_probe.py`；README / cheatsheet 明确 `run()` 与后台生命周期边界。
 - [ ] 链式会话真实设备与长时间稳定性验收：Linux/Windows SSH、USB 拔插、网络分区、持续 UART 压力（测试入口 `tests/integration/test_chained_sessions.py`）。
 
 > 已合并 `9ce30b7` 后立即可以起手做的事，用于让 v0.5 达到"日常可用"。
@@ -98,11 +101,14 @@
 - [ ] `RemoteProcess.wait_ready(pattern, timeout)` 复用 `logs.wait` 机制
 - [ ] `RemoteProcess.kill()` 幂等；`with session.spawn(...) as proc:` 自动清理
 - [ ] SSH：通过 `nohup` + 独立通道；ADB：通过 `run-as` 或 shell 后台
+- [ ] WSL：设计带就绪握手、等待和清理的进程管理；不能把 `nohup` / `setsid` / 固定 `sleep` 当作 launcher 退出后的存活契约。
 
 ### P1-5 TFTP 作为 optional extra
 
-- [ ] `redpymake[tftp]` 只暴露 `rpm.tftpd(root_dir, host, port)` 上下文管理器
-- [ ] 与主 `Session` 解耦；作为独立辅助设施而非 Session 子类
+- [x] `redpymake[tftp]` 提供 `rpm.tftpd(root_dir, *, host, port, timeout, retries) -> TftpServer`，上下文内启动只读下载服务；支持完成等待、日志、错误传播与资源清理。
+- [x] 与主 `Session` 解耦；作为独立辅助设施，第三方依赖只在进入上下文时加载。
+- [x] 回环 UDP 验证分块、空文件、最后 ACK、选项协商、并发客户端、重传、拒绝请求和中途关闭；串口 + BusyBox 下载及 SHA-256 示例已提供。
+- [ ] 真实板卡验收 `examples/serial_session/tftp_download.py`；U-Boot 等其他命令方言仍由调用方显式编写。
 
 ---
 
@@ -145,6 +151,8 @@
 ---
 
 ## 变更记录
+
+- 2026-10-10：修复 POSIX shell/cwd/env 组合、WSL 启动器诊断与 CLI GBK 显示；新增只读 TFTP extra、串口下载示例及 WSL 后台存活复现文档。
 
 - 2026-08-15：新建；基于 v0.5 需求与 `9ce30b7` 实现现状拟定
 - 2026-08-15：新增 `WslSession` + `rpm.wsl(...)` 工厂（CORE-01 显式例外：只校验 `wsl.exe` 存在，不做 distro 级探测）；集成测试在 `RPM_TEST_WSL=1` 门控下运行

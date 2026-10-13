@@ -11,6 +11,7 @@ Python 3.10+，核心零依赖。
 pip install -e .            # 核心
 pip install -e ".[ssh]"     # paramiko
 pip install -e ".[serial]"  # pyserial
+pip install -e ".[tftp]"    # 只读 TFTP 文件分发（tftpy）
 pip install -e ".[web]"     # fastapi + uvicorn
 pip install -e ".[dev]"     # pytest 与可选平台依赖
 ```
@@ -101,6 +102,18 @@ remote.push(here.path("dist/app"), remote.path("/opt/app"))
 remote.pull(remote.path("/var/log/x.log"), here.path("logs/x.log"))
 ```
 
+设备只提供串口 shell 和 TFTP 客户端时，可启动独立的文件分发服务：
+
+```python
+with rpm.tftpd("dist", host="192.168.1.10") as server:
+    # 192.168.1.10 是设备可访问的本机接口；在设备上执行下载命令。
+    server.wait("firmware.bin", timeout=30)  # 等到最后一个 ACK
+```
+
+`[tftp]` 按需加载，核心仍无第三方依赖。服务只接受下载，退出时释放端口和线程；
+传输失败通过 `TransferError` 报出。请使用专门的分发目录，TFTP 本身不提供认证。
+设备侧命令、状态和 SHA-256 校验见[串口 + TFTP 示例](examples/serial_session/tftp_download.py)。
+
 ### 等日志
 
 ```python
@@ -162,13 +175,15 @@ redpymake exec @board ls /workspace          # 选项写在目标名前面
 
 - [`examples/quickstart/`](examples/quickstart/README.md) — 最小 SSH 示例
 - [`examples/wsl_session/`](examples/wsl_session/README.md) — 传输 / stale / wait / script / 长流水线
+- [`background_probe.py`](examples/wsl_session/background_probe.py) — WSL launcher 与后台任务存活复现
+- [`tftp_download.py`](examples/serial_session/tftp_download.py) — BusyBox 串口 shell 下载并校验文件
 
 ## 接口分层
 
 | 层次 | 主要接口 | 说明 |
 | --- | --- | --- |
 | 一级：核心执行 | `session.at`, `session.run`, `session.path` | 会话、工作目录、命令、路径 |
-| 二级 A：文件传输 | `session.push`, `session.pull`, `rpm.copy` | `push` / `pull` 有方向；`copy` 是顶级函数 |
+| 二级 A：文件传输 | `session.push`, `session.pull`, `rpm.copy`, `rpm.tftpd` | `push` / `pull` 有方向；`tftpd` 是独立的可选服务 |
 | 二级 B：日志与等待 | `session.logs`, `session.wait`, `run(...).wait` | 自动收集、订阅、tag、等待 |
 | 二级 C：过时判断 | `rpm.stale(target, depends_on=...)` | 增量优化辅助 |
 | 二级 D：脚本对象 | `rpm.script(...)` | 多会话日志合流、异常自动落盘 |
@@ -188,6 +203,9 @@ redpymake exec @board ls /workspace          # 选项写在目标名前面
 - 串口 `run("reboot")` 默认**不**追加 `\r\n`；需要行结束符请写 `run("reboot\r")`。二进制用 `run(bytes)` / `wait(bytes)`。
 - 会话关闭后仍可读取已收集的日志，但会拒绝新的 `run` / `push` / `wait`。
 - `rpm.wsl()` 只校验 `wsl.exe` 存在，发行版没装会延迟到首次 `run()` 时以 `CommandError` 报出来。
+- POSIX 会话的 `run(..., shell=True, cwd=..., env=...)` 对整段脚本设置目录和环境；目录切换失败时，`;` / `||` / `&` 后的命令也不会执行。
+- WSL 的 `cmd &` 返回 0 只说明 shell 成功返回，不能证明后台任务就绪或完成。`nohup` / `setsid` / 固定 `sleep` 不构成存活保证；有限任务请显式 `wait "$pid"`，详见 [WSL 坑列表与复现](examples/wsl_session/README.md#wsl-后台进程复现)。
+- `run(encoding=...)` 描述命令输出的字节编码，与终端代码页不同。默认 WSL 调用请求 UTF-8 启动器诊断（WSL 0.64+）；CLI 在 GBK 流中保留中文、转义无法表示的字符，异常字段与日志保留原 Unicode。
 
 ## 完整规格
 

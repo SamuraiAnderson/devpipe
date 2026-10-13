@@ -49,7 +49,7 @@ RedPyMake 是一个跨运行环境的 Python 自动化库。调用者通过统�
 - DAG 调度
 - 原生异步执行
 - 远程后台进程生命周期（spawn/kill）
-- TFTP 核心集成（可作为可选 extra）
+- TFTP 核心依赖（只通过 `[tftp]` extra 提供独立服务，见 CORE-04）
 - 内容哈希增量策略（第一版仅时间戳）
 - 连接重试 / 退避
 
@@ -116,6 +116,7 @@ session.path(...)
 session.push(...)
 session.pull(...)
 rpm.copy(...)
+rpm.tftpd(...)  # 独立的只读分发服务，需要 [tftp]
 ```
 
 职责仅限于文件与路径资源传输。
@@ -329,9 +330,14 @@ def run(
 - `shell=False`：每个位置参数都是独立参数，不解析 `|`、`&&`、`>`。
 - `shell=False` 的位置参数按**字面量**传递，**不展开** `~` / `~/...`、`$VAR` / `${VAR}`、`*` / `?` / `[...]` 等 shell 构造；跨平台会话（SSH/WSL/ADB）通过 `shlex.quote` 保证远端 shell 也不展开。需要展开请走 `session.path("~/…")`（CORE-03）预解析为绝对路径，或传 `shell=True`。
 - `shell=True`：只允许一条完整命令字符串；同时传额外位置参数时抛出 `TypeError`。
+- **shell-context**：`cwd` 和 `env` 作用于整段命令。POSIX 后端（SSH / WSL / ADB，包括链式会话）在独立的 `sh -c` 中先切目录、导出环境，再单独解析用户脚本；脚本里的 `;` / `||` / `&` 不得改变前置设置的作用范围。目录切换失败时整段用户脚本都不执行，`check=True` 抛 `CommandError`。环境变量在脚本展开之前生效，并由脚本的子进程继承。
+- WSL 使用 `wsl.exe --exec sh -c ...`，直接启动 POSIX shell，避免发行版默认 shell 对参数再解析；`shell=False` 的引号、变量符号和通配符仍按字面传递。
+- `env` 覆盖 `PATH` 不应妨碍命令解释器本身启动；解释器先按会话原始环境定位，再在脚本解析前应用覆盖。即使新 `PATH` 不包含 `sh`，shell 内建命令仍可执行。
+- **background**：`run()` 等待所调用命令的退出和输出收集，不托管后台进程。`shell=True` 时返回码属于 shell；`cmd &` 的零返回码不表示后台任务就绪或成功完成，需要调用方明确 `wait` 或检查就绪信号。WSL launcher 退出后的存活取决于 WSL 版本和运行环境，`nohup`、`setsid`、固定 `sleep` 均不是库提供的存活保证。
 - `command` 为 `bytes` 时仅串口允许：原样写入、不追加 `newline`；带 `*args` 或 `shell=True` 抛 `TypeError`。其他会话抛 `TypeError`。
 - 底层不得使用简单的 `" ".join(args)`，必须做平台正确的参数传递或转义。
 - 输出默认统一为 `str`。
+- **encoding**：`encoding` 指定子进程 stdout/stderr 的字节编码（默认 UTF-8），与调用方终端编码无关。异常字段和 `SessionLogs` 保存相同的 Unicode 文本，不按控制台代码页重编码。WSL 默认 UTF-8 调用及内部文件操作在启动器进程的环境中设置 `WSL_UTF8=1`（含 SSH → WSL），不修改全局环境；此启动器选项要求 WSL 0.64+。显式非 UTF-8 编码仍用于命令输出，调用方须按实际字节编码选择。
 - **默认 `check=True`**：非零退出码立即抛出 `CommandError`。
 - `check=False` 时无论退出码多少都返回 `CommandResult`，由调用者判断。
 - 连接失败、超时等不受 `check=False` 影响，仍抛对应异常。
@@ -466,6 +472,19 @@ rpm.copy(
 if rpm.stale(remote_file, depends_on=local_file):
     remote.push(local_file, remote_file)
 ```
+
+---
+
+### TFTP 辅助服务（tftp）
+
+`rpm.tftpd(root_dir, *, host="127.0.0.1", port=69, timeout=2.0, retries=3) -> TftpServer` 是独立的、仅上下文管理器使用的二级接口，不是 `Session`。需要 `[tftp]` extra；依赖只在进入上下文时加载，缺失抛 `UnsupportedOperationError` 并提示安装方式。
+
+- **lifecycle**：`with rpm.tftpd(...) as server` 进入时校验本机目录、绑定 IPv4 UDP 地址并启动服务；返回后即可接收请求。`host` 为本机接口地址，`port=0` 请求空闲端口，`server.host` / `.port` 给出实际地址，`.root_dir` 为解析后的 `Path`。退出和幂等 `close()` 停止服务并关闭传输文件、UDP socket 与工作线程，包括正文抛错时。
+- **read-only**：首版仅接受 octet 模式 RRQ 下载（ASCII 协议文件名；本机根目录可含中文），拒绝 WRQ 上传、绝对路径、`..`、反斜杠/盘符和解析后越过根目录的符号链接。只服务已有普通文件。目录由调用方管理，服务运行期间不要替换文件或链接。
+- **completion**：`server.wait(filename, timeout=30.0)` 等待该相对文件名自本次启动以来的一次成功下载（含最后 ACK），成功返回 `None`；不是设备端刷写/执行成功的证明。`server.check()` 检查后台故障。`.logs: SessionLogs` 提供 `transfer_start` / `transfer_end` / `transfer_error` / `transfer_retry` 及服务生命周期记录。
+- **failure**：绑定、请求、协议、读取和传输超时失败均通过 `TransferError` 保留原因链、源/目标；请求拒绝时同时向客户端发送 TFTP ERROR。服务首个故障即停止，等待者被唤醒，故障在 `wait()` / `check()` / 上下文退出时抛出，不伪装为成功。正文已有异常时优先保留正文异常，并链接清理时发现的服务故障。
+- **timeout**：`timeout` 是等待一个数据块 ACK 的秒数；`retries` 是每块最多重传次数，每次重传记录 `transfer_retry`。耗尽后失败；`wait()` 的超时独立于协议超时。首次握手由客户端重试 RRQ。自动化测试使用回环地址和临时端口，不要求管理员权限或真实设备。
+- 串口示例只发送调用方明确写出的设备下载命令，并校验设备返回的状态/文件哈希；不猜提示符、TFTP 命令方言或设备目录，也不把串口 `run()` 的返回码当作设备 shell 的退出码。
 
 ---
 
@@ -805,6 +824,10 @@ with rpm.serial("COM3", baudrate=115200) as uart:
 
 ## CORE-07：统一异常
 
+**diagnostics**：异常消息及 stdout/stderr 字段保存按命令编码解码后的 Unicode，
+与 `SessionLogs` 中相应输出一致；不根据调用方终端代码页重编码或转义。
+终端显示的不可编码字符仅由 CLI 输出层处理（CORE-10/CLI/encoding）。
+
 ```text
 RedPyMakeError
 ├── SessionError
@@ -839,7 +862,7 @@ RedPyMakeError
 - 公共 API 具有完整类型注解与 docstring。
 - 提供 `py.typed`。
 - 核心依赖中移除 Streamlit、NumPy、SciPy、pydub。
-- SSH、串口、TFTP 可拆为可选 extra。
+- SSH、串口、TFTP 通过可选 extra 提供；导入核心不加载这些第三方依赖。
 - 核心库不配置全局日志，只使用标准 `logging`。
 - 建议最低 Python 版本为 3.10。
 - 不兼容旧的 `LocalHost` / `Linux` / `AdbCnet` / `UFile` / `make_style_decorate` API。
@@ -1152,6 +1175,8 @@ def target(
 
 ### CLI
 
+**encoding**：CLI 按 stdout/stderr 目标流的编码输出文本（包含错误信息），无法表示的字符使用 `backslashreplace` 转义；不能向 GBK 文本流混写 UTF-8 字节，也不修改进程全局代码页或标准流配置。JSON 输出使用合法 JSON 转义，解析后原文不变。该显示层处理不改变异常字段、日志或命令退出码。
+
 `redpymake` 入口点（`pyproject.toml [project.scripts]`）：
 
 ```bash
@@ -1173,7 +1198,7 @@ redpymake logs ...                                                       # 见 C
 `exec` 语义：
 
 - 省略 `CMD` 时只建连再关闭，成功退出 0。这就是连通性探针，不另设 `doctor`；
-- 有命令时 `check=False`：远端 `returncode` 原样成为 CLI 退出码。stdout / stderr 原样透传，不加前缀、不落 NDJSON（留档是 `run` 的职责）；
+- 有命令时 `check=False`：远端 `returncode` 原样成为 CLI 退出码。stdout / stderr 文本不加前缀、不落 NDJSON（留档是 `run` 的职责）；终端无法编码的字符按本节 encoding 规则转义；
 - `--shell` 把 `CMD` 各段用空格拼成一个字符串交给远端 shell。没给命令时这是用法错误。默认逐段字面传递；
 - `--cwd` 只覆盖这一次 `run()`，不改目标配置里的 `default_cwd`。
 
@@ -1773,7 +1798,7 @@ Web UI 的行为分两层验证，边界按"要不要真实渲染"划：
 - 连接重试与退避
 - DAG 编排与原生 async
 - 远程进程 spawn / wait / kill
-- TFTP 作为 optional extra
+- TFTP 上传及设备命令适配（只读 `[tftp]` 服务已在 CORE-04 定义）
 - Workspace 并行队列 / diff 视图 / 内置认证
 - Workspace 日志组的**排队式 rotate**（当前 rotate 遇 running run 会直接拒绝）
 - Workspace 日志组的跨机同步 / 云端归档

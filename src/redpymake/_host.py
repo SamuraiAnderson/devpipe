@@ -31,7 +31,10 @@ def _ps_encoded(script: str) -> str:
 
 def _posix_command(argv: Sequence[str], *, shell: bool = False,
                    cwd: str | None = None, env: Mapping[str, str] | None = None) -> str:
-    command = argv[0] if shell else shlex.join(argv)
+    # Parse the user script separately: its ; / || / & must never consume the
+    # cwd/env setup, and trailing comments must not swallow an outer wrapper.
+    # eval is a shell builtin, so an overridden PATH need not contain sh.
+    command = "eval " + shlex.quote(argv[0]) if shell else shlex.join(argv)
     statements = []
     if cwd:
         statements.append("cd " + shlex.quote(cwd))
@@ -41,7 +44,9 @@ def _posix_command(argv: Sequence[str], *, shell: bool = False,
                 raise ValueError(f"invalid environment variable name: {name!r}")
             statements.append("export " + name + "=" + shlex.quote(value))
     statements.append(command)
-    return " && ".join(statements)
+    wrapped = " && ".join(statements)
+    # Resolve the interpreter before applying the command's environment.
+    return "sh -c " + shlex.quote(wrapped) if shell else wrapped
 
 
 def _windows_command(argv: Sequence[str], *, shell: bool = False,
@@ -90,14 +95,16 @@ class _SshHost:
     def build(self, argv: Sequence[str], **kwargs: Any) -> str:
         return (_windows_command if self.platform == "windows" else _posix_command)(argv, **kwargs)
 
-    def spawn(self, argv: Sequence[str], *, timeout: float | None = None):
-        return self.session._open_process(self.build(argv), timeout=timeout)
+    def spawn(self, argv: Sequence[str], *, timeout: float | None = None,
+              env: Mapping[str, str] | None = None):
+        return self.session._open_process(self.build(argv, env=env), timeout=timeout)
 
     def capture(self, argv: Sequence[str], *, timeout: float | None = None,
                 session: Any = None, encoding: str = "utf-8",
-                operation_id: str | None = None, line_filter: Any = None) -> tuple[int, str, str]:
+                operation_id: str | None = None, line_filter: Any = None,
+                env: Mapping[str, str] | None = None) -> tuple[int, str, str]:
         deadline = _Deadline.start(timeout)
-        process = self.spawn(argv, timeout=deadline.remaining())
+        process = self.spawn(argv, timeout=deadline.remaining(), env=env)
         return _capture(process, session=session or self.session, command=argv,
                         timeout=timeout, deadline=deadline, encoding=encoding, operation_id=operation_id,
                         line_filter=line_filter)
@@ -167,8 +174,8 @@ class _SshHost:
         self.session._do_copy_from(remote, local, overwrite=True, timeout=deadline.remaining())
 
     def wsl_path(self, path: str, argv_prefix: Sequence[str], deadline: _Deadline) -> str:
-        rc, out, err = self.capture([*argv_prefix, "--", "wslpath", "-u", path],
-                                    timeout=deadline.remaining())
+        rc, out, err = self.capture([*argv_prefix, "--exec", "wslpath", "-u", path],
+                                    timeout=deadline.remaining(), env={"WSL_UTF8": "1"})
         if rc or not out.startswith("/"):
             raise TransferError(f"cannot map host staging path into WSL: {err or out}",
                                 returncode=rc, stdout=out, stderr=err)

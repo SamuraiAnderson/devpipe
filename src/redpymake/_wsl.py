@@ -6,11 +6,11 @@
   不做 distro 级探测或 ``$HOME`` 探测（作为 CORE-01 "构造时立即连接"要求的
   显式例外），因此构造几乎零延迟。distro 未安装 / 冷启动失败会在首次 ``run()``
   时以 ``CommandError`` / 非零退出码呈现。
-- 命令执行：走 ``wsl.exe [-d D] [-u U] -- sh -c "<wrapped>"``；``<wrapped>`` 内
-  注入 ``cd <cwd> && KEY=value ... cmd``，与 ``AdbSession`` 同构。WSL 会正确
-  回传 rc，无需 marker trick。
+- 命令执行：走 ``wsl.exe [-d D] [-u U] --exec sh -c "<wrapped>"``；shell=True 时
+  在独立 sh 中先切目录、export 环境，再单独解析用户脚本，与 ADB / SSH 共用
+  引用规则。回传调用命令的 rc；不托管 launcher 退出后的后台进程。
 - 资源接口：POSIX 侧探测（``test -e/-f/-d``, ``stat -c``, ``rm -rf``, ``mkdir``）。
-- 传输：Windows 本地路径转换为 ``/mnt/<drive>/...``，全部走 ``wsl -e cp``。
+- 传输：Windows 本地路径转换为 ``/mnt/<drive>/...``，通过 WSL shell 执行 cp。
 
 不引入新依赖：``wsl.exe`` 是 Windows 组件；非 Windows 环境下 ``shutil.which``
 返回 ``None``，构造直接抛 ``SessionConnectionError``。
@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import codecs
 import contextvars
 import ntpath
 import os
@@ -100,12 +101,14 @@ class WslSession(Session):
     ) -> tuple[int, str, str]:
         """一次性调用 wsl.exe，捕获全部 stdout/stderr（不做流式日志）。"""
         if self._host is not None:
-            return self._host.capture(self._wsl_argv(extra), timeout=timeout, session=self)
+            return self._host.capture(self._wsl_argv(extra), timeout=timeout, session=self,
+                                      env={"WSL_UTF8": "1"})
         proc = subprocess.run(
             self._wsl_argv(extra),
             input=stdin,
             capture_output=True,
             timeout=timeout,
+            env={**os.environ, "WSL_UTF8": "1"},
         )
         return (
             proc.returncode,
@@ -123,7 +126,7 @@ class WslSession(Session):
         就会退化成 ``"wsl ... failed:"`` 这种没有根因的消息
         （project-overview.mdc "捕获后若没有在同一个函数里重新抛出，就是掩盖失败"）。
         """
-        return self._run_wsl(["--", "sh", "-c", cmd], timeout=timeout)
+        return self._run_wsl(["--exec", "sh", "-c", cmd], timeout=timeout)
 
     @staticmethod
     def _shell_detail(stderr: str, stdout: str) -> str:
@@ -134,7 +137,7 @@ class WslSession(Session):
         """第一次展开 ``~`` 时调用。发行版未运行则会在这里冷启动。失败直接抛出。"""
         cmd = 'printf %s "$HOME"'
         try:
-            rc, out, err = self._run_wsl(["--", "sh", "-c", cmd], timeout=30)
+            rc, out, err = self._run_wsl(["--exec", "sh", "-c", cmd], timeout=30)
         except subprocess.TimeoutExpired as exc:
             raise CommandTimeoutError(
                 "timed out reading $HOME",
@@ -173,29 +176,20 @@ class WslSession(Session):
         encoding: str,
         operation_id: str,
     ) -> tuple[int, str, str]:
-        if shell:
-            cmd_str = argv[0]
-        else:
-            cmd_str = " ".join(shlex.quote(a) for a in argv)
+        from ._host import _posix_command
 
-        env_prefix = ""
-        if env:
-            env_prefix = " ".join(
-                f"{shlex.quote(k)}={shlex.quote(v)}" for k, v in env.items()
-            ) + " "
-
-        if cwd:
-            wrapped = f"cd {shlex.quote(cwd)} && {env_prefix}{cmd_str}"
-        else:
-            wrapped = f"{env_prefix}{cmd_str}"
+        wrapped = _posix_command(argv, shell=shell, cwd=cwd, env=env)
+        # WSL's own localized diagnostics default to UTF-16LE on redirected
+        # Windows pipes. Request UTF-8 without changing the caller's environment
+        # or guessing the encoding of Linux program output.
+        launcher_env = {"WSL_UTF8": "1"} if codecs.lookup(encoding).name == "utf-8" else None
 
         if self._host is not None:
-            from ._host import _posix_command
-            wrapped = _posix_command(argv, shell=shell, cwd=cwd, env=env)
-            return self._host.capture(self._wsl_argv(["--", "sh", "-c", wrapped]),
-                timeout=timeout, session=self, encoding=encoding, operation_id=operation_id)
+            return self._host.capture(self._wsl_argv(["--exec", "sh", "-c", wrapped]),
+                timeout=timeout, session=self, encoding=encoding, operation_id=operation_id,
+                env=launcher_env)
         popen = subprocess.Popen(
-            self._wsl_argv(["--", "sh", "-c", wrapped]),
+            self._wsl_argv(["--exec", "sh", "-c", wrapped]),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
@@ -203,6 +197,7 @@ class WslSession(Session):
             text=True,
             encoding=encoding,
             errors="replace",
+            env={**os.environ, **launcher_env} if launcher_env else None,
         )
 
         stdout_parts: list[str] = []

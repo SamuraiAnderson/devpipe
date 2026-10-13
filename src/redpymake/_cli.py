@@ -26,7 +26,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, TextIO
 
 from ._discover import ScriptCard, discover
 from ._targets import legal_target_spec, list_targets, target
@@ -46,12 +46,28 @@ EX_TIMEOUT = 124
 EX_CONFLICT = 3
 
 
+def _write_text(text: str, stream: TextIO) -> None:
+    """Keep a text stream's encoding; escape only unrepresentable characters."""
+    encoding = getattr(stream, "encoding", None)
+    if encoding:
+        text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+    stream.write(text)
+
+
+def _print(text: str, *, file: TextIO | None = None) -> None:
+    _write_text(text + "\n", sys.stdout if file is None else file)
+
+
 class _Parser(argparse.ArgumentParser):
     """用法错误统一退出 64，诊断带 ``redpymake: `` 前缀。"""
 
     def error(self, message: str) -> None:
         self.print_usage(sys.stderr)
         self.exit(EX_USAGE, f"redpymake: {message}\n")
+
+    def _print_message(self, message, file=None):
+        if message:
+            _write_text(message, sys.stderr if file is None else file)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -172,10 +188,10 @@ def _cmd_discover(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     cards = discover(root)
     if args.json:
-        print(json.dumps([c.to_dict() for c in cards], ensure_ascii=False, indent=2))
+        _print(json.dumps([c.to_dict() for c in cards], ensure_ascii=True, indent=2))
         return 0
     if not cards:
-        print(f"(no rpm_*.py under {root})")
+        _print(f"(no rpm_*.py under {root})")
         return 0
     for card in cards:
         rel = card.path.relative_to(root) if _try_relative(card.path, root) else card.path
@@ -183,14 +199,11 @@ def _cmd_discover(args: argparse.Namespace) -> int:
         name = card.script_name or "(unnamed)"
         factories = ",".join(card.factories) if card.factories else "-"
         line = f"{prefix} {rel}    name={name}  factories=[{factories}]"
-        try:
-            print(line)
-        except UnicodeEncodeError:  # pragma: no cover - Windows GBK 等极端本地化终端
-            sys.stdout.buffer.write(line.encode("utf-8", "replace") + b"\n")
+        _print(line)
         if card.error:
-            print(f"    error: {card.error}")
+            _print(f"    error: {card.error}")
         if not card.has_script_block and not card.error:
-            print(f"    (no rpm.script(...) block; will not be run by workspace)")
+            _print(f"    (no rpm.script(...) block; will not be run by workspace)")
     return 0
 
 
@@ -232,7 +245,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             except Exception:  # pragma: no cover
                 continue
         if matched is not None and not matched.has_script_block and matched.error is None:
-            print(
+            _print(
                 f"WARNING: {script.name} matches rpm_*.py but has no "
                 f"'with rpm.script(...)' block (no_script_block)",
                 file=sys.stderr,
@@ -244,7 +257,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     env = os.environ.copy()
     env["REDPYMAKE_LIVE_SINK"] = f"file://{sink_path.as_posix()}"
     env["REDPYMAKE_CLI"] = "1"
-    print(f"[redpymake] sink: {sink_path}", file=sys.stderr)
+    _print(f"[redpymake] sink: {sink_path}", file=sys.stderr)
     proc = subprocess.run([sys.executable, str(script)], env=env)
     return int(proc.returncode)
 
@@ -259,7 +272,7 @@ def _cmd_targets(args: argparse.Namespace) -> int:
         return _die(EX_CONFIG, str(exc))
     if args.json:
         payload = [info.to_dict() for info in infos]
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        _print(json.dumps(payload, ensure_ascii=True, indent=2))
         return 0
     if not infos:
         return 0
@@ -267,10 +280,7 @@ def _cmd_targets(args: argparse.Namespace) -> int:
         summary = " ".join(f"{key}={info.params[key]}" for key in sorted(info.params))
         src = " + ".join(info.source)
         line = f"{info.name}  {info.kind}  {summary}  ({src})".rstrip()
-        try:
-            print(line)
-        except UnicodeEncodeError:  # pragma: no cover - Windows GBK 等极端本地化终端
-            sys.stdout.buffer.write(line.encode("utf-8", "replace") + b"\n")
+        _print(line)
     return 0
 
 
@@ -319,13 +329,13 @@ def _cmd_exec(args: argparse.Namespace) -> int:
 
 def _write_streams(stdout: str, stderr: str) -> None:
     if stdout:
-        sys.stdout.write(stdout)
+        _write_text(stdout, sys.stdout)
     if stderr:
-        sys.stderr.write(stderr)
+        _write_text(stderr, sys.stderr)
 
 
 def _die(code: int, message: str) -> int:
-    print(f"redpymake: {message}", file=sys.stderr)
+    _print(f"redpymake: {message}", file=sys.stderr)
     return code
 
 
@@ -341,7 +351,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
     out = Path(args.output).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     render_report(ndjson, out)
-    print(f"[redpymake] wrote {out}")
+    _print(f"[redpymake] wrote {out}")
     return 0
 
 
@@ -368,7 +378,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     from . import workspace as _make_ws
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
-        print(
+        _print(
             f"WARNING: binding to {args.host}; do not expose this on public networks.",
             file=sys.stderr,
         )
@@ -380,7 +390,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         if should_open:
             _schedule_open_browser(args.host, args.port, url)
         else:
-            print(f"[redpymake] serving at {url}", file=sys.stderr)
+            _print(f"[redpymake] serving at {url}", file=sys.stderr)
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 
@@ -395,10 +405,10 @@ def _cmd_logs_list(args: argparse.Namespace) -> int:
         logs = ws.list_logs()
         active_id = ws.current_log.id
     if args.json:
-        print(json.dumps([log.to_dict() for log in logs], ensure_ascii=False, indent=2))
+        _print(json.dumps([log.to_dict() for log in logs], ensure_ascii=True, indent=2))
         return 0
     if not logs:
-        print("(no logs)")
+        _print("(no logs)")
         return 0
     for log in logs:
         marks = []
@@ -408,10 +418,7 @@ def _cmd_logs_list(args: argparse.Namespace) -> int:
             marks.append("pinned")
         tag = f"  [{', '.join(marks)}]" if marks else ""
         line = f"{log.id}  {log.name}  ({log.run_count} runs){tag}"
-        try:
-            print(line)
-        except UnicodeEncodeError:  # pragma: no cover
-            sys.stdout.buffer.write(line.encode("utf-8", "replace") + b"\n")
+        _print(line)
     _ = active_id  # 兼容旧接口用途
     return 0
 
@@ -426,7 +433,7 @@ def _cmd_logs_rename(args: argparse.Namespace) -> int:
             return _die(EX_NOINPUT, f"log not found: {args.log_id}")
         except ValueError as exc:
             return _die(EX_USAGE, str(exc))
-    print(f"renamed: {log.id}  ->  {log.name}")
+    _print(f"renamed: {log.id}  ->  {log.name}")
     return 0
 
 
@@ -438,7 +445,7 @@ def _cmd_logs_rotate(args: argparse.Namespace) -> int:
             log = ws.rotate_log(name=args.name)
         except RuntimeError as exc:
             return _die(EX_CONFLICT, str(exc))
-    print(f"new active log: {log.id}  ({log.name})")
+    _print(f"new active log: {log.id}  ({log.name})")
     return 0
 
 
@@ -450,7 +457,7 @@ def _cmd_logs_pin(args: argparse.Namespace) -> int:
             log = ws.pin_log(args.log_id, pinned=args.pin)
         except KeyError:
             return _die(EX_NOINPUT, f"log not found: {args.log_id}")
-    print(f"{'pinned' if log.pinned else 'unpinned'}: {log.id}")
+    _print(f"{'pinned' if log.pinned else 'unpinned'}: {log.id}")
     return 0
 
 
@@ -464,7 +471,7 @@ def _cmd_logs_discard(args: argparse.Namespace) -> int:
             return _die(EX_NOINPUT, f"log not found: {args.log_id}")
         except RuntimeError as exc:
             return _die(EX_CONFLICT, str(exc))
-    print(f"discarded: {args.log_id}")
+    _print(f"discarded: {args.log_id}")
     return 0
 
 
@@ -520,17 +527,17 @@ def _schedule_open_browser(host: str, port: int, url: str) -> threading.Thread:
             except OSError:
                 time.sleep(0.15)
         else:
-            print(
+            _print(
                 f"[redpymake] serve is up but port never accepted; skip opening browser.\n"
                 f"open manually: {url}",
                 file=sys.stderr,
             )
             return
         try:
-            print(f"[redpymake] opening {url} in default browser ...", file=sys.stderr)
+            _print(f"[redpymake] opening {url} in default browser ...", file=sys.stderr)
             webbrowser.open(url, new=2, autoraise=True)
         except Exception as exc:  # pragma: no cover - 各平台差异
-            print(
+            _print(
                 f"[redpymake] failed to open browser ({exc!r}); open manually: {url}",
                 file=sys.stderr,
             )
